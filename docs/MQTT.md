@@ -60,7 +60,7 @@ The topics that `homebridge-hunter-hydrawise` subscribes to are:
 | Topic                   | Message Expected
 |-------------------------|----------------------------------
 | `controller/get`        | `true` will trigger a publish event of the current status of the irrigation controller and all the zones associated with it.
-| `controller/set`        | A message in the form of <code><start|stop> <zone> [<duration>]</code> where you can choose to start a zone with a given duration, or stop a zone. If no duration is specified, the zone will start using the next scheduled duration for that zone.
+| `controller/set`        | A message in the form of `<start \| stop> <zone> [<duration>]` where you can choose to start a zone with a given duration, or stop a zone. If no duration is specified, the zone will start using the next scheduled duration for that zone.
 
 > [!NOTE]
 >   * MQTT support is disabled by default. It's enabled when an MQTT broker is specified in the configuration.
