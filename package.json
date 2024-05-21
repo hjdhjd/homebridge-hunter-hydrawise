@@ -19,7 +19,7 @@
   "type": "module",
   "engines": {
     "node": ">=18.0",
-    "homebridge": ">=1.8.2"
+    "homebridge": ">=1.7.0"
   },
   "main": "dist/index.js",
   "scripts": {
