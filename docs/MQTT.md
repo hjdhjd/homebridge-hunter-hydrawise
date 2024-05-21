@@ -19,11 +19,11 @@
 ### MQTT Support
 [MQTT](https://mqtt.org) is a popular Internet of Things (IoT) messaging protocol that can be used to weave together different smart devices and orchestrate or instrument them in an infinite number of ways. In short - it lets things that might not normally be able to talk to each other communicate across ecosystems, provided they can support MQTT.
 
-`homebridge-hunter-hydrawise` will publish MQTT events if you've configured a broker in the plugin settings. The plugin supports a rich set of capabilities over MQTT. This includes:
+`homebridge-hunter-hydrawise` will publish MQTT events if you've configured a broker in the plugin settings. Supported MQTT capabilities include:
 
   * Irrigation controller events.
 
-### How to configure and use this feature
+### Configuration
 
 This documentation assumes you know what MQTT is, what an MQTT broker does, and how to configure it. Setting up an MQTT broker will not be covered here. There are plenty of guides available on how to do so just a search away.
 
@@ -60,7 +60,7 @@ The topics that `homebridge-hunter-hydrawise` subscribes to are:
 | Topic                   | Message Expected
 |-------------------------|----------------------------------
 | `controller/get`        | `true` will trigger a publish event of the current status of the irrigation controller and all the zones associated with it.
-| `controller/set`        | A message in the form of `<start|stop> <zone> [<duration>]` where you can choose to start a zone with a given duration, or stop a zone. If no duration is specified, the zone will start using the next scheduled duration for that zone.
+| `controller/set`        | A message in the form of <code><start|stop> <zone> [<duration>]</code> where you can choose to start a zone with a given duration, or stop a zone. If no duration is specified, the zone will start using the next scheduled duration for that zone.
 
 > [!NOTE]
 >   * MQTT support is disabled by default. It's enabled when an MQTT broker is specified in the configuration.

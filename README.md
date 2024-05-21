@@ -49,8 +49,7 @@ To get started with `homebridge-hunter-hydrawise`:
 ## Plugin Development Dashboard
 This is mostly of interest to the true developer nerds amongst us.
 
-[![License](https://img.shields.io/npm/l/homebridge-hunter-hydrawise?color=%23000000&logo=open%20source%20initiative&logoColor=%23FFFFFF&style=for-the-badge)](https://github.com/hjdhjd/homebridge-hunter-hydrawise/blob/main/LICENSE.md)
-[![Build Status](https://img.shields.io/github/actions/workflow/status/hjdhjd/homebridge-hunter-hydrawise/ci.yml?branch=main&color=%23000000&logo=github-actions&logoColor=%23FFFFFF&style=for-the-badge)](https://github.com/hjdhjd/homebridge-hunter-hydrawise/actions?query=workflow%3A%22Continuous+Integration%22)
-[![Dependencies](https://img.shields.io/librariesio/release/npm/homebridge-hunter-hydrawise?color=%23000000&logo=dependabot&style=for-the-badge)](https://libraries.io/npm/homebridge-hunter-hydrawise)
-[![GitHub commits since latest release (by SemVer)](https://img.shields.io/github/commits-since/hjdhjd/homebridge-hunter-hydrawise/latest?color=%23000000&logo=github&sort=semver&style=for-the-badge)](https://github.com/hjdhjd/homebridge-hunter-hydrawise/commits/main)
-
+[![License](https://img.shields.io/npm/l/homebridge-hunter-hydrawise?color=%230A6E93&logo=open%20source%20initiative&logoColor=%23FFFFFF&style=for-the-badge)](https://github.com/hjdhjd/homebridge-hunter-hydrawise/blob/main/LICENSE.md)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/hjdhjd/homebridge-hunter-hydrawise/ci.yml?branch=main&color=%230A6E93&logo=github-actions&logoColor=%23FFFFFF&style=for-the-badge)](https://github.com/hjdhjd/homebridge-hunter-hydrawise/actions?query=workflow%3A%22Continuous+Integration%22)
+[![Dependencies](https://img.shields.io/librariesio/release/npm/homebridge-hunter-hydrawise?color=%230A6E93&logo=dependabot&style=for-the-badge)](https://libraries.io/npm/homebridge-hunter-hydrawise)
+[![GitHub commits since latest release (by SemVer)](https://img.shields.io/github/commits-since/hjdhjd/homebridge-hunter-hydrawise/latest?color=%230A6E93&logo=github&sort=semver&style=for-the-badge)](https://github.com/hjdhjd/homebridge-hunter-hydrawise/commits/main)
