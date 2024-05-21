@@ -1,7 +1,7 @@
 <SPAN ALIGN="CENTER" STYLE="text-align:center">
 <DIV ALIGN="CENTER" STYLE="text-align:center">
 
-[![homebridge-hunter-hydrawise: Native HomeKit support for Hunter Hydrawise](https://raw.githubusercontent.com/hjdhjd/homebridge-hunter-hydrawise/main/images/homebridge-hydrawise.svg)](https://github.com/hjdhjd/homebridge-hunter-hydrawise)
+[![homebridge-hunter-hydrawise: Native HomeKit support for Hunter Hydrawise](https://raw.githubusercontent.com/hjdhjd/homebridge-hunter-hydrawise/main/images/homebridge-hunter-hydrawise.svg)](https://github.com/hjdhjd/homebridge-hunter-hydrawise)
 
 # Homebridge Hunter Hydrawise
 
