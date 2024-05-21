@@ -23,12 +23,12 @@
   },
   "main": "dist/index.js",
   "scripts": {
-    "build": "npm run clean && tsc",
+    "build": "npm run build-ui && tsc",
     "build-ui": "shx mkdir -p homebridge-ui/public/lib && shx cp \"node_modules/homebridge-plugin-utils/dist/ui/**/*.@(js|mjs){,.map}\" homebridge-ui/public/lib",
     "clean": "shx rm -rf dist homebridge-ui/public/lib && npm run build-ui",
     "lint": "eslint eslint.config.mjs src/**.ts homebridge-ui/*.js homebridge-ui/public/**/*.mjs",
     "postpublish": "npm run clean",
-    "prepublishOnly": "npm run lint && npm run build"
+    "prepublishOnly": "npm run build-ui && npm run lint && npm run build"
   },
   "keywords": [
     "garden",
