@@ -1,0 +1,135 @@
+{
+  "pluginAlias": "Hydrawise",
+  "pluginType": "platform",
+  "singular": true,
+  "customUi": true,
+  "headerDisplay": "[homebridge-hunter-hydrawise](https://github.com/hjdhjd/homebridge-hunter-hydrawise) provides HomeKit support for Hunter Hydrawise irrigation controllers.",
+  "footerDisplay": "See the [homebridge-hunter-hydrawise developer page](https://github.com/hjdhjd/homebridge-hunter-hydrawise) for detailed documentation, including [feature options](https://github.com/hjdhjd/homebridge-hunter-hydrawise#feature-options).",
+  "schema": {
+    "type": "object",
+    "properties": {
+
+      "apiKey": {
+        "title": "Hunter Hydrawise Account API Key",
+        "type": "string",
+        "placeholder": "e.g. ABCD-EFGH-0123-4567",
+        "maxLength": 19,
+        "minLength": 19,
+        "required": true,
+        "description": "The API key for your Hunter Hydrawise account. You can generate one by going to the Account Settings section of the Account Details page on your Hydrawise online account. Default: None."
+      },
+
+      "debug": {
+        "title": "Debug Logging",
+        "type": "boolean",
+        "required": false,
+        "description": "Logging verbosity for debugging. Default: false."
+      },
+
+      "mqttTopic": {
+        "type": "string",
+        "title": "MQTT Base Topic",
+        "required": false,
+        "placeholder": "e.g. hydrawise",
+        "description": "The base MQTT topic to publish to. Default: hydrawise."
+      },
+
+      "mqttUrl": {
+        "type": "string",
+        "title": "MQTT Broker URL",
+        "required": false,
+        "format": "uri",
+        "placeholder": "e.g. mqtt://1.2.3.4",
+        "description": "URL for the MQTT broker you'd like to publish event messages to. Default: None."
+      },
+
+      "name": {
+        "title": "Plugin Name",
+        "type": "string",
+        "required": true,
+        "default": "Hunter Hydrawise",
+        "description": "Name to use for Homebridge logging purposes. Default: Hunter Hydrawise."
+      },
+
+      "options": {
+        "title": "Feature Options",
+        "type": "array",
+
+        "items": {
+          "type": "string",
+          "title": "Feature Option",
+          "required": false,
+          "description": "Enter only one option per entry. Use the feature options webUI tab above unless you know what you're doing.",
+          "placeholder": "e.g. Disable.Device"
+        }
+      }
+    }
+  },
+
+  "layout": [
+    {
+      "type": "section",
+      "title": "Required Settings",
+      "items": [
+        {
+          "description": "These options are required in order to use this plugin.",
+          "items": [
+            "apiKey"
+          ]
+        }
+      ]
+    },
+    {
+      "type": "section",
+      "title": "Plugin Feature Options (Optional)",
+      "expandable": true,
+      "expanded": false,
+      "items": [
+        {
+          "key": "options",
+          "type": "array",
+          "orderable": true,
+          "title": " ",
+          "description": "Use the feature options webUI tab above instead of manually configuring feature options here.",
+          "buttonText": "Add Feature Option",
+          "items": [
+            "options[]"
+          ]
+        }
+      ]
+    },
+
+    {
+      "type": "section",
+      "title": "MQTT Settings (Optional)",
+      "expandable": true,
+      "expanded": false,
+      "items": [
+        {
+          "description": "MQTT support will only be enabled if an MQTT broker URL is specified below.",
+          "items": [
+            "mqttUrl",
+            "mqttTopic"
+          ]
+        }
+      ]
+    },
+
+    {
+      "type": "section",
+      "title": "Advanced Settings (Optional)",
+      "expandable": true,
+      "expanded": false,
+      "items": [
+        {
+          "description": "These settings should be rarely used or needed by most people. Use these with caution.",
+          "items": [
+            "name",
+            "debug"
+          ]
+        }
+      ]
+    }
+
+  ]
+}

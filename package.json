@@ -1,0 +1,60 @@
+{
+  "name": "homebridge-hunter-hydrawise",
+  "displayName": "Homebridge Hunter Hydrawise",
+  "version": "1.0.0",
+  "description": "HomeKit integration for Hunter Hydrawise Irrigation Controllers.",
+  "license": "ISC",
+  "author": {
+    "name": "HJD",
+    "url": "https://github.com/hjdhjd"
+  },
+  "homepage": "https://github.com/hjdhjd/homebridge-hunter-hydrawise#readme",
+  "repository": {
+    "type": "git",
+    "url": "git://github.com/hjdhjd/homebridge-hunter-hydrawise.git"
+  },
+  "bugs": {
+    "url": "https://github.com/hjdhjd/homebridge-hunter-hydrawise/issues"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=18.0",
+    "homebridge": ">=1.8.2"
+  },
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "npm run clean && tsc",
+    "build-ui": "shx mkdir -p homebridge-ui/public/lib && shx cp \"node_modules/homebridge-plugin-utils/dist/ui/**/*.@(js|mjs){,.map}\" homebridge-ui/public/lib",
+    "clean": "shx rm -rf dist homebridge-ui/public/lib && npm run build-ui",
+    "lint": "eslint eslint.config.mjs src/**.ts homebridge-ui/*.js homebridge-ui/public/**/*.mjs",
+    "postpublish": "npm run clean",
+    "prepublishOnly": "npm run lint && npm run build"
+  },
+  "keywords": [
+    "garden",
+    "homebridge",
+    "homebridge-plugin",
+    "hunter",
+    "hydrawise",
+    "irrigation",
+    "irrigation controller",
+    "irrigation system",
+    "lawn",
+    "sprinkler",
+    "water"
+  ],
+  "devDependencies": {
+    "@stylistic/eslint-plugin": "^2.1.0",
+    "@types/node": "^20.12.12",
+    "eslint": "^8.5.7",
+    "homebridge": "^1.8.2",
+    "shx": "^0.3.4",
+    "typescript": "^5.4.5",
+    "typescript-eslint": "^7.10.0"
+  },
+  "dependencies": {
+    "@adobe/fetch": "^4.1.2",
+    "@homebridge/plugin-ui-utils": "^1.0.3",
+    "homebridge-plugin-utils": "^1.1.0"
+  }
+}

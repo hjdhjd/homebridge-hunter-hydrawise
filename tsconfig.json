@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+
+    "outDir": "dist",
+    "rootDir": "src"
+  },
+
+  "extends": "./node_modules/homebridge-plugin-utils/build/tsconfig.json",
+
+  "include": [
+
+    "eslint.config.mjs",
+    "homebridge-ui",
+    "src"
+  ]
+}

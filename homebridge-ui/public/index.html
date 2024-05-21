@@ -1,0 +1,210 @@
+<style>
+  .hbhh-blockquote {
+    background-color: rgb(201, 218, 224);
+    border-left: 5px solid rgb(10, 110, 147);
+    font-size: 0.9rem;
+    font-weight: 550;
+  }
+</style>
+<p class="text-center">
+  <img src="https://raw.githubusercontent.com/hjdhjd/homebridge-hunter-hydrawise/main/images/homebridge-hunter-hydrawise.svg" alt="homebridge-hunter-hydrawise logo" class="w-50" />
+</p>
+<div id="pageFirstRun" style="display: none;">
+  <div class="mx-auto text-left" style="width: 90%;">
+    <p>Welcome to <strong>homebridge-hunter-hydrawise</strong>. To get started:
+      <ol>
+        <li>Ensure you have a <a href="https://app.hydrawise.com">Hydrawise account</a>.</li>
+        <li><a hred="https://app.hydrawise.com/config/account-details">Generate a Hydrawise API key</a>, should you need one, from the account details section of the Hydrawise site and enter it below.</li>
+      </ol>
+    </p>
+    <table class="table table-sm table-borderless">
+      <tr>
+        <td class="text-center">
+          <input type="text" maxLength="19" minLength="19" placeholder="Enter your Hydrawise API Key" size="30" id="apiKey"></input>
+        </td>
+      </tr>
+      <tr>
+        <td class="m-0 p-2 text-center font-weight-bold text-danger" id="loginError">
+          &nbsp;
+        </td>
+      </tr>
+    </table>
+    <blockquote class="blockquote hbhh-blockquote mb-0 mt-0 pb-0 pt-0">
+      Things to keep in mind regarding the Hydrawise API:
+      <ul dir="auto">
+        <li>The Hydrawise API is rate-limited with the following constraints:</li>
+          <ul dir="auto">
+            <li>A limit of 3 API calls to start, stop, or suspend any zone within a 30 second interval.</li>
+            <li>An additional limit across the entire API of no more than 30 calls in any 5 minute period.</li>
+          </ul>
+        <li>While the API provides the ability to suspend a zone, it does not provide the ability to resume a schedule.</li>
+      </ul>
+    </blockquote>
+  </div>
+  <div class="text-center">
+    <br>
+      <button type="button" class="btn btn-primary" id="firstRun">Configure Plugin &rarr;</button>
+    <br>
+      To optimize performance and responsiveness, make this plugin a <a target="_blank" href="https://github.com/homebridge/homebridge/wiki/Child-Bridges">child bridge</a> once you've completed configuration.
+  </div>
+</div>
+<div id="menuWrapper" class="btn-group w-100 mb-0" role="group" aria-label="UI Menu" style="display: none;">
+  <button type="button" class="btn btn-primary" id="menuSettings">Settings</button>
+  <button type="button" class="btn btn-primary" id="menuFeatureOptions">Feature Options</button>
+  <button type="button" class="btn btn-primary mr-0" id="menuHome">Support</button>
+</div>
+<div id="pageFeatureOptions" class="mt-4" style="display: none;">
+  <div id="deviceInfo">
+    <table class="table table-sm table-borderless">
+      <tr class="align-center">
+        <td id="headerInfo" colspan="2" class="m-0 p-2 text-center font-weight-bold"></td>
+      </tr>
+      <tr class="align-top">
+        <td rowspan="3" class="w-25">
+          <table id="sidebar" class="table table-sm table-bordered m-0 p-0">
+            <tr>
+              <td>
+                <table class="table table-sm table-borderless m-0 p-0" id="controllersTable"></table>
+              </td>
+            </tr>
+            <tr>
+              <td>
+                <table class="table table-sm table-borderless m-0 p-0" id="devicesTable"></table>
+              </td>
+            </tr>
+          </table>
+        </td>
+        <td id="deviceStatsTable">
+          <table class="table table-sm table-borderless border-bottom m-0 p-0">
+            <tr id="deviceStatsHeader">
+              <th class="m-0 p-0 w-25"><B>Serial</B></th>
+              <th class="m-0 p-0 w-25"><B>Firmware<B></th>
+            </tr>
+            <tr>
+              <td id="device_serial" class="m-0 p-0"></td>
+              <td id="device_firmware" class="m-0 p-0"></td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+      <tr>
+        <td id="configTable" class="w-100"></td>
+      </tr>
+    </table>
+  </div>
+</div>
+<div id="pageSupport" class="mt-4" style="display: none;">
+  <h5>Introduction</h5>
+    <p class="px-4">I hope you enjoy <a target="_blank" href="https://github.com/hjdhjd/homebridge-hunter-hydrawise">homebridge-hunter-hydrawise</a> as much as I enjoy developing it. All my projects are labors of love. If you'd like to show your appreciation - <a target="_blank" href="https://github.com/hjdhjd/homebridge-hunter-hydrawise">star this project on Github</A> and do some good in your community, either financially or with your time: a food bank, an animal shelter (two of my passions), or whatever resonates with you that can give something back to the world around you.</p>
+
+    <div class="px-4">
+      Other plugins by <a target="_blank" href="https://github.com/hjdhjd">HJD</a>:
+
+      <ul dir="auto">
+        <li><a target="_blank" href="https://github.com/hjdhjd/homebridge-ratgdo">homebridge-ratgdo: Ratgdo (non-myQ Liftmaster and Chamberlain) garage door and gate opener support for HomeKit</a></li>
+        <li><a target="_blank" href="https://github.com/hjdhjd/homebridge-unifi-access">homebridge-unifi-access: HomeKit integration for the UniFi Access ecosystem</a></li>
+        <li><a target="_blank" href="https://github.com/hjdhjd/homebridge-unifi-protect">homebridge-unifi-protect: Complete HomeKit integration for the entire UniFi Protect ecosystem</a></li>
+      </ul>
+    </div>
+
+  <h5>Getting Started</h5>
+    <ul dir="auto">
+      <li>
+        <a target="_blank" href="https://github.com/hjdhjd/homebridge-hunter-hydrawise#installation">Installation</a>: installing this plugin, including system requirements.
+      </li>
+      <li>
+        <a target="_blank" href="https://github.com/hjdhjd/homebridge-hunter-hydrawise#plugin-configuration">Plugin Configuration</a>: how to quickly get up and running.
+      </li>
+      <li>
+        <a target="_blank" href="https://github.com/hjdhjd/homebridge-hunter-hydrawise#notes">Additional Notes</a>: some things you should be aware of, including Hydrawise-specific quirks.
+      </li>
+    </ul>
+
+  <h5>Advanced Topics</h5>
+    <ul dir="auto">
+      <li>
+        <a target="_blank" href="https://github.com/hjdhjd/homebridge-hunter-hydrawise/blob/main/docs/FeatureOptions.md">Feature Options</a>: granular options to allow you to show or hide specific irrigation controllers, and more.
+      </li>
+      <li>
+        <a target="_blank" href="https://github.com/hjdhjd/homebridge-hunter-hydrawise/blob/main/docs/MQTT.md">MQTT</a>: how to configure MQTT support.
+      </li>
+    </ul>
+
+  <h5>Notes</h5>
+    Things to keep in mind regarding the Hydrawise API:
+    <ul dir="auto">
+      <li>The Hydrawise API is rate-limited with the following constraints:</li>
+        <ul dir="auto">
+          <li>A limit of 3 API calls to start, stop, or suspend any zone within a 30 second interval.</li>
+          <li>An additional limit across the entire API of no more than 30 calls in any 5 minute period.</li>
+        </ul>
+      <li>While the API provides the ability to suspend a zone, it does not provide the ability to resume a schedule.</li>
+    </ul>
+
+  <h5>Support</h5>
+    <ul>
+      <li>
+        <a target="_blank" href="https://discord.gg/QXqfHEW">Discord Support Channel</a>
+      </li>
+      <li>
+        <a target="_blank" href="https://github.com/hjdhjd/homebridge-hunter-hydrawise/issues/new/choose">Create a Developer Support Request</a>
+      </li>
+      <li>
+        <a target="_blank" href="https://github.com/hjdhjd/homebridge-hunter-hydrawise/blob/main/docs/Changelog.md">Changelog and Release Notes</a>
+      </li>
+    </ul>
+</div>
+<script type="module">
+
+  /* Copyright(C) 2017-2024, HJD (https://github.com/hjdhjd). All rights reserved.
+   *
+   * Plugin webUI.
+   */
+
+  "use strict";
+
+  import { webUi } from "./lib/webUi.mjs";
+  import { webUiFeatureOptions } from "./lib/webui-featureoptions.mjs";
+
+  // Keep a list of all the feature options and option groups.
+  const featureOptions = new webUiFeatureOptions({ sidebar: "Hydrawise Devices", useControllers: false });
+
+  // Execute our first run screen if we don't have a valid Hydrawise API key.
+  const firstRunRequired = () => featureOptions.currentConfig[0]?.apiKey?.length !== 19;
+
+  // Initialize our first run screen with any information from our existing configuration.
+  const firstRunInit = () => {
+
+    // Pre-populate with anything we might already have in our configuration.
+    document.getElementById("apiKey").value = featureOptions.currentConfig[0].apiKey ?? "";
+
+    return true;
+  }
+
+  // Validate our Hydrawise API key.
+  const firstRunSubmit = async () => {
+
+    const apiKey = document.getElementById("apiKey").value;
+    const tdLoginError = document.getElementById("loginError");
+
+    tdLoginError.innerHTML = "&nbsp;";
+
+    const validateApiKey = await homebridge.request("/login", apiKey);
+
+    if(validateApiKey !== "success") {
+
+      tdLoginError.innerHTML = "<code class=\"text-danger\">" + validateApiKey + "</code>";
+      homebridge.hideSpinner();
+      return false;
+    }
+
+    featureOptions.currentConfig[0].apiKey = apiKey;
+    await homebridge.updatePluginConfig(featureOptions.currentConfig);
+
+    return true;
+  }
+
+  // Instantiate the webUI.
+  new webUi({ featureOptions: featureOptions, firstRunInit: firstRunInit, firstRunRequired: firstRunRequired, firstRunSubmit: firstRunSubmit, homebridge: homebridge,
+    name: "Hydrawise" });
+</script>
