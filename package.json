@@ -1,7 +1,7 @@
 {
   "name": "homebridge-hunter-hydrawise",
   "displayName": "Homebridge Hunter Hydrawise",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "HomeKit integration for Hunter Hydrawise Irrigation Controllers.",
   "license": "ISC",
   "author": {
