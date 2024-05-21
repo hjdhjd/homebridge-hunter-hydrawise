@@ -1,0 +1,80 @@
+name: Support Request
+description: Report a bug or request help. Please read the HBHH documentation before creating a support request.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ### Before opening a support request, please ensure you have read the [documentation](https://github.com/hjdhjd/homebridge-hunter-hydrawise#documentation). Questions and topics already addressed in the documentation, or in prior issue reports, will be closed without a response.
+
+  - type: input
+    id: pluginversion
+    attributes:
+      label: Homebridge Hunter Hydrawise
+      description: Which version of Homebridge Hunter Hydrawise (HBHR) are you running on?
+      placeholder: e.g. v1.1.0
+    validations:
+      required: true
+
+  - type: input
+    id: homebridgeos
+    attributes:
+      label: Homebridge Platform and OS
+      description: What hardware and operating system are you running Homebridge on?
+      placeholder: e.g. macOS Sonoma
+    validations:
+      required: true
+
+  - type: input
+    id: homebridge
+    attributes:
+      label: Homebridge Version
+      description: Which version of Homebridge are you running on?
+      placeholder: e.g. v1.7.0
+    validations:
+      required: true
+
+  - type: input
+    id: node
+    attributes:
+      label: Node Version
+      description: Which version of Node are you running on?
+      placeholder: e.g. v18.1.0
+    validations:
+      required: true
+
+  - type: input
+    id: hydrawise
+    attributes:
+      label: Hunter Hydrawise Irrigation Controller Type
+      description: Which Hydrawise irrigation controller do you have?
+      placeholder: e.g. Hunter PRO-HC PHC-1200
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: Describe the problem
+      description: Please describe the issue you're encountering, and ensure you include steps to reproduce.
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Homebridge HBHH JSON configuration
+      description: Please copy and paste your Homebridge HBHH JSON configuration. This will be automatically formatted into code, so no need for backticks.
+      placeholder: Paste your HBHH configuration from Homebridge (gear icon in the Homebridge webUI next to HBHH, then select JSON config). Copy and paste it here.
+      render: json
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: Please copy and paste any relevant Homebridge HBHH log output. This will be automatically formatted into code, so no need for backticks.
+      placeholder: Please paste the relevant log entries here.
+      render: shell
+    validations:
+      required: true
