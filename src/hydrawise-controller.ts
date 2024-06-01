@@ -463,7 +463,7 @@ export class HydrawiseController {
 
     if(this.isStoppedBySensor(zone)) {
 
-      return "Rain sensor is stopping irrigation.";
+      return "Rain sensor is preventing irrigation.";
     }
 
     // If we're currently running, inform the user of the remaining duration. Otherwise, inform the user of the next runtime.
