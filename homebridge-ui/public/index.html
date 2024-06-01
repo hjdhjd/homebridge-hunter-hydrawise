@@ -20,7 +20,7 @@
     <table class="table table-sm table-borderless">
       <tr>
         <td class="text-center">
-          <input type="text" maxLength="19" minLength="19" placeholder="Enter your Hydrawise API Key" size="30" id="apiKey"></input>
+          <input type="text" maxLength="19" minLength="19" placeholder="Hydrawise API Key" size="30" id="apiKey"></input>
         </td>
       </tr>
       <tr>
@@ -74,15 +74,15 @@
             </tr>
           </table>
         </td>
-        <td id="deviceStatsTable">
+        <td id="deviceStatsTable" class="w-75">
           <table class="table table-sm table-borderless border-bottom m-0 p-0">
             <tr id="deviceStatsHeader">
-              <th class="m-0 p-0 w-25"><B>Serial</B></th>
-              <th class="m-0 p-0 w-25"><B>Firmware<B></th>
+              <th class="m-0 p-0 w-25"><B>MAC Address</B></th>
+              <th class="m-0 p-0 w-25"><B>Zones</B></th>
             </tr>
             <tr>
               <td id="device_serial" class="m-0 p-0"></td>
-              <td id="device_firmware" class="m-0 p-0"></td>
+              <td id="device_zones" class="m-0 p-0"></td>
             </tr>
           </table>
         </td>
@@ -95,12 +95,13 @@
 </div>
 <div id="pageSupport" class="mt-4" style="display: none;">
   <h5>Introduction</h5>
-    <p class="px-4">I hope you enjoy <a target="_blank" href="https://github.com/hjdhjd/homebridge-hunter-hydrawise">homebridge-hunter-hydrawise</a> as much as I enjoy developing it. All my projects are labors of love. If you'd like to show your appreciation - <a target="_blank" href="https://github.com/hjdhjd/homebridge-hunter-hydrawise">star this project on Github</A> and do some good in your community, either financially or with your time: a food bank, an animal shelter (two of my passions), or whatever resonates with you that can give something back to the world around you.</p>
+    <p class="px-4">I hope you enjoy this plugin as much as I enjoy developing it. All my projects are labors of love. If you'd like to show your appreciation - <a target="_blank" href="https://github.com/hjdhjd/homebridge-hunter-hydrawise">star this project on GitHub</A> and do some good in your community, either financially or with your time: a food bank, an animal shelter (two of my passions), or whatever resonates with you that can give something back to the world around you. If you're looking for a couple of my faves: <a target="_blank" href="https://wck.org/donate">World Central Kitchen</a> and <a target="_blank" href="https://bestfriends.org/donate">Best Friends</a>.</p>
 
     <div class="px-4">
-      Other plugins by <a target="_blank" href="https://github.com/hjdhjd">HJD</a>:
+      Plugins by <a target="_blank" href="https://github.com/hjdhjd">HJD</a>:
 
       <ul dir="auto">
+        <li><a target="_blank" href="https://github.com/hjdhjd/homebridge-hunter-hydrawise">homebridge-hunter-hydrawise: Hunter Hydrawise integration for HomeKit.</a></li>
         <li><a target="_blank" href="https://github.com/hjdhjd/homebridge-ratgdo">homebridge-ratgdo: Ratgdo (non-myQ Liftmaster and Chamberlain) garage door and gate opener support for HomeKit</a></li>
         <li><a target="_blank" href="https://github.com/hjdhjd/homebridge-unifi-access">homebridge-unifi-access: HomeKit integration for the UniFi Access ecosystem</a></li>
         <li><a target="_blank" href="https://github.com/hjdhjd/homebridge-unifi-protect">homebridge-unifi-protect: Complete HomeKit integration for the entire UniFi Protect ecosystem</a></li>
@@ -158,53 +159,13 @@
 
   /* Copyright(C) 2017-2024, HJD (https://github.com/hjdhjd). All rights reserved.
    *
-   * Plugin webUI.
+   * Plugin webUI script loader.
    */
-
   "use strict";
 
-  import { webUi } from "./lib/webUi.mjs";
-  import { webUiFeatureOptions } from "./lib/webui-featureoptions.mjs";
-
-  // Keep a list of all the feature options and option groups.
-  const featureOptions = new webUiFeatureOptions({ sidebar: "Hydrawise Devices", useControllers: false });
-
-  // Execute our first run screen if we don't have a valid Hydrawise API key.
-  const firstRunRequired = () => featureOptions.currentConfig[0]?.apiKey?.length !== 19;
-
-  // Initialize our first run screen with any information from our existing configuration.
-  const firstRunInit = () => {
-
-    // Pre-populate with anything we might already have in our configuration.
-    document.getElementById("apiKey").value = featureOptions.currentConfig[0].apiKey ?? "";
-
-    return true;
-  }
-
-  // Validate our Hydrawise API key.
-  const firstRunSubmit = async () => {
-
-    const apiKey = document.getElementById("apiKey").value;
-    const tdLoginError = document.getElementById("loginError");
-
-    tdLoginError.innerHTML = "&nbsp;";
-
-    const validateApiKey = await homebridge.request("/login", apiKey);
-
-    if(validateApiKey !== "success") {
-
-      tdLoginError.innerHTML = "<code class=\"text-danger\">" + validateApiKey + "</code>";
-      homebridge.hideSpinner();
-      return false;
-    }
-
-    featureOptions.currentConfig[0].apiKey = apiKey;
-    await homebridge.updatePluginConfig(featureOptions.currentConfig);
-
-    return true;
-  }
-
-  // Instantiate the webUI.
-  new webUi({ featureOptions: featureOptions, firstRunInit: firstRunInit, firstRunRequired: firstRunRequired, firstRunSubmit: firstRunSubmit, homebridge: homebridge,
-    name: "Hydrawise" });
+  // Ensure we load the webUI dynamically so it isn't cached on each load.
+  const script = document.createElement('script');
+  script.src = "./ui.mjs?v=" + Date.now().toString();
+  script.type = "module";
+  document.body.appendChild(script);
 </script>

@@ -27,7 +27,7 @@
 
 This documentation assumes you know what MQTT is, what an MQTT broker does, and how to configure it. Setting up an MQTT broker will not be covered here. There are plenty of guides available on how to do so just a search away.
 
-You configure MQTT settings in the plugin webUI. The settings are:
+You can configure MQTT settings in the plugin webUI. The settings are:
 
 | Configuration Setting | Description
 |-----------------------|----------------------------------
@@ -39,9 +39,9 @@ You configure MQTT settings in the plugin webUI. The settings are:
 
 When events are published, by default, the topics look like:
 
-```sh
-hydrawise/1234567890AB
-```
+> ```sh
+> hydrawise/1234567890AB
+> ```
 
 In the above example, `1234567890AB` is the serial number of your Hunter Hydrawise irrigation controller. `homebridge-hunter-hydrawise` provides you information about your Hydrawise devices and their respective serial numbers in the Homebridge log on startup.
 

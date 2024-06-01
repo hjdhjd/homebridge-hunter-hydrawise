@@ -31,16 +31,12 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     this.account = {} as CustomerDetailsResponse;
     this.api = api;
     this.configuredDevices = {};
+    this.featureOptions = new FeatureOptions(featureOptionCategories, featureOptions, config?.options ?? []);
+    this.fetch = context({ alpnProtocols: [ALPNProtocol.ALPN_HTTP2], rejectUnauthorized: false, userAgent: "homebridge-hunter-hydrawise" }).fetch;
     this.hap = api.hap;
     this.log = log;
     this.log.debug = this.debug.bind(this);
     this.mqtt = null;
-
-    const { fetch } = context({ alpnProtocols: [ ALPNProtocol.ALPN_HTTP2 ], rejectUnauthorized: false, userAgent: "homebridge-hunter-hydrawise" });
-    this.fetch = fetch;
-
-    // Initialize our feature options.
-    this.featureOptions = new FeatureOptions(featureOptionCategories, featureOptions, config.options as string[]);
 
     // We can't start without being configured.
     if(!config) {
@@ -61,6 +57,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     if(!this.config.apiKey?.length) {
 
       this.log.error("Unable to startup: no Hunter Hydrawise API key has been configured. Please configure one and restart the plugin.");
+
       return;
     }
 
@@ -105,6 +102,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       } catch(error) {
 
         this.log.error("Unable to retrieve the list of controllers: %s", util.inspect(error, { colors: true, sorted: true }));
+
         return false;
       }
 
@@ -234,6 +232,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       if(response.status === 404) {
 
         this.log.error("Invalid API key. Please check your Hydrawise API key.");
+
         return null;
       }
 
@@ -241,6 +240,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       if(response.status === 429) {
 
         this.log.error("Hydrawise API rate limit has been exceeded.");
+
         return null;
       }
 
@@ -248,6 +248,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       if(!response.ok) {
 
         this.log.error("%s: %s", response.status, await response.text());
+
         return null;
       }
 
@@ -258,6 +259,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
         this.log.error("The Hydrawise API is taking too long to respond to a request. This error can usually be safely ignored.");
         this.log.debug("Original request was: %s", url);
+
         return null;
       }
 

@@ -121,6 +121,7 @@ export class HydrawiseController {
       if(!zone) {
 
         this.log.error("MQTT: Invalid zone specified.");
+
         return;
       }
 
@@ -131,16 +132,19 @@ export class HydrawiseController {
         case "start":
 
           await this.sendCommand(zone, "run", parseInt(action[2]));
+
           return;
 
         case "stop":
 
           await this.sendCommand(zone, "stop");
+
           return;
 
         default:
 
           this.log.error("Invalid command.");
+
           return;
       }
     }, this.log);
@@ -158,6 +162,7 @@ export class HydrawiseController {
 
       // Add a service label service in order to be able to properly enumerate and name the individual zone valves.
       const serviceLabel = new this.hap.Service.ServiceLabel(this.name);
+
       serviceLabel.updateCharacteristic(this.hap.Characteristic.ServiceLabelNamespace, this.hap.Characteristic.ServiceLabelNamespace.ARABIC_NUMERALS);
       this.accessory.addService(serviceLabel);
 
@@ -215,6 +220,7 @@ export class HydrawiseController {
           if(!valveService) {
 
             this.log.error("Unable to create a valve service for zone: %s (%s).", zone.name, zone.relay_id);
+
             continue;
           }
 
@@ -466,8 +472,8 @@ export class HydrawiseController {
       return "Currently running with " + this.getMinutes(zone.run) + " remaining.";
     } else {
 
-      return "Next run will be " + (zone.timestr.includes(":") ? "at " + this.formatStartTime(zone.timestr) : "on " + zone.timestr) + " for " + this.getMinutes(zone.run)
-        + ".";
+      return "Next run will be " + (zone.timestr.includes(":") ? "at " + this.formatStartTime(zone.timestr) : "on " + zone.timestr) + " for " +
+        this.getMinutes(zone.run) + ".";
     }
   }
 

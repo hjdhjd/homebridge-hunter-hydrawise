@@ -66,7 +66,7 @@ export default ts.config(
 
   {
 
-    files: [ "homebridge-ui/public/lib/webUi.mjs", "homebridge-ui/public/lib/webui-featureoptions.mjs" ],
+    files: [ "homebridge-ui/public/lib/webUi.mjs", "homebridge-ui/public/lib/webUi-featureoptions.mjs" ],
 
     languageOptions: {
 

@@ -18,8 +18,8 @@ export interface HydrawiseOptions {
 // Feature option categories.
 export const featureOptionCategories = [
 
-  { description: "Device feature options.", name: "Device", validFor: [ "all" ] },
-  { description: "Logging feature options.", name: "Log", validFor: [ "all" ] }
+  { description: "Device feature options.", name: "Device" },
+  { description: "Logging feature options.", name: "Log" }
 ];
 
 // Individual feature options, broken out by category.
