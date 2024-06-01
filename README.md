@@ -39,7 +39,8 @@ To get started with `homebridge-hunter-hydrawise`:
   * Configure `homebridge-hunter-hydrawise` and enter your API key.
   * That's it. Enjoy!
 
-> [!IMPORTANT]<A NAME="notes"></A>
+<A NAME="notes"></A>
+> [!IMPORTANT]
 > Things to keep in mind regarding the Hydrawise API:
 > * The Hydrawise API is rate-limited with the following constraints:
 >   * A limit of 3 API calls to start, stop, or suspend any zone within a 30 second interval.
