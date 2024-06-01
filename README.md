@@ -31,7 +31,7 @@ I've developed a full-featured Homebridge plugin that enables the following feat
   * A rich webUI for configuration.
   * MQTT support.
 
-## Installation
+## <A NAME="plugin-configuration"></A>Installation
 To get started with `homebridge-hunter-hydrawise`:
 
   * [Generate a Hydrawise API key](https://app.hydrawise.com/config/account-details), should you need one.</li>
@@ -39,7 +39,7 @@ To get started with `homebridge-hunter-hydrawise`:
   * Configure `homebridge-hunter-hydrawise` and enter your API key.
   * That's it. Enjoy!
 
-> [!IMPORTANT]
+> [!IMPORTANT]<A NAME="notes"></A>
 > Things to keep in mind regarding the Hydrawise API:
 > * The Hydrawise API is rate-limited with the following constraints:
 >   * A limit of 3 API calls to start, stop, or suspend any zone within a 30 second interval.
