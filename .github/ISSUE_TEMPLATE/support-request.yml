@@ -1,5 +1,5 @@
 name: Support Request
-description: Report a bug or request help. Please read the HBHH documentation before creating a support request.
+description: Report a bug or request help. Please read the Homebridge Hunter Hydrawise documentation before creating a support request.
 body:
   - type: markdown
     attributes:
@@ -10,7 +10,7 @@ body:
     id: pluginversion
     attributes:
       label: Homebridge Hunter Hydrawise
-      description: Which version of Homebridge Hunter Hydrawise (HBHR) are you running on?
+      description: Which version of Homebridge Hunter Hydrawise (HBHH) are you running on?
       placeholder: e.g. v1.1.0
     validations:
       required: true
@@ -62,9 +62,9 @@ body:
   - type: textarea
     id: config
     attributes:
-      label: Homebridge HBHH JSON configuration
-      description: Please copy and paste your Homebridge HBHH JSON configuration. This will be automatically formatted into code, so no need for backticks.
-      placeholder: Paste your HBHH configuration from Homebridge (gear icon in the Homebridge webUI next to HBHH, then select JSON config). Copy and paste it here.
+      label: Homebridge Hunter Hydrawise JSON configuration
+      description: Please copy and paste your Homebridge Hunter Hydrawise JSON configuration. This will be automatically formatted into code, so no need for backticks.
+      placeholder: Paste your Homebridge Hunter Hydrawise configuration from Homebridge (gear icon in the Homebridge webUI next to Homebridge Hunter Hydrawise, then select JSON config). Copy and paste it here.
       render: json
     validations:
       required: true
@@ -73,7 +73,7 @@ body:
     id: logs
     attributes:
       label: Relevant log output
-      description: Please copy and paste any relevant Homebridge HBHH log output. This will be automatically formatted into code, so no need for backticks.
+      description: Please copy and paste any relevant Homebridge Hunter Hydrawise log output. This will be automatically formatted into code, so no need for backticks.
       placeholder: Please paste the relevant log entries here.
       render: shell
     validations:
