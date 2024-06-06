@@ -105,9 +105,6 @@ export class HydrawiseController {
     // Set the state of a given irrigation zone.
     this.platform.mqtt?.subscribeSet(this.controller.serial_number, "controller", "Irrigiation controller", async (value: string) => {
 
-      let command;
-      let position;
-
       // Parse the command.
       const action = value.split(" ");
 
@@ -124,8 +121,6 @@ export class HydrawiseController {
 
         return;
       }
-
-      let response;
 
       switch(action[0]) {
 
@@ -189,7 +184,7 @@ export class HydrawiseController {
 
       // Update our status. If it's our first run through, we use our internal defaults.
       // eslint-disable-next-line no-await-in-loop
-      await retry(() => this.getStatus(), (isFirstRun ? HYDRAWISE_API_RETRY_INTERVAL : (this.status.nextpoll + 0.2)) * 1000);
+      await retry(async () => this.getStatus(), (isFirstRun ? HYDRAWISE_API_RETRY_INTERVAL : (this.status.nextpoll + 0.2)) * 1000);
 
       // Let's get the list of current valves on this irrigation controller.
       const currentValves = this.status.relays.map(x => x.relay_id.toString());
