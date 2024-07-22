@@ -4,7 +4,7 @@
  */
 import { API, CharacteristicValue, HAP, PlatformAccessory, Service } from "homebridge";
 import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL } from "./settings.js";
-import { HomebridgePluginLogging, retry, sleep } from "homebridge-plugin-utils";
+import { HomebridgePluginLogging, acquireService, retry, sleep } from "homebridge-plugin-utils";
 import { HydrawiseControllerConfig, HydrawiseZoneConfig, StatusScheduleResponse } from "./hydrawise-types.js";
 import { HydrawiseOptions } from "./hydrawise-options.js";
 import { HydrawisePlatform } from "./hydrawise-platform.js";
@@ -150,26 +150,22 @@ export class HydrawiseController {
   // Configure the irrigation system service for HomeKit.
   private configureIrrigationSystem(): boolean {
 
-    let irrigationSystemService = this.accessory.getService(this.hap.Service.IrrigationSystem);
+    // Acquire the service and id needed, add a service label service in order to be able to properly enumerate and name the individual zone valves.
+    const service = acquireService(this.hap, this.accessory, this.hap.Service.IrrigationSystem, this.name, undefined,
+      () => acquireService(this.hap, this.accessory, this.hap.Service.ServiceLabel, this.name)
+        ?.updateCharacteristic(this.hap.Characteristic.ServiceLabelNamespace, this.hap.Characteristic.ServiceLabelNamespace.ARABIC_NUMERALS));
 
-    // Add the garage door opener service to the accessory, if needed.
-    if(!irrigationSystemService) {
+    if(!service) {
 
-      // Add a service label service in order to be able to properly enumerate and name the individual zone valves.
-      const serviceLabel = new this.hap.Service.ServiceLabel(this.name);
+      this.log.error("Unable to add the irrigation controller.");
 
-      serviceLabel.updateCharacteristic(this.hap.Characteristic.ServiceLabelNamespace, this.hap.Characteristic.ServiceLabelNamespace.ARABIC_NUMERALS);
-      this.accessory.addService(serviceLabel);
-
-      irrigationSystemService = new this.hap.Service.IrrigationSystem(this.name);
-      irrigationSystemService.addOptionalCharacteristic(this.hap.Characteristic.Name);
-      this.accessory.addService(irrigationSystemService);
+      return false;
     }
 
     // Initialize the service.
-    irrigationSystemService.updateCharacteristic(this.hap.Characteristic.Active, this.hap.Characteristic.Active.ACTIVE);
-    irrigationSystemService.updateCharacteristic(this.hap.Characteristic.InUse, this.hap.Characteristic.InUse.NOT_IN_USE);
-    irrigationSystemService.updateCharacteristic(this.hap.Characteristic.ProgramMode, this.hap.Characteristic.ProgramMode.PROGRAM_SCHEDULED);
+    service.updateCharacteristic(this.hap.Characteristic.Active, this.hap.Characteristic.Active.ACTIVE);
+    service.updateCharacteristic(this.hap.Characteristic.InUse, this.hap.Characteristic.InUse.NOT_IN_USE);
+    service.updateCharacteristic(this.hap.Characteristic.ProgramMode, this.hap.Characteristic.ProgramMode.PROGRAM_SCHEDULED);
 
     return true;
   }
@@ -203,38 +199,30 @@ export class HydrawiseController {
       // Discover any new zones and update our zone state.
       for(const zone of this.status.relays) {
 
-        // Find the valve, if it exists.
-        let valveService = this.accessory.getServiceById(this.hap.Service.Valve, zone.relay_id.toString());
+        // Acquire the valve service.
         let isNewValve = false;
+        const valveService = acquireService(this.hap, this.accessory, this.hap.Service.Valve,
+          (this.accessory.getServiceById(this.hap.Service.Valve, zone.relay_id.toString())?.getCharacteristic(this.hap.Characteristic.ConfiguredName).value as string) ??
+            zone.name, zone.relay_id.toString(), (newService: Service) => {
 
-        // It's a new valve, let's add it.
+            // Enumerate the valve service to align with the irrigation controller's zone numbering.
+            newService.updateCharacteristic(this.hap.Characteristic.ServiceLabelIndex, zone.relay);
+
+            // This allows users to enable or disable the zone from within HomeKit. We could exclude it, but the extra optionality for end users can be useful.
+            newService.updateCharacteristic(this.hap.Characteristic.IsConfigured, this.hap.Characteristic.IsConfigured.CONFIGURED);
+
+            // All valves attached to an irrigation system must have their type set accordingly.
+            newService.updateCharacteristic(this.hap.Characteristic.ValveType, this.hap.Characteristic.ValveType.IRRIGATION);
+
+            // Ensure that we inform the user of the new valve.
+            isNewValve = true;
+          });
+
         if(!valveService) {
 
-          valveService = this.accessory.addService(this.hap.Service.Valve, zone.name, zone.relay_id.toString());
+          this.log.error("Unable to create a valve service for zone: %s (%s).", zone.name, zone.relay_id);
 
-          if(!valveService) {
-
-            this.log.error("Unable to create a valve service for zone: %s (%s).", zone.name, zone.relay_id);
-
-            continue;
-          }
-
-          // Configure the service.
-          // Enumerate the valve service to align with the irrigation controller's zone numbering.
-          valveService.updateCharacteristic(this.hap.Characteristic.ServiceLabelIndex, zone.relay);
-
-          // This allows users to enable or disable the zone from within HomeKit. We could exclude it, but the extra optionality for end users can be useful.
-          valveService.updateCharacteristic(this.hap.Characteristic.IsConfigured, this.hap.Characteristic.IsConfigured.CONFIGURED);
-
-          // All valves attached to an irrigation system must have their type set accordingly.
-          valveService.updateCharacteristic(this.hap.Characteristic.ValveType, this.hap.Characteristic.ValveType.IRRIGATION);
-
-          // Provide the initial name of the zone.
-          valveService.addOptionalCharacteristic(this.hap.Characteristic.ConfiguredName);
-          valveService.updateCharacteristic(this.hap.Characteristic.ConfiguredName, zone.name);
-
-          // Ensure that we inform the user of the new valve.
-          isNewValve = true;
+          continue;
         }
 
         // See if the zone has been stopped due to a rain sensor event.
@@ -331,14 +319,14 @@ export class HydrawiseController {
           irrigationRemaining += duration;
 
           // Update the duration of the remaining runtime of this valve, in seconds.
-          valveService.updateCharacteristic(this.hap.Characteristic.RemainingDuration, duration);
+          valveService.updateCharacteristic(this.hap.Characteristic.RemainingDuration, Math.min(duration, 3600));
         } else {
 
           // Clear out the manual activation tracker for this zone.
           this.zoneHints[zone.relay_id].isManual = false;
 
           // Set the duration of the next run of this valve, in seconds, in HomeKit based on the Hydrawise scheduled runtime.
-          valveService.updateCharacteristic(this.hap.Characteristic.SetDuration, duration);
+          valveService.updateCharacteristic(this.hap.Characteristic.SetDuration, Math.min(duration, 3600));
         }
 
         // Active represents whether the zone is ready to be activated - meaning it's queued to turn on imminently or is currently on.
@@ -379,7 +367,7 @@ export class HydrawiseController {
       // Update the irrigation system state.
       irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.InUse,
         (irrigationRemaining > 0) ? this.hap.Characteristic.InUse.IN_USE : this.hap.Characteristic.InUse.NOT_IN_USE);
-      irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.RemainingDuration, irrigationRemaining);
+      irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.RemainingDuration, Math.min(irrigationRemaining, 3600));
 
       // No more manually activated zones, we can resume our schedule.
       if(!Object.values(this.zoneHints).some(x => x.isManual)) {
@@ -528,18 +516,6 @@ export class HydrawiseController {
   private hasFeature(option: string): boolean {
 
     return this.platform.featureOptions.test(option, this.controller.serial_number);
-  }
-
-  // Utility function to set the name of a service.
-  private setServiceName(service: Service | undefined, name: string): void {
-
-    if(!service) {
-
-      return;
-    }
-
-    service.displayName = name;
-    service.updateCharacteristic(this.hap.Characteristic.Name, name);
   }
 
   // Utility function to get the configured name of a valve, if set.
