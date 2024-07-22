@@ -1,7 +1,7 @@
 {
   "name": "homebridge-hunter-hydrawise",
   "displayName": "Homebridge Hunter Hydrawise",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "HomeKit integration for Hunter Hydrawise Irrigation Controllers.",
   "license": "ISC",
   "author": {
@@ -28,7 +28,7 @@
     "build-ui": "shx mkdir -p homebridge-ui/public/lib && shx cp \"node_modules/homebridge-plugin-utils/dist/ui/**/*.@(js|mjs){,.map}\" homebridge-ui/public/lib",
     "clean": "shx rm -rf dist homebridge-ui/public/lib",
     "prelint": "npm run build-ui",
-    "lint": "eslint eslint.config.mjs src/**.ts homebridge-ui/*.js homebridge-ui/public/**/*.mjs",
+    "lint": "eslint --max-warnings=${ESLINT_MAX_WARNINGS:-\"-1\"} eslint.config.mjs src/**.ts homebridge-ui/*.js homebridge-ui/public/**/*.mjs",
     "postpublish": "npm run clean",
     "prepublishOnly": "npm run lint && npm run build"
   },
@@ -46,17 +46,17 @@
     "water"
   ],
   "devDependencies": {
-    "@stylistic/eslint-plugin": "^2.1.0",
-    "@types/node": "^20.14.2",
+    "@stylistic/eslint-plugin": "^2.3.0",
+    "@types/node": "^20.14.11",
     "eslint": "^8.5.7",
-    "homebridge": "^1.8.2",
+    "homebridge": "^1.8.4",
     "shx": "^0.3.4",
-    "typescript": "^5.4.5",
-    "typescript-eslint": "^7.12.0"
+    "typescript": "^5.5.3",
+    "typescript-eslint": "^7.16.1"
   },
   "dependencies": {
-    "@adobe/fetch": "^4.1.4",
+    "@adobe/fetch": "^4.1.8",
     "@homebridge/plugin-ui-utils": "^1.0.3",
-    "homebridge-plugin-utils": "^1.4.0"
+    "homebridge-plugin-utils": "^1.6.1"
   }
 }
