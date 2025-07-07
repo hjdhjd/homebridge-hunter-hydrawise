@@ -1,4 +1,4 @@
-/* Copyright(C) 2017-2024, HJD (https://github.com/hjdhjd). All rights reserved.
+/* Copyright(C) 2017-2025, HJD (https://github.com/hjdhjd). All rights reserved.
  *
  * ui.mjs: Homebridge Hunter Hydrawise webUI.
  */
@@ -54,7 +54,7 @@ const getDevices = async () => {
     firmwareVersion: (device.services.find(service => service.constructorName ===
       "AccessoryInformation")?.characteristics.find(characteristic => characteristic.constructorName === "FirmwareRevision")?.value ?? ""),
     name: device.displayName,
-    serial: (device.services.find(service => service.constructorName ===
+    serialNumber: (device.services.find(service => service.constructorName ===
       "AccessoryInformation")?.characteristics.find(characteristic => characteristic.constructorName === "SerialNumber")?.value ?? ""),
     zones: device.services.filter(service => service.constructorName === "Valve").length.toString()
   }));
@@ -91,7 +91,7 @@ const showDeviceDetails = (device) => {
 
     // Display our device details.
     deviceFirmware.innerHTML = device.firmwareVersion;
-    deviceSerial.innerHTML = device.serial;
+    deviceSerial.innerHTML = device.serialNumber;
     deviceZones.innerHTML = device.zones;
 };
 

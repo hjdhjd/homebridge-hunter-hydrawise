@@ -41,6 +41,7 @@ Feature options provide a rich mechanism for tailoring your `homebridge-hunter-h
 | Option                                           | Description
 |--------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 | `Device`                                         | Make this device available in HomeKit. **(default: enabled)**.
+| `Device.Suspend`                                 | Enable a switch accessory to control suspending all zones. **(default: disabled)**.
 
 #### <A NAME="log"></A>Logging feature options.
 

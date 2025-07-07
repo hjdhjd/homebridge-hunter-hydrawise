@@ -1,7 +1,14 @@
-/* Copyright(C) 2020-2024, HJD (https://github.com/hjdhjd). All rights reserved.
+/* Copyright(C) 2020-2025, HJD (https://github.com/hjdhjd). All rights reserved.
  *
  * hydrawise-types.ts: Interface and type definitions for Hydrawise.
  */
+// HBHH reserved names.
+export enum HydrawiseReservedNames {
+
+  // Manage our switch types.
+  SWITCH_SUSPEND_ALL = "All"
+}
+
 // Hydrawise API: Hydrawise irrigation controller configuration.
 export interface HydrawiseControllerConfig {
 

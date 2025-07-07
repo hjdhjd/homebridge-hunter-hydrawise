@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file. This project uses [semantic versioning](https://semver.org/).
 
+## 1.2.0 (2025-07-06)
+  * New feature: resume a schedule.
+  * Housekeeping.
+
 ## 1.1.2 (2024-07-22)
   * Housekeeping.
 

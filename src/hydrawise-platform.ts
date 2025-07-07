@@ -1,15 +1,17 @@
-/* Copyright(C) 2017-2024, HJD (https://github.com/hjdhjd). All rights reserved.
+/* Copyright(C) 2017-2025, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * hydrawise-platform.ts: homebridge-hydrawise platform class.
+ * hydrawise-platform.ts: homebridge-hunter-hydrawise platform class.
  */
-import { ALPNProtocol, AbortError, FetchError, Request, RequestOptions, Response, context, timeoutSignal } from "@adobe/fetch";
-import { API, APIEvent, DynamicPlatformPlugin, HAP, Logging, PlatformAccessory, PlatformConfig } from "homebridge";
-import { CustomerDetailsResponse, HydrawiseControllerConfig } from "./hydrawise-types.js";
+import type { API, DynamicPlatformPlugin, HAP, Logging, PlatformAccessory, PlatformConfig } from "homebridge";
+import type { CustomerDetailsResponse, HydrawiseControllerConfig } from "./hydrawise-types.js";
+import { type Dispatcher, Pool, interceptors, request, setGlobalDispatcher } from "undici";
 import { FeatureOptions, retry } from "homebridge-plugin-utils";
 import { HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_TIMEOUT, HYDRAWISE_MQTT_TOPIC, PLATFORM_NAME, PLUGIN_NAME  } from "./settings.js";
-import { HydrawiseOptions, featureOptionCategories, featureOptions } from "./hydrawise-options.js";
+import { type HydrawiseOptions, featureOptionCategories, featureOptions } from "./hydrawise-options.js";
+import { MqttClient, type Nullable } from "homebridge-plugin-utils";
+import { APIEvent } from "homebridge";
 import { HydrawiseController } from "./hydrawise-controller.js";
-import { MqttClient } from "homebridge-plugin-utils";
+import { STATUS_CODES } from "node:http";
 import util from "node:util";
 
 export class HydrawisePlatform implements DynamicPlatformPlugin {
@@ -20,10 +22,9 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   public readonly featureOptions: FeatureOptions;
   public config!: HydrawiseOptions;
   public readonly configuredDevices: { [index: string]: HydrawiseController };
-  private fetch: (url: string | Request, options?: RequestOptions) => Promise<Response>;
   public readonly hap: HAP;
   public readonly log: Logging;
-  public readonly mqtt: MqttClient | null;
+  public readonly mqtt: Nullable<MqttClient>;
 
   constructor(log: Logging, config: PlatformConfig, api: API) {
 
@@ -32,7 +33,6 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     this.api = api;
     this.configuredDevices = {};
     this.featureOptions = new FeatureOptions(featureOptionCategories, featureOptions, config?.options ?? []);
-    this.fetch = context({ alpnProtocols: [ALPNProtocol.ALPN_HTTP2], rejectUnauthorized: false, userAgent: "homebridge-hunter-hydrawise" }).fetch;
     this.hap = api.hap;
     this.log = log;
     this.log.debug = this.debug.bind(this);
@@ -60,6 +60,19 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
       return;
     }
+
+    // Create an interceptor that allows us to set the user agent to our liking.
+    const ua: Dispatcher.DispatcherComposeInterceptor = (dispatch) => (opts: Dispatcher.DispatchOptions, handler: Dispatcher.DispatchHandler) => {
+
+      opts.headers ??= {};
+      (opts.headers as Record<string, string>)["user-agent"] = "homebridge-hunter-hydrawise";
+
+      return dispatch(opts, handler);
+    };
+
+    // We want to enable the use of HTTP/2, accept unauthorized SSL certificates and retry a request up to three times.
+    setGlobalDispatcher(new Pool("https://api.hydrawise.com", { allowH2: true, clientTtl: 60 * 1000, connect: { rejectUnauthorized: false }, connections: 1 })
+      .compose(ua, interceptors.retry({ maxRetries: 3, maxTimeout: 5000, minTimeout: 1000, statusCodes: [ 400, 404, 429, 500, 502, 503, 504 ], timeoutFactor: 2 })));
 
     // Initialize MQTT, if needed.
     if(this.config.mqttUrl) {
@@ -98,17 +111,17 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
       try {
 
-        this.account = await response.json() as CustomerDetailsResponse;
+        this.account = await response.body.json() as CustomerDetailsResponse;
       } catch(error) {
 
-        this.log.error("Unable to retrieve the list of controllers: %s", util.inspect(error, { colors: true, sorted: true }));
+        this.log.error("Unable to retrieve the list of controllers: %s", util.inspect(error, { colors: true, depth: null, sorted: true }));
 
         return false;
       }
 
       this.log.info("Successfully connected to the Hydrawise API.");
 
-      this.log.debug(util.inspect(this.account, { colors: true, sorted: true }));
+      this.log.debug(util.inspect(this.account, { colors: true, depth: null, sorted: true }));
 
       // Trim whitespace on irrigation controller names.
       this.account.controllers = this.account.controllers.map(x => ({ ...x, name: x.name.trim() }));
@@ -129,7 +142,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   }
 
   // Configure a discovered irrigation controller.
-  private configureController(controller: HydrawiseControllerConfig): HydrawiseController | null {
+  private configureController(controller: HydrawiseControllerConfig): Nullable<HydrawiseController> {
 
     // Generate this controller's unique identifier.
     const uuid = this.hap.uuid.generate(controller.controller_id.toString());
@@ -191,8 +204,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   }
 
   // Communicate HTTP requests with the Hydrawise API.
-  // Internal interface to communicating HTTP requests with a Protect controller, with error handling.
-  public async retrieve(endpoint: string, params?: Record<string, string>, isRetry = false): Promise<Response | null> {
+  public async retrieve(endpoint: string, params?: Record<string, string>): Promise<Nullable<Dispatcher.ResponseData<unknown>>> {
 
     // Catch Hydrawise server-side issues:
     //
@@ -204,10 +216,12 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     // 503: Service temporarily unavailable.
     const isServerSideIssue = (code: number): boolean => [400, 404, 429, 500, 502, 503].includes(code);
 
-    let response: Response;
+    let response: Dispatcher.ResponseData<unknown>;
 
     // Create a signal handler to deliver the abort operation.
-    const signal = timeoutSignal(HYDRAWISE_API_TIMEOUT * 1000);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), HYDRAWISE_API_TIMEOUT * 1000);
+    const signal = controller.signal;
 
     if(!params) {
 
@@ -226,10 +240,10 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     try {
 
       // Execute the API call.
-      response = await this.fetch(url, { signal: signal });
+      response = await request(url, { signal: signal });
 
       // Bad username and password.
-      if(response.status === 404) {
+      if(response.statusCode === 404) {
 
         this.log.error("Invalid API key. Please check your Hydrawise API key.");
 
@@ -237,7 +251,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       }
 
       // API rate limit exceeded.
-      if(response.status === 429) {
+      if(response.statusCode === 429) {
 
         this.log.error("Hydrawise API rate limit has been exceeded.");
 
@@ -245,9 +259,10 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       }
 
       // Some other unknown error occurred.
-      if(!response.ok) {
+      if(!(response.statusCode >= 200) && (response.statusCode < 300)) {
 
-        this.log.error(isServerSideIssue(response.status) ? "Hydrawise API is temporarily unavailable." : response.status.toString() + ": " + await response.text());
+        this.log.error(isServerSideIssue(response.statusCode) ? "Hydrawise API is temporarily unavailable." : response.statusCode.toString() + ": " +
+          STATUS_CODES[response.statusCode]);
 
         return null;
       }
@@ -255,7 +270,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       return response;
     } catch(error) {
 
-      if(error instanceof AbortError) {
+      if((error instanceof DOMException) && (error.name === "AbortError")) {
 
         this.log.error("The Hydrawise API is taking too long to respond to a request. This error can usually be safely ignored.");
         this.log.debug("Original request was: %s", url);
@@ -263,33 +278,49 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
         return null;
       }
 
-      if(error instanceof FetchError) {
+      if(error instanceof TypeError) {
 
-        switch(error.code) {
+        const cause = error.cause as NodeJS.ErrnoException;
+
+        switch(cause.code) {
 
           case "ECONNREFUSED":
-          case "ERR_HTTP2_STREAM_CANCEL":
+          case "EHOSTDOWN":
 
             this.log.error("Connection refused.");
 
             break;
 
           case "ECONNRESET":
-          case "ERR_HTTP2_STREAM_ERROR":
+          case "UND_ERR_DESTROYED":
 
-            // Retry on connection reset, but no more than once.
-            if(!isRetry) {
+            this.log.error("Connection has been reset.");
 
-              return this.retrieve(endpoint, params, true);
-            }
+            break;
 
-            this.log.error("Network connection to the Hydrawise API has been reset.");
+          case "ENOTFOUND":
+
+            this.log.error("Hostname or IP address not found. Please ensure you're connected to the Internet.");
+
+            break;
+
+          case "UND_ERR_CONNECT_TIMEOUT":
+
+            this.log.error("Connection timed out.");
+
+            break;
+
+          case "UND_ERR_REQ_RETRY":
+
+            this.log.error("Unable to connect to the Hydrawise API. This is usually temporary and will retry automatically.");
 
             break;
 
           default:
 
-            this.log.error("Error: %s - %s.", error.code, error.message);
+            // If we're logging when we have an error, do so.
+            this.log.error("Error: %s | %s.", cause.code, cause.message);
+            this.log.error(util.inspect(error, { colors: true, depth: null, sorted: true}));
 
             break;
         }
@@ -299,7 +330,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     } finally {
 
       // Clear out our response timeout if needed.
-      signal.clear();
+      clearTimeout(timeout);
     }
   }
 
