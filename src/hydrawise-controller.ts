@@ -622,7 +622,7 @@ export class HydrawiseController {
   private formatStartTime(time: string): string {
 
     // Split it into hours and minutes and ensure we convert it in the process.
-    const [hours, minutes] = time.split(":").map(Number);
+    const [ hours, minutes ] = time.split(":").map(Number);
 
     // Return our user-friendly time string.
     return ((hours % 12) || 12).toString() + ":" + minutes.toString().padStart(2, "0") + " " + (hours >= 12 ? "PM" : "AM");

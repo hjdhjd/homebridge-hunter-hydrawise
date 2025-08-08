@@ -6,6 +6,7 @@
 "use strict";
 
 import { webUi } from "./lib/webUi.mjs";
+import { webUiFeatureOptions } from "./lib/webUi-featureoptions.mjs";
 
 // Execute our first run screen if we don't have a valid Hydrawise API key.
 const firstRunIsRequired = () => ui.featureOptions.currentConfig[0]?.apiKey?.length !== 19;
@@ -42,31 +43,32 @@ const firstRunOnSubmit = async () => {
   return true;
 };
 
-// Return the list of devices and associated details for this API key.
+// Tailor the list of devices and associated details for this API key.
 const getDevices = async () => {
 
+  // Retrieve the list of devices from HBPU that we then customize further.
+  const devices = await ui.featureOptions.getHomebridgeDevices();
+
   // Retrieve the full list of cached accessories.
-  let devices = await homebridge.getCachedAccessories();
+  const accessories = await homebridge.getCachedAccessories();
 
-  // Filter out only the components we're interested in.
-  devices = devices.map(device => ({
+  // We want to retrieve the list of zones associated with each accessory so we can include that in the UI.
+  for(const accessory of accessories) {
 
-    firmwareVersion: (device.services.find(service => service.constructorName ===
-      "AccessoryInformation")?.characteristics.find(characteristic => characteristic.constructorName === "FirmwareRevision")?.value ?? ""),
-    name: device.displayName,
-    serialNumber: (device.services.find(service => service.constructorName ===
-      "AccessoryInformation")?.characteristics.find(characteristic => characteristic.constructorName === "SerialNumber")?.value ?? ""),
-    zones: device.services.filter(service => service.constructorName === "Valve").length.toString()
-  }));
+    // Find the serial number of the accessory.
+    const info = accessory.services.find(s => s.constructorName === "AccessoryInformation");
+    const serialNumber = info?.characteristics.find(c => c.constructorName === "SerialNumber")?.value;
 
-  // Sort it for posterity.
-  devices.sort((a, b) => {
+    if(serialNumber) {
 
-    const aCase = (a.name ?? "").toLowerCase();
-    const bCase = (b.name ?? "").toLowerCase();
+      const device = devices.find(d => d.serialNumber === serialNumber);
 
-    return aCase > bCase ? 1 : (bCase > aCase ? -1 : 0);
-  });
+      if(device) {
+
+        device.zones = accessory.services.filter(service => service.constructorName === "Valve").length.toString();
+      }
+    }
+  }
 
   // Return the list.
   return devices;
@@ -75,31 +77,33 @@ const getDevices = async () => {
 // Show the details for this device.
 const showDeviceDetails = (device) => {
 
-    const deviceFirmware = document.getElementById("device_firmware") ?? {};
-    const deviceSerial = document.getElementById("device_serial") ?? {};
-    const deviceZones = document.getElementById("device_zones") ?? {};
+  const deviceStatsContainer = document.getElementById("deviceStatsContainer");
 
-    // No device specified, we must be in a global context.
-    if(!device) {
+  // No device specified, we must be in a global context.
+  if(!device) {
 
-      deviceFirmware.innerHTML = "N/A";
-      deviceSerial.innerHTML = "N/A";
-      deviceZones.innerHTML = "N/A";
+    deviceStatsContainer.innerHTML = "";
+    return;
+  }
 
-      return;
-    }
-
-    // Display our device details.
-    deviceFirmware.innerHTML = device.firmwareVersion;
-    deviceSerial.innerHTML = device.serialNumber;
-    deviceZones.innerHTML = device.zones;
+  // Populate the device details.
+  deviceStatsContainer.innerHTML =
+    "<div class=\"device-stats-grid\">" +
+      "<div class=\"stat-item\">" +
+        "<span class=\"stat-label\">MAC Address</span>" +
+        "<span class=\"stat-value font-monospace\">" + device.serialNumber + "</span>" +
+      "</div>" +
+      "<div class=\"stat-item\">" +
+        "<span class=\"stat-label\">Zones</span>" +
+        "<span class=\"stat-value\">" +  device.zones + "</span>" +
+      "</div>" +
+    "</div>";
 };
 
 // Parameters for our feature options webUI.
 const featureOptionsParams = {
 
   getDevices: getDevices,
-  hasControllers: false,
   infoPanel: showDeviceDetails,
   sidebar: {
 

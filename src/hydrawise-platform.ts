@@ -198,7 +198,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     this.log.info("%s: Removing device from HomeKit.", accessory.displayName);
 
     // Unregister the accessory and delete it's remnants from HomeKit.
-    this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [ accessory ]);
+    this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
     this.accessories.splice(this.accessories.indexOf(accessory), 1);
     this.api.updatePlatformAccessories(this.accessories);
   }
@@ -214,7 +214,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     // 500: Internal server error.
     // 502: Bad gateway.
     // 503: Service temporarily unavailable.
-    const serverErrors = new Set([400, 404, 429, 500, 502, 503]);
+    const serverErrors = new Set([ 400, 404, 429, 500, 502, 503 ]);
 
     let response: Dispatcher.ResponseData<unknown>;
 
