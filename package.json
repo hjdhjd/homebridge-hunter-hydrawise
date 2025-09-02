@@ -1,7 +1,7 @@
 {
   "name": "homebridge-hunter-hydrawise",
-  "displayName": "Homebridge Hunter Hydrawise",
-  "version": "1.2.3",
+  "displayName": "Hunter Hydrawise",
+  "version": "1.2.4",
   "description": "HomeKit integration for Hunter Hydrawise Irrigation Controllers.",
   "license": "ISC",
   "author": {
@@ -46,17 +46,17 @@
     "water"
   ],
   "devDependencies": {
-    "@stylistic/eslint-plugin": "5.2.3",
-    "@types/node": "24.2.1",
-    "eslint": "9.33.0",
+    "@stylistic/eslint-plugin": "5.3.1",
+    "@types/node": "24.3.0",
+    "eslint": "9.34.0",
     "homebridge": "1.11.0",
     "shx": "0.4.0",
     "typescript": "5.9.2",
-    "typescript-eslint": "8.39.0"
+    "typescript-eslint": "8.42.0"
   },
   "dependencies": {
     "@homebridge/plugin-ui-utils": "2.1.0",
-    "homebridge-plugin-utils": "1.27.1",
-    "undici": "7.13.0"
+    "homebridge-plugin-utils": "1.29.1",
+    "undici": "7.15.0"
   }
 }

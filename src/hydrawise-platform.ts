@@ -19,14 +19,15 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   private readonly accessories: PlatformAccessory[];
   private account: CustomerDetailsResponse;
   public readonly api: API;
+  private dispatcher?: Dispatcher;
   public readonly featureOptions: FeatureOptions;
-  public config!: HydrawiseOptions;
-  public readonly configuredDevices: { [index: string]: HydrawiseController };
+  public config: HydrawiseOptions;
+  public readonly configuredDevices: { [index: string]: HydrawiseController | undefined };
   public readonly hap: HAP;
   public readonly log: Logging;
   public readonly mqtt: Nullable<MqttClient>;
 
-  constructor(log: Logging, config: PlatformConfig, api: API) {
+  constructor(log: Logging, config: PlatformConfig | undefined, api: API) {
 
     this.accessories = [];
     this.account = {} as CustomerDetailsResponse;
@@ -38,22 +39,17 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     this.log.debug = this.debug.bind(this);
     this.mqtt = null;
 
-    // We can't start without being configured.
-    if(!config) {
-
-      return;
-    }
-
     this.config = {
 
-      apiKey: config.apiKey as string,
-      debug: config.debug === true,
-      mqttTopic: (config.mqttTopic as string) ?? HYDRAWISE_MQTT_TOPIC,
-      mqttUrl: config.mqttUrl as string,
-      options: config.options as string[]
+      apiKey: config?.apiKey ?? "",
+      debug: config?.debug === true,
+      mqttTopic: config?.mqttTopic ?? HYDRAWISE_MQTT_TOPIC,
+      mqttUrl: config?.mqttUrl,
+      options: config?.options ?? []
     };
 
     // No Hydrawise API key, we're done.
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
     if(!this.config.apiKey?.length) {
 
       this.log.error("Unable to startup: no Hunter Hydrawise API key has been configured. Please configure one and restart the plugin.");
@@ -61,18 +57,8 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       return;
     }
 
-    // Create an interceptor that allows us to set the user agent to our liking.
-    const ua: Dispatcher.DispatcherComposeInterceptor = (dispatch) => (opts: Dispatcher.DispatchOptions, handler: Dispatcher.DispatchHandler) => {
-
-      opts.headers ??= {};
-      (opts.headers as Record<string, string>)["user-agent"] = "homebridge-hunter-hydrawise";
-
-      return dispatch(opts, handler);
-    };
-
-    // We want to enable the use of HTTP/2, accept unauthorized SSL certificates and retry a request up to three times.
-    setGlobalDispatcher(new Pool("https://api.hydrawise.com", { allowH2: true, clientTtl: 60 * 1000, connect: { rejectUnauthorized: false }, connections: 1 })
-      .compose(ua, interceptors.retry({ maxRetries: 3, maxTimeout: 5000, minTimeout: 1000, statusCodes: [ 400, 404, 429, 500, 502, 503, 504 ], timeoutFactor: 2 })));
+    // Initialize our network connectivity.
+    this.initNetworking();
 
     // Initialize MQTT, if needed.
     if(this.config.mqttUrl) {
@@ -203,6 +189,28 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     this.api.updatePlatformAccessories(this.accessories);
   }
 
+  // Initialize our network stack.
+  private initNetworking(): void {
+
+    // Create an interceptor that allows us to set the user agent to our liking.
+    const ua: Dispatcher.DispatcherComposeInterceptor = (dispatch) => (opts: Dispatcher.DispatchOptions, handler: Dispatcher.DispatchHandler) => {
+
+      opts.headers ??= {};
+      (opts.headers as Record<string, string>)["user-agent"] = "homebridge-hunter-hydrawise";
+
+      return dispatch(opts, handler);
+    };
+
+    // Cleanup any existing dispatcher we may have.
+    void this.dispatcher?.destroy();
+
+    // We want to enable the use of HTTP/2, accept unauthorized SSL certificates and retry a request up to three times.
+    this.dispatcher = new Pool("https://api.hydrawise.com", { allowH2: true, clientTtl: 60 * 1000, connect: { rejectUnauthorized: false }, connections: 1 })
+      .compose(ua, interceptors.retry({ maxRetries: 3, maxTimeout: 5000, minTimeout: 1000, statusCodes: [ 400, 404, 429, 500, 502, 503, 504 ], timeoutFactor: 2 }));
+
+    setGlobalDispatcher(this.dispatcher);
+  }
+
   // Communicate HTTP requests with the Hydrawise API.
   public async retrieve(endpoint: string, params?: Record<string, string>): Promise<Nullable<Dispatcher.ResponseData<unknown>>> {
 
@@ -223,10 +231,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     const timeout = setTimeout(() => controller.abort(), HYDRAWISE_API_TIMEOUT * 1000);
     const signal = controller.signal;
 
-    if(!params) {
-
-      params = {};
-    }
+    params ??= {};
 
     // Set our API key.
     // eslint-disable-next-line camelcase
@@ -276,24 +281,16 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
         this.log.error("The Hydrawise API is taking too long to respond to a request. This error can usually be safely ignored.");
         this.log.debug("Original request was: %s", url);
 
+        // Reset our network stack, just in case.
+        this.initNetworking();
+
         return null;
       }
 
       // Connection timed out.
       if(error instanceof errors.ConnectTimeoutError) {
 
-        switch(error.code) {
-
-          case "UND_ERR_CONNECT_TIMEOUT":
-
-            this.log.error("Connection timed out.");
-
-            break;
-
-          default:
-
-            break;
-        }
+        this.log.error("Connection timed out.");
 
         return null;
       }
@@ -301,18 +298,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       // We destroyed the pool due to a reset event and our inflight connections are failing.
       if(error instanceof errors.RequestRetryError) {
 
-        switch(error.code) {
-
-          case "UND_ERR_REQ_RETRY":
-
-            this.log.error("Unable to connect to the Hydrawise API. This is usually temporary and will retry automatically.");
-
-            break;
-
-          default:
-
-            break;
-        }
+        this.log.error("Unable to connect to the Hydrawise API. This is usually temporary and will retry automatically.");
 
         return null;
       }

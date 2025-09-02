@@ -15,8 +15,8 @@ import util from "node:util";
 // Device-specific options and settings.
 interface HydrawiseHints {
 
-  logZone: boolean,
-  suspendAll: boolean
+  logZone: boolean;
+  suspendAll: boolean;
 }
 
 export class HydrawiseController {
@@ -37,7 +37,7 @@ export class HydrawiseController {
 
     this.accessory = accessory;
     this.api = platform.api;
-    this.status = {} as StatusScheduleResponse;
+    this.status = { nextpoll: -1, relays: [] as HydrawiseZoneConfig[] } as StatusScheduleResponse;
     this.config = platform.config;
     this.hap = this.api.hap;
     this.hints = {} as HydrawiseHints;
@@ -197,9 +197,9 @@ export class HydrawiseController {
     }
 
     // Suspend or resume the irrigation schedule.
-    service.getCharacteristic(this.hap.Characteristic.On)?.onGet(() => this.isAllSuspended);
+    service.getCharacteristic(this.hap.Characteristic.On).onGet(() => this.isAllSuspended);
 
-    service.getCharacteristic(this.hap.Characteristic.On)?.onSet(async (value: CharacteristicValue) => {
+    service.getCharacteristic(this.hap.Characteristic.On).onSet(async (value: CharacteristicValue) => {
 
       // We either set the timestamp to the current time, to resume irrigation, or to a year from now to suspend irrigation.
       const timestamp = (Date.now() / 1000) + (value ? 31556926 : 0);
@@ -244,11 +244,12 @@ export class HydrawiseController {
     // We loop forever, updating our irrigation system state at regular intervals.
     for(;;) {
 
-      const isFirstRun = this.status?.nextpoll === undefined;
+      const isFirstRun = this.status.nextpoll === -1;
 
       // Update our status. If it's our first run through, we use our internal defaults.
       // eslint-disable-next-line no-await-in-loop
-      await retry(async () => this.getStatus(), (isFirstRun ? HYDRAWISE_API_RETRY_INTERVAL : (this.status.nextpoll + HYDRAWISE_API_JITTER)) * 1000);
+      await retry(async () => this.getStatus(),
+        (isFirstRun ? HYDRAWISE_API_RETRY_INTERVAL : Math.min(this.status.nextpoll + HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL * 2)) * 1000);
 
       // Let's get the list of current valves on this irrigation controller.
       const currentValves = this.status.relays.map(x => x.relay_id.toString());
@@ -270,8 +271,8 @@ export class HydrawiseController {
         // Acquire the valve service.
         let isNewValve = false;
         const valveService = acquireService(this.accessory, this.hap.Service.Valve,
-          (this.accessory.getServiceById(this.hap.Service.Valve, zone.relay_id.toString())?.getCharacteristic(this.hap.Characteristic.ConfiguredName).value as string) ??
-            zone.name, zone.relay_id.toString(), (newService: Service) => {
+          (this.accessory.getServiceById(this.hap.Service.Valve, zone.relay_id.toString())
+            ?.getCharacteristic(this.hap.Characteristic.ConfiguredName).value as string | undefined) ?? zone.name, zone.relay_id.toString(), (newService: Service) => {
 
             // Enumerate the valve service to align with the irrigation controller's zone numbering.
             newService.updateCharacteristic(this.hap.Characteristic.ServiceLabelIndex, zone.relay);
@@ -297,16 +298,11 @@ export class HydrawiseController {
         const isStopped = this.isStoppedBySensor(zone);
 
         // Inform the user.
+        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
         if(isFirstRun || isNewValve) {
 
-          // Create our zone hints, if needed.
-          if(!this.zoneHints[zone.relay_id]) {
-
-            this.zoneHints[zone.relay_id] = {};
-          }
-
-          // Initialize our stopped state.
-          this.zoneHints[zone.relay_id].isStopped = isStopped;
+          // Create our zone hints, if needed and initialize our stopped state.
+          (this.zoneHints[zone.relay_id] ??= {}).isStopped = isStopped;
 
           this.log.info("%s: %s", this.getValveName(valveService, zone), this.zoneStatus(zone));
 
@@ -637,13 +633,13 @@ export class HydrawiseController {
   // Utility function to get the configured name of a valve, if set.
   private getValveName(service: Service, zone: HydrawiseZoneConfig): string {
 
-    return ((service.getCharacteristic(this.hap.Characteristic.ConfiguredName).value as string) ?? zone.name) + " [Zone " + zone.relay + "]";
+    return ((service.getCharacteristic(this.hap.Characteristic.ConfiguredName).value as string | undefined) ?? zone.name) + " [Zone " + zone.relay + "]";
   }
 
   // Utility to return whether all zones are suspended or not.
   private get isAllSuspended(): boolean {
 
-    return !this.status.relays?.some(zone => zone.run || zone.timestr || (zone.time !== 1576800000) || this.isStoppedBySensor(zone));
+    return !this.status.relays.some(zone => zone.run || zone.timestr || (zone.time !== 1576800000) || this.isStoppedBySensor(zone));
   }
 
   // Utility to return our status as a JSON for MQTT.
@@ -656,7 +652,7 @@ export class HydrawiseController {
   private get name(): string {
 
     // We use the irrigation system service as the natural proxy for the name.
-    const name = this.accessory.getService(this.hap.Service.IrrigationSystem)?.getCharacteristic(this.hap.Characteristic.Name).value as string;
+    const name = this.accessory.getService(this.hap.Service.IrrigationSystem)?.getCharacteristic(this.hap.Characteristic.Name).value as string | undefined;
 
     // If we don't have a name for the irrigation system service, return the controller name from Hydrawise.
     return name?.length ? name : this.controller.name;
@@ -665,7 +661,7 @@ export class HydrawiseController {
   // Utility function to return the current accessory name of this device.
   private get accessoryName(): string {
 
-    return ((this.accessory.getService(this.hap.Service.AccessoryInformation)?.getCharacteristic(this.hap.Characteristic.Name).value as string) ??
+    return ((this.accessory.getService(this.hap.Service.AccessoryInformation)?.getCharacteristic(this.hap.Characteristic.Name).value as string | undefined) ??
       this.controller.name);
   }
 
