@@ -2,15 +2,16 @@
  *
  * v2.ts: Hydrawise v2 GraphQL API client.
  */
-import { HYDRAWISE_V2_CLIENT_ID, HYDRAWISE_V2_CLIENT_SECRET, HYDRAWISE_V2_GRAPH_ENDPOINT, HYDRAWISE_V2_MUTATION_ADMISSION_TIMEOUT,
-  HYDRAWISE_V2_REFRESH_THRESHOLD, HYDRAWISE_V2_TIMEOUT, HYDRAWISE_V2_TOKEN_ENDPOINT } from "./settings.ts";
+import { HYDRAWISE_TRANSPORT_FAULT_SENTENCES, HYDRAWISE_V2_CLIENT_ID, HYDRAWISE_V2_CLIENT_SECRET, HYDRAWISE_V2_GRAPH_ENDPOINT,
+  HYDRAWISE_V2_MUTATION_ADMISSION_TIMEOUT, HYDRAWISE_V2_REFRESH_THRESHOLD, HYDRAWISE_V2_TIMEOUT, HYDRAWISE_V2_TOKEN_ENDPOINT,
+  PLUGIN_NAME } from "./settings.ts";
 import { HYDRAWISE_V2_MUTATION_OK, controllerV2Facts } from "./types.ts";
 import type { HomebridgePluginLogging, Nullable, RateBudget } from "homebridge-plugin-utils";
 import type { HydrawiseControllerV2Facts, HydrawiseV2Account, HydrawiseV2GraphResponse, HydrawiseV2MutationData, HydrawiseV2MutationResult,
   HydrawiseV2TokenResponse, HydrawiseV2TokenState } from "./types.ts";
-import { Pool, request } from "undici";
-import { composeSignals, waitWithSignal } from "homebridge-plugin-utils";
+import { classifyTransportError, composeSignals, createApiDispatcher, waitWithSignal } from "homebridge-plugin-utils";
 import type { Dispatcher } from "undici";
+import { request } from "undici";
 import util from "node:util";
 
 /* The whole-account query, stated once. It asks for every controller on the account in ONE request, which is what lets the platform fetch a single time and hand
@@ -67,7 +68,7 @@ const MUTATION_OFFSET_LABEL = "-0500";
  */
 interface HydrawiseV2Failure {
 
-  joiner: string;
+  joiner: "." | ":";
   reason: string;
 }
 
@@ -139,11 +140,13 @@ export class HydrawiseV2Client {
     this.token = { state: "none" };
     this.username = options.username;
 
-    // The default factory builds a keep-alive HTTP/2 pool against the v2 origin, derived from the endpoint constant so the pool and the requests it carries can
-    // never target different hosts. The one-minute client TTL recycles that connection periodically rather than holding it open for the plugin's whole session,
-    // the same choice the v1 transport makes for its own pool.
+    /* The default factory builds the family's vetted pool against the v2 origin, derived from the endpoint constant so the pool and the requests it carries can never
+     * target different hosts. Transport retries are declined on purpose: every call here is paced by a deliberately small budget that a retry would spend repeating a
+     * question the server already answered, and a status the retry policy would re-ask is, on this API, an answer this client reads for itself - with retries on, it
+     * would arrive as an exhausted-retries failure instead.
+     */
     this.dispatcherFactory = options.dispatcherFactory ??
-      ((): Dispatcher => new Pool(new URL(HYDRAWISE_V2_GRAPH_ENDPOINT).origin, { allowH2: true, clientTtl: 60 * 1000, connections: 1 }));
+      ((): Dispatcher => createApiDispatcher({ origin: new URL(HYDRAWISE_V2_GRAPH_ENDPOINT).origin, retry: false, userAgent: PLUGIN_NAME }));
     this.currentDispatcher = this.dispatcherFactory();
   }
 
@@ -515,26 +518,44 @@ export class HydrawiseV2Client {
 
   /* Classify a thrown request failure into the reason a caller reports, taking whatever recovery the kind of failure calls for along the way.
    *
-   * A shutdown supersedes every other classification and answers NOTHING to report: near the timeout boundary the composed rejection's shape is ambiguous, so the
-   * plugin signal's own aborted flag is the truth, and answering quietly here also guarantees the self-heal below can never re-arm a pool after shutdown.
+   * The switch is exhaustive over the classifier's kinds with no default arm, so a kind the library learns to name is a compile error here until this client says
+   * what it means. A shutdown answers nothing to report: the lifetime signal outranks every reading of the error, which also guarantees the self-heal below can never
+   * re-arm a pool after shutdown.
    */
   private classifyFailure(error: unknown): Nullable<HydrawiseV2Failure> {
 
-    if(this.signal.aborted) {
+    const failure = classifyTransportError(error, this.signal);
 
-      return null;
+    switch(failure.kind) {
+
+      case "aborted":
+
+        return null;
+
+      // A timed-out request re-arms the connection pool. With a single connection a wedged session carries every request on it, so destroying and replacing the pool
+      // fails those fast onto a fresh one, where a graceful drain would instead wait on the very wedge the re-arm is clearing.
+      case "timeout":
+
+        this.rearmDispatcher();
+
+        return { joiner: ".", reason: "The Hydrawise API took too long to respond, which can usually be safely ignored." };
+
+      // A concrete network fault reads as the sentence the plugin keeps for it, a complete sentence in its own right, so it follows the report's sentence as one.
+      case "connect-timeout":
+      case "destroyed":
+      case "dns":
+      case "refused":
+      case "reset":
+      case "retries-exhausted":
+
+        return { joiner: ".", reason: HYDRAWISE_TRANSPORT_FAULT_SENTENCES[failure.kind] };
+
+      // A genuine failure carrying no marker anyone can read: the dump is the reason, and a colon is what marks it as text being quoted rather than a sentence
+      // being said.
+      case "transport":
+
+        return { joiner: ":", reason: util.inspect(error, { colors: true, depth: null, sorted: true }) };
     }
-
-    // A timed-out request re-arms the connection pool. With a single connection a wedged session carries every request on it, so destroying and replacing the pool
-    // fails those fast onto a fresh one, where a graceful drain would instead wait on the very wedge the re-arm is clearing.
-    if((error instanceof DOMException) && (error.name === "TimeoutError")) {
-
-      this.rearmDispatcher();
-
-      return { joiner: ".", reason: "The Hydrawise API took too long to respond, which can usually be safely ignored." };
-    }
-
-    return { joiner: ":", reason: util.inspect(error, { colors: true, depth: null, sorted: true }) };
   }
 
   // Destroy the current dispatcher and build its replacement through the same factory the constructor used, so a re-arm runs the identical code path whether this

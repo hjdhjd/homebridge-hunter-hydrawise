@@ -4,13 +4,10 @@
  */
 "use strict";
 
-import { HYDRAWISE_API_TIMEOUT, HYDRAWISE_V2_CLIENT_ID, HYDRAWISE_V2_CLIENT_SECRET, HYDRAWISE_V2_GRAPH_ENDPOINT, HYDRAWISE_V2_TIMEOUT,
-  HYDRAWISE_V2_TOKEN_ENDPOINT } from "../dist/settings.js";
+import { HYDRAWISE_API_BASE_URL, HYDRAWISE_API_TIMEOUT, HYDRAWISE_V2_CLIENT_ID, HYDRAWISE_V2_CLIENT_SECRET, HYDRAWISE_V2_GRAPH_ENDPOINT,
+  HYDRAWISE_V2_TIMEOUT, HYDRAWISE_V2_TOKEN_ENDPOINT } from "../dist/settings.js";
 import { featureOptionCategories, featureOptions } from "../dist/options.js";
 import { HomebridgePluginUiServer } from "@homebridge/plugin-ui-utils";
-
-// The base URL for every v1 REST call this server makes. The account-login validation below reaches the v2 API through its own endpoint constants instead.
-const HYDRAWISE_API_BASE = "https://api.hydrawise.com/api/v1/";
 
 /* The account-login validation this server performs is a SECOND implementation of the OAuth grant and graph call the plugin's own v2 client runs, and that is a
  * deliberate duplication rather than an oversight. This is a separate process from the running plugin: it can import compiled constants from dist, which is why
@@ -84,7 +81,7 @@ const fetchControllers = async (apiKey) => {
 
     params.set("api_key", apiKey);
 
-    const response = await fetch(HYDRAWISE_API_BASE + "customerdetails.php?" + params.toString(), { signal: AbortSignal.timeout(HYDRAWISE_API_TIMEOUT * 1000) });
+    const response = await fetch(HYDRAWISE_API_BASE_URL + "customerdetails.php?" + params.toString(), { signal: AbortSignal.timeout(HYDRAWISE_API_TIMEOUT * 1000) });
 
     if(!response.ok) {
 
@@ -127,7 +124,7 @@ const fetchZones = async (apiKey, controllers) => {
       params.set("controller_id", String(controller.controllerId));
 
       // eslint-disable-next-line no-await-in-loop
-      const response = await fetch(HYDRAWISE_API_BASE + "statusschedule.php?" + params.toString(), { signal: AbortSignal.timeout(HYDRAWISE_API_TIMEOUT * 1000) });
+      const response = await fetch(HYDRAWISE_API_BASE_URL + "statusschedule.php?" + params.toString(), { signal: AbortSignal.timeout(HYDRAWISE_API_TIMEOUT * 1000) });
 
       if(!response.ok) {
 
@@ -244,7 +241,7 @@ class PluginUiServer extends HomebridgePluginUiServer {
 
         params.set("api_key", apiKey);
 
-        const response = await fetch(HYDRAWISE_API_BASE + "customerdetails.php?" + params.toString(), { signal: AbortSignal.timeout(HYDRAWISE_API_TIMEOUT * 1000) });
+        const response = await fetch(HYDRAWISE_API_BASE_URL + "customerdetails.php?" + params.toString(), { signal: AbortSignal.timeout(HYDRAWISE_API_TIMEOUT * 1000) });
 
         if(!response.ok) {
 

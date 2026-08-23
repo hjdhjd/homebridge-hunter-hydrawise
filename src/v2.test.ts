@@ -12,13 +12,14 @@
  */
 // The OAuth and GraphQL wire shapes use snake_case keys such as access_token, so camelcase is disabled here to let the fixtures mirror the captured bodies verbatim.
 /* eslint-disable camelcase */
-import { HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_V2_CLIENT_ID, HYDRAWISE_V2_CLIENT_SECRET, HYDRAWISE_V2_GRAPH_ENDPOINT,
-  HYDRAWISE_V2_MUTATION_ADMISSION_TIMEOUT, HYDRAWISE_V2_MUTATION_BUDGET_CALLS, HYDRAWISE_V2_MUTATION_BUDGET_WINDOW,
+import { HYDRAWISE_TRANSPORT_FAULT_SENTENCES, HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_V2_CLIENT_ID, HYDRAWISE_V2_CLIENT_SECRET,
+  HYDRAWISE_V2_GRAPH_ENDPOINT, HYDRAWISE_V2_MUTATION_ADMISSION_TIMEOUT, HYDRAWISE_V2_MUTATION_BUDGET_CALLS, HYDRAWISE_V2_MUTATION_BUDGET_WINDOW,
   HYDRAWISE_V2_TOKEN_ENDPOINT } from "./settings.ts";
+import { MockAgent, errors } from "undici";
 import { describe, test } from "node:test";
 import type { CapturedLogLine } from "./testing.helpers.ts";
+import type { HydrawiseTransportFault } from "./settings.ts";
 import { HydrawiseV2Client } from "./v2.ts";
-import { MockAgent } from "undici";
 import { RateBudget } from "homebridge-plugin-utils";
 import assert from "node:assert/strict";
 import { capturingLog } from "./testing.helpers.ts";
@@ -1337,5 +1338,95 @@ describe("HydrawiseV2Client dispatcher", () => {
      */
     assert.equal(client.dispatcher, second, "the timeout re-armed the pool, and the getter answers the live one");
     assert.ok(lines().some(line => (line.level === "error") && line.message.includes("too long to respond")), "the timeout is reported to the user");
+  });
+
+  test("a response deadline re-arms the connection pool exactly as the request deadline does", async () => {
+
+    const first = destroyable(new MockAgent());
+    const second = new MockAgent();
+    const built = [ first, second ];
+    const { lines, logger } = capturingLog();
+    const signal = new AbortController().signal;
+
+    first.disableNetConnect();
+    second.disableNetConnect();
+
+    // The transport's own header deadline is a deadline elapsing exactly as the composed per-request timeout is, so it takes the same arm: the same sentence, and
+    // the same replacement of a pool whose single connection every in-flight request was riding.
+    first.get(V2_ORIGIN).intercept({ method: "POST", path: TOKEN_PATH }).replyWithError(new errors.HeadersTimeoutError()).persist();
+
+    const client = new HydrawiseV2Client({ budget: new RateBudget({ capacity: HYDRAWISE_V2_BUDGET_CALLS, signal, window: HYDRAWISE_V2_BUDGET_WINDOW * 1000 }),
+      dispatcherFactory: (): MockAgent => built.shift() ?? second, log: logger,
+      mutationBudget: new RateBudget({ capacity: HYDRAWISE_V2_MUTATION_BUDGET_CALLS, signal, window: HYDRAWISE_V2_MUTATION_BUDGET_WINDOW * 1000 }),
+      password: "test-password", signal, username: "test-user" });
+
+    assert.equal(client.dispatcher, first, "the client starts on the dispatcher its factory built");
+    assert.equal(await client.ensureToken(), null, "a grant that outran the response deadline answers null");
+    assert.equal(client.dispatcher, second, "the deadline re-armed the pool, and the getter answers the live one");
+    assert.ok(lines().some(line => (line.level === "error") && line.message.includes("too long to respond")), "and the deadline is reported to the user");
+  });
+
+  test("every coded transport fault is reported as the sentence the plugin keeps for its kind", async () => {
+
+    /* Each row pairs a wire code with the kind it classifies as, and the expected sentence is READ from the shared table rather than restated here - so what this
+     * pins is the wiring: that a fault of a given kind reaches that kind's entry, joined to the caller's sentence by a period. The prose of each sentence is pinned
+     * literally by the retrieve suite's substring assertions over the same table, which divides the work between them: a mis-paired kind fails here, and a mistyped
+     * sentence fails there.
+     */
+    const faultRows: { code: string; kind: HydrawiseTransportFault }[] = [
+
+      { code: "ECONNREFUSED", kind: "refused" },
+      { code: "ECONNRESET", kind: "reset" },
+      { code: "ENOTFOUND", kind: "dns" },
+      { code: "UND_ERR_CONNECT_TIMEOUT", kind: "connect-timeout" },
+      { code: "UND_ERR_DESTROYED", kind: "destroyed" },
+      { code: "UND_ERR_REQ_RETRY", kind: "retries-exhausted" }
+    ];
+
+    assert.deepEqual(faultRows.map(row => row.kind).toSorted(), Object.keys(HYDRAWISE_TRANSPORT_FAULT_SENTENCES).toSorted(),
+      "a kind the table names is a row this test demands");
+
+    for(const row of faultRows) {
+
+      const first = destroyable(new MockAgent());
+      const second = new MockAgent();
+      const built = [ first, second ];
+      const { lines, logger } = capturingLog();
+      const signal = new AbortController().signal;
+
+      first.disableNetConnect();
+      second.disableNetConnect();
+      first.get(V2_ORIGIN).intercept({ method: "POST", path: TOKEN_PATH })
+        .replyWithError(Object.assign(new Error("a transport fault"), { code: row.code })).persist();
+
+      const client = new HydrawiseV2Client({ budget: new RateBudget({ capacity: HYDRAWISE_V2_BUDGET_CALLS, signal, window: HYDRAWISE_V2_BUDGET_WINDOW * 1000 }),
+        dispatcherFactory: (): MockAgent => built.shift() ?? second, log: logger,
+        mutationBudget: new RateBudget({ capacity: HYDRAWISE_V2_MUTATION_BUDGET_CALLS, signal, window: HYDRAWISE_V2_MUTATION_BUDGET_WINDOW * 1000 }),
+        password: "test-password", signal, username: "test-user" });
+
+      // eslint-disable-next-line no-await-in-loop
+      assert.equal(await client.ensureToken(), null, "a coded transport fault answers the same null every failed grant does");
+      assert.deepEqual(errorLines(lines()),
+        ["Unable to sign in to your Hydrawise account for enhanced features. " + HYDRAWISE_TRANSPORT_FAULT_SENTENCES[row.kind]],
+        "and it reads as the sign-in sentence joined to the fault's own by a period");
+      assert.equal(client.dispatcher, first, "while a fault that is not a deadline leaves the pool alone");
+    }
+  });
+
+  test("a transport fault on a suspension command travels back as the sentence the controller says", async () => {
+
+    /* The command path is where a transport fault reaches a user under the name of the zone they touched: the failure travels back in the result rather than being
+     * logged here, so the reason the controller is handed is what this pins.
+     */
+    const harness = makeV2Harness((agent, record) => {
+
+      programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
+      agent.get(V2_ORIGIN).intercept({ method: "POST", path: GRAPH_PATH })
+        .replyWithError(Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }));
+    });
+
+    assert.deepEqual(await harness.client.setZoneSuspension({ until: PROBE_SUSPEND_UNTIL, zoneId: QUIET_ZONE_ID }),
+      { reason: HYDRAWISE_TRANSPORT_FAULT_SENTENCES.refused, status: "failed" }, "the fault's own sentence travels back for the controller to say");
+    assert.deepEqual(errorLines(harness.lines()), [], "with nothing said here about the command that provoked it");
   });
 });

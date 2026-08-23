@@ -4,6 +4,7 @@
  */
 import type { Categories } from "homebridge";
 import type { HydrawiseEndpoint } from "./types.ts";
+import type { TransportFailure } from "homebridge-plugin-utils";
 
 // Hydrawise API response timeout, in seconds.
 export const HYDRAWISE_API_TIMEOUT = 7;
@@ -31,6 +32,28 @@ export const HYDRAWISE_COMMAND_BUDGET_WINDOW = 30;
 // The one Hydrawise endpoint that carries a zone command, and therefore the one that draws against the stricter command ceiling as well as the account-wide one.
 // The platform's draw branch and the controller's command dispatch both read this constant, so the endpoint identity has a single home.
 export const HYDRAWISE_COMMAND_ENDPOINT: HydrawiseEndpoint = "setzone.php";
+
+// The base URL every key-based API request is assembled on. The platform derives its connection pool's origin from this one constant, so the host a request goes to
+// and the host the pool connects to can never disagree - the same rule the account-credentialed API group below states for its own endpoints.
+export const HYDRAWISE_API_BASE_URL = "https://api.hydrawise.com/api/v1/";
+
+// The transport failures the classifier reaches only by matching a transport or errno code - each one a concrete network fault with a sentence of its own below.
+export type HydrawiseTransportFault = Extract<TransportFailure, { code: string }>["kind"];
+
+/* What each concrete network fault means to a Hydrawise user, stated once and read by both API clients. The key type is derived from the library's own union, so a
+ * fault kind the library learns to name is a compile error here until this plugin gives it a sentence. The lifetime abort, the deadline, and the unmarked failure are
+ * deliberately absent: an abort is silent, a deadline re-arms the catching client's own connection pool and speaks for itself there, and an unmarked failure has
+ * nothing better to offer than the error itself.
+ */
+export const HYDRAWISE_TRANSPORT_FAULT_SENTENCES: Readonly<Record<HydrawiseTransportFault, string>> = Object.freeze({
+
+  "connect-timeout": "Connection timed out.",
+  "destroyed": "A request to the Hydrawise API was interrupted while the connection was being reset.",
+  "dns": "Hostname or IP address not found. Please ensure you're connected to the Internet.",
+  "refused": "Connection refused.",
+  "reset": "Connection has been reset.",
+  "retries-exhausted": "Unable to connect to the Hydrawise API. This is usually temporary and will retry automatically."
+});
 
 /* The Hydrawise v2 API. This group states endpoints and credentials, which is a different kind of constant from the durations and call counts the rest of this
  * file carries, so it is marked out as its own group. Everything below is optional at runtime: the v2 surface is reached only when the user has configured their

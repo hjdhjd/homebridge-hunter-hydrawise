@@ -22,6 +22,7 @@ import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
 import { featureOptionCategories, featureOptions } from "../options.ts";
 import type { CapturedLogLine } from "../testing.helpers.ts";
 import type { Dispatcher } from "undici";
+import { HYDRAWISE_API_BASE_URL } from "../settings.ts";
 import { HydrawiseController } from "../controller.ts";
 import type { HydrawiseOptions } from "../options.ts";
 import { HydrawisePlatform } from "../platform.ts";
@@ -819,8 +820,9 @@ export function buildPlatform(options: BuildPlatformOptions = {}): BuildPlatform
   return { lines, platform, ...apiResult };
 }
 
-// The Hydrawise API origin every retrieve() request targets. The MockAgent intercepts against this origin.
-const HYDRAWISE_ORIGIN = "https://api.hydrawise.com";
+// The Hydrawise API origin every retrieve() request targets. The MockAgent intercepts against this origin, derived from the same base URL production assembles its
+// requests on so an intercept and the request it stands in for can never target different hosts.
+export const HYDRAWISE_ORIGIN = new URL(HYDRAWISE_API_BASE_URL).origin;
 
 // The AsyncDisposable handle installMockDispatcher returns: the MockAgent to program replies on, disposed with `await using` to restore the prior global
 // dispatcher and close the agent.

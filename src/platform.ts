@@ -3,25 +3,31 @@
  * platform.ts: homebridge-hunter-hydrawise platform class.
  */
 import type { API, Categories, DynamicPlatformPlugin, HAP, Logging, PlatformAccessory, PlatformConfig } from "homebridge";
-import { APIEvent, FeatureOptions, RateBudget, TimerRegistry, composeSignals, createMqttClient, loopFaultReporter, retry, sanitizeName,
-  superviseLoop } from "homebridge-plugin-utils";
+import { APIEvent, API_RETRY_STATUS_CODES, FeatureOptions, RateBudget, TimerRegistry, classifyTransportError, composeSignals, createApiDispatcher,
+  createMqttClient, loopFaultReporter, retry, sanitizeName, superviseLoop } from "homebridge-plugin-utils";
 import type { CustomerDetailsResponse, HydrawiseAccessory, HydrawiseAccessoryContext, HydrawiseControllerAccessory, HydrawiseControllerConfig,
   HydrawiseControllerIdentity, HydrawiseEndpoint, HydrawiseZoneIdentity, HydrawiseZoneSuspensionResult } from "./types.ts";
-import { HYDRAWISE_API_BUDGET_CALLS, HYDRAWISE_API_BUDGET_WINDOW, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_TIMEOUT, HYDRAWISE_COMMAND_BUDGET_CALLS,
-  HYDRAWISE_COMMAND_BUDGET_WINDOW, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_V2_MUTATION_BUDGET_CALLS,
-  HYDRAWISE_V2_MUTATION_BUDGET_WINDOW, HYDRAWISE_V2_REFRESH_INTERVAL, HYDRAWISE_ZONE_ACCESSORY_CATEGORY, HYDRAWISE_ZONE_ACCESSORY_GRACE_POLLS, PLATFORM_NAME,
-  PLUGIN_NAME } from "./settings.ts";
+import { HYDRAWISE_API_BASE_URL, HYDRAWISE_API_BUDGET_CALLS, HYDRAWISE_API_BUDGET_WINDOW, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_TIMEOUT,
+  HYDRAWISE_COMMAND_BUDGET_CALLS, HYDRAWISE_COMMAND_BUDGET_WINDOW, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_TRANSPORT_FAULT_SENTENCES,
+  HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_V2_MUTATION_BUDGET_CALLS, HYDRAWISE_V2_MUTATION_BUDGET_WINDOW,
+  HYDRAWISE_V2_REFRESH_INTERVAL, HYDRAWISE_ZONE_ACCESSORY_CATEGORY, HYDRAWISE_ZONE_ACCESSORY_GRACE_POLLS, PLATFORM_NAME, PLUGIN_NAME } from "./settings.ts";
 import type { HydrawiseGlobalFlagOption, HydrawiseGlobalValueOption, HydrawiseOptions } from "./options.ts";
 import type { MqttClient, Nullable } from "homebridge-plugin-utils";
-import { Pool, errors, interceptors, request, setGlobalDispatcher } from "undici";
 import { controllerIdentity, isZoneAccessoryContext, sameControllerIdentity, sameZoneIdentity, zoneAccessoryId } from "./types.ts";
 import { featureOptionCategories, featureOptions } from "./options.ts";
+import { request, setGlobalDispatcher } from "undici";
 import type { Dispatcher } from "undici";
 import { HydrawiseController } from "./controller.ts";
 import { HydrawiseV2Client } from "./v2.ts";
 import { STATUS_CODES } from "node:http";
 import { setTimeout as setTimeoutAsync } from "node:timers/promises";
 import util from "node:util";
+
+/* The statuses that share the temporarily-unavailable sentence in retrieve(), derived from the list the transport itself retries so the two can never disagree: a
+ * status the transport retries is, by definition, one this plugin describes as transient once the retries run out. 404 and 429 are members for that reason but never
+ * reach that classification, because each returns from its own dedicated branch first.
+ */
+const RETRYABLE_STATUSES: ReadonlySet<number> = new Set(API_RETRY_STATUS_CODES);
 
 export class HydrawisePlatform implements DynamicPlatformPlugin {
 
@@ -682,43 +688,21 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   // Initialize our network stack.
   private initNetworking(): void {
 
-    // Create an interceptor that allows us to set the user agent to our liking.
-    const ua: Dispatcher.DispatcherComposeInterceptor = (dispatch) => (opts: Dispatcher.DispatchOptions, handler: Dispatcher.DispatchHandler) => {
-
-      opts.headers ??= {};
-      (opts.headers as Record<string, string>)["user-agent"] = "homebridge-hunter-hydrawise";
-
-      return dispatch(opts, handler);
-    };
-
     // Destroy any existing dispatcher before we re-arm. With a single HTTP/2 connection a wedged session carries every in-flight request, so destroy fails them fast
     // onto the fresh pool through their own retry loops, where a graceful drain would instead wait on the very wedge the re-arm is clearing.
     void this.dispatcher?.destroy();
 
-    /* Enable HTTP/2 and bound retry attempts at maxRetries below. The statusCodes list names every status this interceptor treats as retryable, and it is kept
-     * byte-identical by hand to the serverErrors Set retrieve() builds for its own classification - a status added to or dropped from one list is expected to
-     * move in the other too, since nothing here derives one list from the other.
+    /* The family's vetted transport - the pool, the retry policy over the statuses RETRYABLE_STATUSES reads, and this plugin's name as the user agent - built against
+     * the origin derived from the one base URL every request is assembled on. Re-arming after a wedge is another call through the same factory, so the pool the
+     * constructor built and the pool a timeout rebuilds can never differ.
      */
-    this.dispatcher = new Pool("https://api.hydrawise.com", { allowH2: true, clientTtl: 60 * 1000, connections: 1 })
-      .compose(ua, interceptors.retry({ maxRetries: 3, maxTimeout: 5000, minTimeout: 1000, statusCodes: [ 400, 404, 429, 500, 502, 503, 504 ], timeoutFactor: 2 }));
+    this.dispatcher = createApiDispatcher({ origin: new URL(HYDRAWISE_API_BASE_URL).origin, userAgent: PLUGIN_NAME });
 
     setGlobalDispatcher(this.dispatcher);
   }
 
   // Communicate HTTP requests with the Hydrawise API.
   public async retrieve(endpoint: HydrawiseEndpoint, params?: Record<string, string>): Promise<Nullable<Dispatcher.ResponseData<unknown>>> {
-
-    /* The status codes that share the "temporarily unavailable" message below, mirroring the retry interceptor's own statusCodes list in initNetworking() so
-     * the two stay in sync. 404 and 429 are carried here for that symmetry but never actually reach this classification - each is resolved by its own
-     * dedicated branch earlier in this method and returns before this point - so in practice only these produce the message:
-     *
-     * 400: Bad request.
-     * 500: Internal server error.
-     * 502: Bad gateway.
-     * 503: Service temporarily unavailable.
-     * 504: Gateway timeout.
-     */
-    const serverErrors = new Set([ 400, 404, 429, 500, 502, 503, 504 ]);
 
     let response: Dispatcher.ResponseData<unknown>;
 
@@ -736,10 +720,10 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
        * into the classification below, whose aborted-signal branch returns the same quiet null every other teardown path returns.
        *
        * Two limits on what these budgets can promise, stated plainly. They admit LOGICAL calls and sit above undici's retry interceptor, so one admitted call can
-       * still put more than one request on the wire during a failure storm - the initial attempt plus whatever retries the interceptor's maxRetries setting in
-       * initNetworking() allows - accepted headroom, because retries exist to ride out exactly the trouble a ceiling is not the cause of. And they account only
-       * for this process: the Homebridge config UI runs its own server process against the same account, one customerdetails call per refresh plus one
-       * statusschedule call per controller it holds no cached context for, which an in-process window cannot see.
+       * still put more than one request on the wire during a failure storm - the initial attempt plus whatever retries the dispatcher factory's retry policy
+       * allows - accepted headroom, because retries exist to ride out exactly the trouble a ceiling is not the cause of. And they account only for this process:
+       * the Homebridge config UI runs its own server process against the same account, one customerdetails call per refresh plus one statusschedule call per
+       * controller it holds no cached context for, which an in-process window cannot see.
        */
       if(endpoint === HYDRAWISE_COMMAND_ENDPOINT) {
 
@@ -754,7 +738,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
       const queryParams = new URLSearchParams(params);
 
-      url = "https://api.hydrawise.com/api/v1/" + endpoint + "?" + queryParams.toString();
+      url = HYDRAWISE_API_BASE_URL + endpoint + "?" + queryParams.toString();
 
       // Compose a per-request timeout with the platform's shutdown signal, so a slow request aborts on the timeout and an in-flight request aborts on shutdown, all
       // through one signal handed to undici. The timeout is armed only now, after both budgets have admitted the call, so a wait for a rate-limit slot never eats
@@ -783,7 +767,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       // message once it has survived retries; every other non-2xx status reports its raw code and reason phrase.
       if((response.statusCode < 200) || (response.statusCode >= 300)) {
 
-        this.log.error(serverErrors.has(response.statusCode) ? "Hydrawise API is temporarily unavailable." : response.statusCode.toString() + ": " +
+        this.log.error(RETRYABLE_STATUSES.has(response.statusCode) ? "Hydrawise API is temporarily unavailable." : response.statusCode.toString() + ": " +
           (STATUS_CODES[response.statusCode] ?? ""));
 
         return null;
@@ -792,83 +776,49 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       return response;
     } catch(error) {
 
-      // A shutdown abort supersedes every other classification. Near the timeout boundary the composed rejection's shape is ambiguous, so the platform signal's own
-      // aborted flag is the truth: we exit quietly here, which also guarantees the timeout branch below can never re-arm the Pool after shutdown.
-      if(this.signal.aborted) {
+      const failure = classifyTransportError(error, this.signal);
 
-        return null;
+      /* Branch on the classified kind rather than on error shapes, with no default arm: the switch is exhaustive over the classifier's kinds, so a kind the library
+       * learns to name is a compile error here until this plugin says what it means, never a silent fall-through. The classifier answers what kind of failure
+       * occurred; what it means to a Hydrawise user, and what we do about it, is decided here.
+       */
+      switch(failure.kind) {
+
+        // A shutdown is not news. The lifetime signal outranks every reading of the error itself, which is also what guarantees the deadline arm below can never
+        // re-arm the pool after shutdown.
+        case "aborted":
+
+          return null;
+
+        // A deadline elapsed: our own per-request timeout, or a response that stalled after it began. With a single HTTP/2 connection a wedged session carries every
+        // request on it, so we reset the network stack rather than wait on the wedge.
+        case "timeout":
+
+          this.log.error("The Hydrawise API is taking too long to respond to a request. This error can usually be safely ignored.");
+          this.log.debug("Original request was: %s", url);
+          this.initNetworking();
+
+          return null;
+
+        // A concrete network fault, named by the sentence the plugin keeps for it.
+        case "connect-timeout":
+        case "destroyed":
+        case "dns":
+        case "refused":
+        case "reset":
+        case "retries-exhausted":
+
+          this.log.error(HYDRAWISE_TRANSPORT_FAULT_SENTENCES[failure.kind]);
+
+          return null;
+
+        // A genuine failure carrying no marker anyone can read. The full dump is the only useful thing to say about it, and it carries whatever code the chain held.
+        case "transport":
+
+          this.log.error(util.inspect(error, { colors: true, depth: null, sorted: true }));
+
+          return null;
       }
-
-      // The request exceeded our timeout budget.
-      if((error instanceof DOMException) && (error.name === "TimeoutError")) {
-
-        this.log.error("The Hydrawise API is taking too long to respond to a request. This error can usually be safely ignored.");
-        this.log.debug("Original request was: %s", url);
-
-        // Reset our network stack, just in case.
-        this.initNetworking();
-
-        return null;
-      }
-
-      // Connection timed out.
-      if(error instanceof errors.ConnectTimeoutError) {
-
-        this.log.error("Connection timed out.");
-
-        return null;
-      }
-
-      // The retry interceptor exhausted its configured retries against one of the codes in its statusCodes list (set in initNetworking()); undici wraps the
-      // exhausted attempt as RequestRetryError once maxRetries is exceeded.
-      if(error instanceof errors.RequestRetryError) {
-
-        this.log.error("Unable to connect to the Hydrawise API. This is usually temporary and will retry automatically.");
-
-        return null;
-      }
-
-      if(error instanceof TypeError) {
-
-        // The cast assumes undici and Node's fetch implementation surface a Node system error as TypeError.cause for a connection failure, which is what gives
-        // it the .code property the switch below reads.
-        const cause = error.cause as NodeJS.ErrnoException;
-
-        switch(cause.code) {
-
-          case "ECONNREFUSED":
-          case "EHOSTDOWN":
-
-            this.log.error("Connection refused.");
-
-            break;
-
-          case "ECONNRESET":
-
-            this.log.error("Connection has been reset.");
-
-            break;
-
-          case "ENOTFOUND":
-
-            this.log.error("Hostname or IP address not found. Please ensure you're connected to the Internet.");
-
-            break;
-
-          default:
-
-            this.log.error("Error: %s | %s.", cause.code, cause.message);
-            this.log.error(util.inspect(error, { colors: true, depth: null, sorted: true}));
-
-            break;
-        }
-
-        return null;
-      }
-
-      this.log.error(util.inspect(error, { colors: true, depth: null, sorted: true}));
-
-      return null;
     }
   }
 
