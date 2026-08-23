@@ -4,6 +4,7 @@
  */
 import type { Nullable } from "homebridge-plugin-utils";
 import type { PlatformAccessory } from "homebridge";
+import { sameEntries } from "homebridge-plugin-utils";
 
 // HBHH reserved names.
 export const HydrawiseReservedNames = {
@@ -757,32 +758,6 @@ export function isScheduleStatus(value: unknown): value is HydrawiseScheduleStat
   return (typeof value === "object") && (value !== null) && (typeof (value as HydrawiseScheduleStatus).activeWindowSeconds === "number") &&
     (typeof (value as HydrawiseScheduleStatus).asOf === "number") && ((online === undefined) || (typeof online === "boolean")) &&
     Array.isArray((value as HydrawiseScheduleStatus).zones) && (value as HydrawiseScheduleStatus).zones.every(entry => isZoneScheduleStatus(entry));
-}
-
-// Compare two arrays entry by entry, delegating each pair to a caller-supplied field-wise comparison. Every persisted array this codebase compares on change walks
-// through here - the account's controller roster in its own order, and the relay-ordered zone identity and zone schedule arrays - so the walk itself lives once
-// and each caller supplies only what it means for two entries to match. The paired entry is tested against undefined rather than for truthiness, so the walk stays
-// correct for an element type whose legitimate values include falsy ones.
-export function sameEntries<T>(a: T[], b: T[], same: (x: T, y: T) => boolean): boolean {
-
-  if(a.length !== b.length) {
-
-    return false;
-  }
-
-  // The equal-length check above guarantees a paired entry exists; the guard narrows the strict indexed access so the comparison reads the entry directly, and a
-  // defensively-absent entry simply reports the arrays as differing.
-  return a.every((entry, index) => {
-
-    const other = b[index];
-
-    if(other === undefined) {
-
-      return false;
-    }
-
-    return same(entry, other);
-  });
 }
 
 // The schedule fields a change comparison reads. Naming the excluded field at the type level is what makes reintroducing it a deliberate edit rather than an

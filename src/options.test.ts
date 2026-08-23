@@ -4,7 +4,7 @@
  * scopes and the compile-time controller/zone option-name unions the runtime narrows against, that the account credentials declare themselves secret where
  * the settings page must mask them, and the describeOptionScope prose the docs renderer consumes.
  */
-import type { FeatureOptionEntry, FeatureOptionScope } from "homebridge-plugin-utils";
+import type { FeatureCategoryEntry, FeatureOptionEntry, FeatureOptionScope } from "homebridge-plugin-utils";
 import type { HydrawiseControllerOption, HydrawiseZoneOption } from "./options.ts";
 import { describe, test } from "node:test";
 import { describeOptionScope, featureOptionCategories, featureOptions } from "./options.ts";
@@ -21,6 +21,17 @@ function fullName(category: string, entry: FeatureOptionEntry): string {
 function optionEntry(category: string, name: string): FeatureOptionEntry | undefined {
 
   return featureOptions[category]?.find(entry => entry.name === name);
+}
+
+// Look up a catalog category by name. The composed scope hook reads only the option, but the renderer's hook signature takes the category alongside it, so each
+// pin below hands it the catalog's real entry rather than a stand-in.
+function categoryEntry(name: string): FeatureCategoryEntry {
+
+  const category = featureOptionCategories.find(entry => entry.name === name);
+
+  assert.ok(category, "the " + name + " category should exist");
+
+  return category;
 }
 
 // Collect the option names whose declared scopes include the given scope level, sorted for a stable comparison.
@@ -164,8 +175,8 @@ describe("hydrawise feature options", () => {
     const device = optionEntry("Device", "");
 
     assert.ok(device, "the base Device option should exist");
-    assert.equal(describeOptionScope(device), " <BR>*Configurable at the whole controller, each zone, and globally, across every controller.*",
-      "an option configurable at every level lists all three");
+    assert.equal(describeOptionScope(device, categoryEntry("Device")),
+      " <BR>*Configurable on the whole controller, on each zone, or globally across every controller.*", "an option configurable at every level lists all three");
   });
 
   test("describeOptionScope renders the two-scope prose", () => {
@@ -173,7 +184,7 @@ describe("hydrawise feature options", () => {
     const suspend = optionEntry("Device", "Suspend.All");
 
     assert.ok(suspend, "the suspend option should exist");
-    assert.equal(describeOptionScope(suspend), " <BR>*Configurable at the whole controller and globally, across every controller.*",
+    assert.equal(describeOptionScope(suspend, categoryEntry("Device")), " <BR>*Configurable on the whole controller or globally across every controller.*",
       "a controller-and-global option lists both levels");
   });
 
@@ -184,12 +195,14 @@ describe("hydrawise feature options", () => {
     const apiKey = optionEntry("Account", "ApiKey");
 
     assert.ok(apiKey, "the API key option should exist");
-    assert.equal(describeOptionScope(apiKey), " <BR>*Configurable at globally, across every controller.*", "a global-only option lists just the global level");
+    assert.equal(describeOptionScope(apiKey, categoryEntry("Account")), " <BR>*Configurable globally across every controller.*",
+      "a global-only option lists just the global level");
   });
 
   test("describeOptionScope omits the suffix when an option declares no scope", () => {
 
     // An entry that declares no scopes (the base renderer's generic entry shape permits it) yields no scope suffix.
-    assert.equal(describeOptionScope({ default: true, description: "No scope here.", name: "Bare" }), undefined, "a scopeless option should render no suffix");
+    assert.equal(describeOptionScope({ default: true, description: "No scope here.", name: "Bare" }, categoryEntry("Device")), undefined,
+      "a scopeless option should render no suffix");
   });
 });

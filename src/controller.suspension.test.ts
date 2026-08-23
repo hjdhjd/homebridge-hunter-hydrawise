@@ -709,7 +709,7 @@ describe("HydrawiseController suspension commands composed into the projection",
      */
     applyFacts(h, { [ALPHA_RELAY_ID]: false }, now());
 
-    const publishesBefore = h.mqtt?.publishes.length ?? 0;
+    const publishesBefore = h.mqtt?.published.length ?? 0;
 
     await service.getCharacteristic(Characteristic.On).triggerSet(true);
 
@@ -719,9 +719,9 @@ describe("HydrawiseController suspension commands composed into the projection",
     assert.equal((entry?.state === "suspended") ? entry.until : undefined, Math.floor(Date.now() / 1000) + HYDRAWISE_SUSPEND_DURATION,
       "and carries the instant the command actually asked for");
 
-    const payload = JSON.parse(h.mqtt?.publishes.at(-1)?.payload ?? "[]") as { state?: string; suspendedUntil?: number }[];
+    const payload = JSON.parse(String(h.mqtt?.published.at(-1)?.payload ?? "[]")) as { state?: string; suspendedUntil?: number }[];
 
-    assert.equal(h.mqtt?.publishes.length, publishesBefore + 1, "the command's own handler publishes exactly once");
+    assert.equal(h.mqtt?.published.length, publishesBefore + 1, "the command's own handler publishes exactly once");
     assert.equal(payload[0]?.state, "suspended", "and the payload it published carries the composed state");
     assert.equal(countLogged(h.lines(), "info", "Suspended until"), 1, "the transition narrates once, in the command's own handler");
   });
@@ -869,19 +869,19 @@ describe("HydrawiseController suspension commands composed into the projection",
     applyFacts(h, { [ALPHA_RELAY_ID]: false }, now());
 
     const flushesBefore = h.flushes.length;
-    const publishesBefore = h.mqtt?.publishes.length ?? 0;
+    const publishesBefore = h.mqtt?.published.length ?? 0;
 
     await service.getCharacteristic(Characteristic.On).triggerSet(true);
 
     assert.equal(h.flushes.length, flushesBefore + 1, "the command writes the accessory cache exactly once");
-    assert.equal(h.mqtt?.publishes.length, publishesBefore + 1, "publishes exactly once");
+    assert.equal(h.mqtt?.published.length, publishesBefore + 1, "publishes exactly once");
     assert.equal(countLogged(h.lines(), "info", "Suspended until"), 1, "and narrates exactly once");
 
     // The same command again, against a classification that already reads suspended. Nothing moved, so nothing is written, published, or said.
     await service.getCharacteristic(Characteristic.On).triggerSet(true);
 
     assert.equal(h.flushes.length, flushesBefore + 1, "a command that moves no classification writes nothing");
-    assert.equal(h.mqtt?.publishes.length, publishesBefore + 1, "publishes nothing");
+    assert.equal(h.mqtt?.published.length, publishesBefore + 1, "publishes nothing");
     assert.equal(countLogged(h.lines(), "info", "Suspended until"), 1, "and narrates nothing a second time");
   });
 

@@ -26,6 +26,7 @@ import { HYDRAWISE_API_BASE_URL } from "../settings.ts";
 import { HydrawiseController } from "../controller.ts";
 import type { HydrawiseOptions } from "../options.ts";
 import { HydrawisePlatform } from "../platform.ts";
+import { TestMqttClient } from "homebridge-plugin-utils/testing";
 import { capturingLog } from "../testing.helpers.ts";
 import { setTimeout as delay } from "node:timers/promises";
 import { syntheticController } from "../api.fixtures.ts";
@@ -63,79 +64,12 @@ export function countLogged(lines: CapturedLogLine[], level: CapturedLogLine["le
   return lines.filter(line => (line.level === level) && util.format(line.message, ...line.args).includes(substring)).length;
 }
 
-// A recorded MQTT get subscription. The get handler answers the current controller status as a JSON string.
-interface RecordedMqttGet {
-
-  handler: () => string;
-  topic: string;
-  type: string;
-}
-
-// A recorded MQTT set subscription. The set handler drives a controller command; only the first (normalized) argument is read by production.
-interface RecordedMqttSet {
-
-  handler: (value: string, rawValue: string, signal: AbortSignal) => Promise<void> | void;
-  topic: string;
-  type: string;
-}
-
-// A recorded MQTT publish. Tests read these to assert on publish cadence - how many times a poll or command published - and to parse a specific payload for
-// the state it carries.
-interface RecordedMqttPublish {
-
-  payload: string;
-  topic: string;
-}
-
-/* A recording double of the homebridge-plugin-utils MqttClient surface the controller consumes: subscribeGet, subscribeSet, publish. It records every
- * subscription and publish so tests invoke a registered get / set handler and assert on the published topics and payloads, all without a live broker. The
- * signal a set handler receives is normally composed by homebridge-plugin-utils's MqttClient itself, from its connection-level signal and any per-invocation
- * timeout; the double stands in for that composition with a fresh AbortController per call rather than reproducing it - these tests assert on recorded
- * traffic, not teardown.
+/* The library's recording MqttClient double, re-exported so every suite reaches it through this one harness module, exactly as it reaches every other double
+ * here. It mirrors the real client's observable behavior - the suffix the client appends to a get or set registration, the republish a get answers with, the
+ * lowercasing a set handler's first argument arrives with, and the guarded publish's own log lines - so a controller driven against it branches as it would
+ * against a live broker.
  */
-export class TestMqttClient {
-
-  public readonly gets: RecordedMqttGet[] = [];
-  public readonly publishes: RecordedMqttPublish[] = [];
-  // When set, publish() rejects with this error instead of recording, so a test can drive the guarded-publish failure path. Persistent for the double's per-test
-  // lifetime; every test builds a fresh client, so there is no reset machinery.
-  public publishRejection: Nullable<Error> = null;
-  public readonly sets: RecordedMqttSet[] = [];
-
-  public subscribeGet(topic: string, type: string, getValue: () => string): void {
-
-    this.gets.push({ handler: getValue, topic, type });
-  }
-
-  public subscribeSet(topic: string, type: string, setValue: (value: string, rawValue: string, signal: AbortSignal) => Promise<void> | void): void {
-
-    this.sets.push({ handler: setValue, topic, type });
-  }
-
-  public async publish(topic: string, payload: string): Promise<void> {
-
-    if(this.publishRejection) {
-
-      throw this.publishRejection;
-    }
-
-    this.publishes.push({ payload, topic });
-  }
-
-  // Invoke the recorded get handler for a topic suffix (matched by suffix so callers need not reproduce the full per-controller prefix). Returns the handler's value.
-  public invokeGet(topicSuffix: string): string | undefined {
-
-    return this.gets.find(entry => entry.topic.endsWith(topicSuffix))?.handler();
-  }
-
-  // Invoke the recorded set handler for a topic suffix. The controller's set handler reads only the first (normalized) argument, so rawValue mirrors value by default.
-  public async invokeSet(topicSuffix: string, value: string): Promise<void> {
-
-    const entry = this.sets.find(record => record.topic.endsWith(topicSuffix));
-
-    await entry?.handler(value, value, new AbortController().signal);
-  }
-}
+export { TestMqttClient };
 
 // One recorded retrieve call: the endpoint the controller asked for and the params it passed. The recorder keeps these so a test asserts on the wire traffic
 // (the statusschedule cadence, the setzone params) without any real network.
@@ -302,9 +236,9 @@ export interface MakeTestPlatformResult {
 }
 
 /* Build a platform double around a REAL FeatureOptions engine seeded with the supplied userOptions, so the production feature-option logic (test / logFeature)
- * runs unchanged. A capturing log records every line and keeps a mutable debug the production platform would reassign; a recording MQTT double captures
- * subscriptions and publishes; the retrieve recorder stands in for the network. The signal starts pre-aborted by default so a constructed controller's loop
- * exits at once; pass signalAborted false for a live-loop test and abort it via the returned lever.
+ * runs unchanged. A capturing log records every line and keeps a writable debug slot so a test can interpose on the debug channel; a recording MQTT double
+ * captures subscriptions and publishes; the retrieve recorder stands in for the network. The signal starts pre-aborted by default so a constructed controller's
+ * loop exits at once; pass signalAborted false for a live-loop test and abort it via the returned lever.
  */
 export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTestPlatformResult {
 
@@ -316,7 +250,7 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
     signalController.abort("pre-aborted");
   }
 
-  const mqtt = options.mqtt ? new TestMqttClient() : null;
+  const mqtt = options.mqtt ? new TestMqttClient({ log: logger }) : null;
 
   /* The REAL timer registry, not a double. A double stands in for an I/O surface - the recording MQTT client for a network client, the retrieve recorder for the
    * wire - while a pure in-memory, signal-scoped mechanism runs its production self here, exactly as the FeatureOptions engine and the platform's rate budgets do.
@@ -416,8 +350,17 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
     timers
   };
 
-  return { abort: (reason?: string): void => signalController.abort(reason ?? "test-teardown"), flushes, lines, mqtt, platform, reconciles, retrieve,
-    signalController, suspensions, zoneAccessories };
+  /* The teardown lever: the platform signal first, then the MQTT double, which is the pairing production wires - the client's lifetime rides the platform's own
+   * shutdown signal, so the two fall together. A test that reaches past this lever and aborts signalController directly leaves the double running, on the same
+   * terms as every other handle this harness returns.
+   */
+  const abort = (reason?: string): void => {
+
+    signalController.abort(reason ?? "test-teardown");
+    mqtt?.abort();
+  };
+
+  return { abort, flushes, lines, mqtt, platform, reconciles, retrieve, signalController, suspensions, zoneAccessories };
 }
 
 // Options for buildController: the controller-config overrides, an optional program hook, and everything makeTestPlatform accepts.

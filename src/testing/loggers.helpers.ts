@@ -5,9 +5,9 @@
  * interface, which mirrors the public surface of the project's production logger.
  *
  * Two project adaptations from the canonical copy are applied here. First, the debug channel is message-first (`debug(message, ...args)`) to match Homebridge's
- * Logging and homebridge-plugin-utils' HomebridgePluginLogging, whose debug signature carries no leading category; the platform constructor reassigns `.debug` in
- * place, so the captured shape must mirror production's calls or every captured debug line is corrupt. Second, the bound-logger method is dropped entirely,
- * because this plugin prefixes through the prefixedLog wrapper rather than a logger method, so TestLogger has no bound-logger surface to model.
+ * Logging and homebridge-plugin-utils' HomebridgePluginLogging, whose debug signatures carry no leading category; the captured shape must mirror production's
+ * calls or every captured debug line is corrupt. Second, the bound-logger method is dropped entirely, because this plugin prefixes through the prefixedLog
+ * wrapper rather than a logger method, so TestLogger has no bound-logger surface to model.
  */
 
 /**

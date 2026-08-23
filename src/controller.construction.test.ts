@@ -73,12 +73,14 @@ describe("HydrawiseController construction", () => {
     const { mqtt } = buildController({ mqtt: true });
 
     assert.ok(mqtt, "the MQTT recorder should be attached");
-    assert.equal(mqtt.gets.length, 1, "one controller get subscription should be registered");
-    assert.equal(mqtt.sets.length, 1, "one controller set subscription should be registered");
 
-    const getEntry = firstOf(mqtt.gets, "MQTT get subscription");
+    const gets = mqtt.subscriptions.filter(entry => entry.kind === "get");
+    const sets = mqtt.subscriptions.filter(entry => entry.kind === "set");
 
-    assert.ok(getEntry.topic.endsWith("controller"), "the get topic should be the controller topic");
+    assert.equal(gets.length, 1, "one controller get subscription should be registered");
+    assert.equal(sets.length, 1, "one controller set subscription should be registered");
+    assert.ok(firstOf(gets, "MQTT get subscription").topic.endsWith("controller/get"), "the get topic should be the controller topic");
+    assert.ok(firstOf(sets, "MQTT set subscription").topic.endsWith("controller/set"), "the set topic should be the controller topic");
   });
 
   test("registers no MQTT subscriptions when MQTT is not configured", () => {

@@ -7,7 +7,7 @@
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { RetrieveRecorder, TestMqttClient, installMockDispatcher, loggedAt, makeTestApi, makeTestPlatform } from "./platform.helpers.ts";
+import { RetrieveRecorder, installMockDispatcher, loggedAt, makeTestApi, makeTestPlatform } from "./platform.helpers.ts";
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { getGlobalDispatcher } from "undici";
@@ -62,36 +62,6 @@ describe("RetrieveRecorder", () => {
   });
 });
 
-describe("TestMqttClient", () => {
-
-  test("records subscriptions and publishes and invokes them by topic suffix", async () => {
-
-    const mqtt = new TestMqttClient();
-
-    mqtt.subscribeGet("serial/controller", "controller", () => "get-value");
-
-    const received: string[] = [];
-
-    mqtt.subscribeSet("serial/controller", "controller", value => { received.push(value); });
-    await mqtt.publish("serial/controller", "published");
-
-    assert.equal(mqtt.invokeGet("controller"), "get-value", "invokeGet should run the recorded get handler by suffix");
-    await mqtt.invokeSet("controller", "set-value");
-    assert.deepEqual(received, ["set-value"], "invokeSet should run the recorded set handler by suffix");
-    assert.equal(mqtt.publishes[0]?.payload, "published", "publish should record the payload");
-  });
-
-  test("publishRejection makes publish reject instead of recording", async () => {
-
-    const mqtt = new TestMqttClient();
-
-    mqtt.publishRejection = new Error("broker gone");
-
-    await assert.rejects(() => mqtt.publish("serial/controller", "x"), /broker gone/, "an armed rejection should reject the publish");
-    assert.equal(mqtt.publishes.length, 0, "a rejected publish should not be recorded");
-  });
-});
-
 describe("installMockDispatcher", () => {
 
   test("installs the mock agent as global and restores the prior dispatcher on dispose", async () => {
@@ -141,8 +111,8 @@ describe("makeTestPlatform", () => {
 
     const { lines, platform } = makeTestPlatform();
 
-    // The real platform reassigns log.debug to route through its debug gate; the double's log must tolerate that reassignment and keep capturing. The runtime
-    // property is a plain writable slot; the cast bridges the readonly HomebridgePluginLogging.debug declaration the double is typed against.
+    // The capture's debug channel is a plain writable slot, so a test can interpose its own function on it and still have the capture record what comes through.
+    // The cast bridges the readonly HomebridgePluginLogging.debug declaration the double is typed against.
     (platform.log as { debug: (message: string) => void }).debug = (message: string): void => platform.log.error(message);
     platform.log.debug("routed debug line");
 

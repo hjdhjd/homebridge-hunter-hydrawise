@@ -6,14 +6,14 @@ import type { API, CharacteristicValue, HAP, Service } from "homebridge";
 import { HAP_DEFAULT_MODEL, HAP_DURATION_CEILING, HOMEBRIDGE_UNKNOWN_FIRMWARE, HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER,
   HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_REVERT_DELAY, HYDRAWISE_SUSPEND_DURATION, HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
 import { HYDRAWISE_UNSCHEDULED_SENTINEL, HydrawiseReservedNames, controllerIdentity, isControllerIdentity, isScheduleStatus, isSuspendZoneSubtype,
-  isZoneIdentity, isZoneStoppedBySensor, sameControllerIdentity, sameEntries, sameScheduleStatus, sameZoneIdentity, scheduleStatus, suspendZoneSubtype,
+  isZoneIdentity, isZoneStoppedBySensor, sameControllerIdentity, sameScheduleStatus, sameZoneIdentity, scheduleStatus, suspendZoneSubtype,
   zoneIdentity, zoneScheduleStatus } from "./types.ts";
 import type { HomebridgePluginLogging, Nullable } from "homebridge-plugin-utils";
 import type { HydrawiseAccessory, HydrawiseControllerAccessory, HydrawiseControllerConfig, HydrawiseControllerHardware, HydrawiseControllerIdentity,
   HydrawiseControllerV2Facts, HydrawiseScheduleStatus, HydrawiseZoneConfig, HydrawiseZoneIdentity, HydrawiseZoneScheduleStatus, HydrawiseZoneSuspensionResult,
   SetZoneResponse, StatusScheduleResponse } from "./types.ts";
 import type { HydrawiseControllerOption, HydrawiseControllerValueOption, HydrawiseZoneOption, HydrawiseZoneValueOption } from "./options.ts";
-import { acquireService, getServiceName, guardedDispatch, loopFaultReporter, prefixedLog, retry, sanitizeName, setAccessoryName, setServiceName, superviseLoop,
+import { acquireService, getServiceName, loopFaultReporter, prefixedLog, retry, sameEntries, sanitizeName, setAccessoryName, setServiceName, superviseLoop,
   validService } from "homebridge-plugin-utils";
 import type { Dispatcher } from "undici";
 import type { HydrawisePlatform } from "./platform.ts";
@@ -275,7 +275,8 @@ export class HydrawiseController {
     this.platform = platform;
     this.zoneHints = new HydrawiseZoneHintLedger();
 
-    // Prefix every log line with this controller's live name. The platform's log.debug is already rebound to the platform's debug gate, so debug routing stays intact.
+    // Prefix every log line with this controller's live name. The platform's logger already gates debug routing through the user's debug setting, so debug lines
+    // prefixed here route intact.
     this.log = prefixedLog(platform.log, (): string => this.name);
 
     this.configureDevice(roster);
@@ -477,8 +478,7 @@ export class HydrawiseController {
 
     if(projectionChanged) {
 
-      guardedDispatch({ handler: async (): Promise<void> => { await this.platform.mqtt?.publish(this.mqttTopic("controller"), this.statusJson(facts)); },
-        label: "MQTT publish (controller)", log: this.log });
+      this.platform.mqtt?.publishGuarded(this.mqttTopic("controller"), this.statusJson(facts));
     }
   }
 
@@ -1106,8 +1106,8 @@ export class HydrawiseController {
 
   // Project one completed poll onto HomeKit. This is the HomeKit half of the loop and the only half that touches a service: the persisted zone roster, the
   // enabled-zone projection and the prunes it drives, the per-zone valve state, the irrigation-system aggregates, the MQTT publish, and the suspend-all switch.
-  // It is synchronous by design - the MQTT publish is dispatched fire-and-forget through guardedDispatch - so one poll's projection lands in a single frame with
-  // nothing awaited partway through it.
+  // It is synchronous by design - the MQTT publish is dispatched fire-and-forget through the client's guarded publish - so one poll's projection lands in a single
+  // frame with nothing awaited partway through it.
   private applyStatus(update: HydrawisePollUpdate): void {
 
     const { isFirstRun, status } = update;
@@ -1486,10 +1486,9 @@ export class HydrawiseController {
           this.hap.Characteristic.ProgramMode.NO_PROGRAM_SCHEDULED : this.hap.Characteristic.ProgramMode.PROGRAM_SCHEDULED);
     }
 
-    // Publish our status to MQTT if configured to do so, routing through guardedDispatch so a rejected publish - the broker vanishing mid-write, a teardown race -
-    // lands in the log instead of floating as an unhandled rejection.
-    guardedDispatch({ handler: async (): Promise<void> => { await this.platform.mqtt?.publish(this.mqttTopic("controller"), this.statusJson(facts)); },
-      label: "MQTT publish (controller)", log: this.log });
+    // Publish our status to MQTT if configured to do so, through the client's guarded publish so a rejected write - the broker vanishing mid-write, a teardown race -
+    // lands in the client's log instead of floating as an unhandled rejection.
+    this.platform.mqtt?.publishGuarded(this.mqttTopic("controller"), this.statusJson(facts));
   }
 
   /* Establish, name, and bind one zone's companion suspension switch on whichever accessory now hosts that zone.

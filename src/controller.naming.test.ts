@@ -572,7 +572,7 @@ describe("the zone name option's declared scope", () => {
     assert.equal(rosterOf(h)[0]?.name, ACCOUNT_NAME, "the roster persists the account's name");
     assert.equal(nameOf(valve), OVERRIDE_NAME, "while the valve the user looks at still carries their own");
 
-    const published = JSON.parse(h.mqtt?.invokeGet("controller") ?? "[]") as { name: string }[];
+    const published = JSON.parse((await h.mqtt?.invokeGet("controller/get")) ?? "[]") as { name: string }[];
 
     assert.equal(published[0]?.name, ACCOUNT_NAME, "and the MQTT payload publishes the account's name rather than the user's private label");
   });

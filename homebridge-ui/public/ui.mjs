@@ -5,7 +5,7 @@
 "use strict";
 
 import { API_KEY_LENGTH, makeHydrawiseConfig, makeLegacyHydrawiseConfig } from "./hydrawise-config.mjs";
-import { FeatureOptions, expandOption } from "homebridge-plugin-utils/featureOptions.js";
+import { FeatureOptions, buildCatalogIndex, enumerateConfiguredEntries, expandOption } from "homebridge-plugin-utils/featureOptions.js";
 import { ZONE_STATE_LABELS, deriveControllerDisplay, deriveZoneDisplay, formatRunTime, zoneScheduleState } from "./hydrawise-display.mjs";
 import { PluginConfigSession } from "homebridge-plugin-utils/pluginConfigSession.mjs";
 import { webUi } from "homebridge-plugin-utils/webUi.mjs";
@@ -16,16 +16,8 @@ import { withDeadline } from "homebridge-plugin-utils/webUi-liveness.mjs";
 // independently in TypeScript; the two meet at the wire.
 const DEVICE_CATEGORY = "Device";
 
-// The canonical lowercased key the Device feature option expands to. A controller-scope floor entry is an Enable/Disable action prefix, this key, and the serial id -
-// we derive the key through the feature-option engine's own grammar rather than hardcoding the string, so a future rename of the option cannot silently break the
-// floor parser.
-const DEVICE_OPTION_KEY = expandOption(DEVICE_CATEGORY, "").toLowerCase();
-
-// The two floor-entry prefixes the Device option can carry: an explicit enable or an explicit disable of a whole controller.
-const DEVICE_FLOOR_PREFIXES = [ "disable." + DEVICE_OPTION_KEY + ".", "enable." + DEVICE_OPTION_KEY + "." ];
-
-// The canonical option name of the custom-name override, derived through the engine's own grammar for the same reason the floor key is: a rename of the option
-// cannot silently break the lookup. One option answers at both grains - a controller and a zone alike - so one constant names it.
+// The canonical option name of the custom-name override, composed through the engine's own grammar rather than spelled out here, so a rename of the option cannot
+// silently break the lookup. One option answers at both grains - a controller and a zone alike - so one constant names it.
 const NAME_OPTION = expandOption(DEVICE_CATEGORY, "Name");
 
 // The guidance sentences the controller notice states render through the infoPanel. Complete sentences, shown verbatim to the user.
@@ -105,13 +97,7 @@ const getCatalog = () => {
       throw new Error("Received a malformed response from the plugin option catalog.");
     }
 
-    return {
-
-      categories: response.categories,
-      deviceOptionNames: new Set(response.options[DEVICE_CATEGORY].filter((option) => (typeof option?.name === "string") && option.name.length)
-        .map((option) => option.name.toLowerCase())),
-      options: response.options
-    };
+    return { categories: response.categories, index: buildCatalogIndex(response.categories, response.options), options: response.options };
   }).catch((error) => {
 
     catalogPromise = null;
@@ -223,50 +209,26 @@ const isScheduleStatus = (value) => (typeof value === "object") && (value !== nu
 const matchControllerAccessory = (cached, targetSerial) => cached.find((accessory) => isControllerIdentity(accessory?.context?.controller) &&
   (foldSerial(accessory.context.controller.serialNumber) === targetSerial));
 
-/* Extract the controller serials named by the config floor. A floor entry names a whole controller as "Enable/Disable.Device.<serial>"; the same grammar also carries
- * a zone-scope disable ("Disable.Device.<relayId>") and the suspend family's own entries ("Disable.Device.Suspend.All.<serial>"), so we keep only single-segment
- * ids and let the caller drop any id that matches a known zone. A multi-segment option name therefore excludes itself here: its trailing segment can never be
- * mistaken for a serial, because the id it would yield still carries a dot. The action prefixes and the Device key are derived through the engine's own
- * expandOption grammar, so a rename of the option cannot silently break the match; the walk over the entries is a hand scan, because the engine exports no
- * enumeration primitive to delegate it to.
- *
- * excludedNames carries the lowercased Device-category option names the catalog declares, and any candidate id it names is dropped. Such an entry is that option's
- * global-scope entry - the raw-tail lookup key the engine's own config index stores for it - rather than a Device-scoped serial, so honoring the exclusion is what
- * keeps this scan and the engine agreeing on what an entry means. A candidate carrying an "=" is dropped for the same reason: the character is the value grammar's
- * payload delimiter, so such a tail is a value-centric option's entry rather than a serial, and no Hydrawise serial contains one. We slice the original entry, not
- * the lowercased copy, so a mixed-case serial keeps its display casing.
+/* Extract the controller serials named by the config floor, through the engine's own grammar: one record per entry addressing the whole-device option, the id in
+ * the casing the user wrote it. A global entry yields an empty id and is dropped; a zone-scope disable yields that zone's relay id, and the caller screens every
+ * candidate against the known zones. An entry that is really some other option's address - a dotted tail, a value payload - yields nothing, because the engine
+ * reads it as what it is.
  */
-const floorSerials = (options, excludedNames) => {
-
-  const serials = [];
+const floorSerials = (options, catalog) => {
 
   if(!Array.isArray(options)) {
 
-    return serials;
+    return [];
   }
 
-  for(const entry of options) {
+  const serials = [];
 
-    if(typeof entry !== "string") {
+  for(const entry of enumerateConfiguredEntries({ catalog: catalog.index, configuredOptions: options.filter((entry) => typeof entry === "string"),
+    option: DEVICE_CATEGORY })) {
 
-      continue;
-    }
+    if(entry.id.length) {
 
-    const lower = entry.toLowerCase();
-
-    for(const prefix of DEVICE_FLOOR_PREFIXES) {
-
-      if(!lower.startsWith(prefix)) {
-
-        continue;
-      }
-
-      const id = entry.slice(prefix.length);
-
-      if(id.length && !id.includes(".") && !id.includes("=") && !excludedNames.has(id.toLowerCase())) {
-
-        serials.push(id);
-      }
+      serials.push(entry.id);
     }
   }
 
@@ -603,14 +565,16 @@ const getControllers = async ({ config }) => {
     return { controllers: [], error: "Unable to read the Homebridge accessory cache: " + ((err instanceof Error) ? err.message : String(err)) };
   }
 
-  /* (b) The config floor, screened against the option catalog. Each named serial is remembered for the session; one that is neither a known controller nor a known
-   * zone becomes a serial-labeled disabled entry the user can then refresh to name. A failed catalog read degrades the scan to its prefix-only behavior, which is
-   * acceptable here: the framework's own show cycle fetches the same endpoint unguarded, so an endpoint that cannot answer fails the page load before this matters.
+  /* (b) The config floor, read through the option catalog. Each named serial is remembered for the session; one that is neither a known controller nor a known
+   * zone becomes a serial-labeled disabled entry the user can then refresh to name. The catalog read is unguarded on purpose: there is no floor walk without a
+   * catalog, and a roster silently missing every floor-only controller is the same partial answer the accessory-cache read above rejects. A failure therefore
+   * rejects this listing, which the framework routes to the same connection-error view with a retry that the error half above reaches, and the cached fetch
+   * clears itself so the retry asks fresh.
    */
-  const catalog = await getCatalog().catch(() => null);
+  const catalog = await getCatalog();
   const floorSet = new Set();
 
-  for(const serial of floorSerials(config?.options, catalog?.deviceOptionNames ?? new Set())) {
+  for(const serial of floorSerials(config?.options, catalog)) {
 
     const key = foldSerial(serial);
 

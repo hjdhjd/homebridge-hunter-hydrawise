@@ -167,7 +167,7 @@ describe("HydrawiseController polling loop structure", () => {
     assert.ok(h.mqtt, "the MQTT recorder should be attached");
 
     const mqtt = h.mqtt;
-    const samples: { fetches: number; publishes: number }[] = [];
+    const samples: { fetches: number; published: number }[] = [];
 
     /* Read both recorders in ONE synchronous sample, repeatedly, across several polls. Under a single envelope the two halves run in lockstep, so at any instant
      * the fetches recorded can lead the publishes recorded by at most one - the poll currently in flight between the fetch and its projection. A wire half that
@@ -176,15 +176,15 @@ describe("HydrawiseController polling loop structure", () => {
      */
     await waitFor(() => {
 
-      samples.push({ fetches: h.retrieve.callsTo("statusschedule.php").length, publishes: mqtt.publishes.length });
+      samples.push({ fetches: h.retrieve.callsTo("statusschedule.php").length, published: mqtt.published.length });
 
-      return (mqtt.publishes.length >= POLLS_OBSERVED) ? true : undefined;
+      return (mqtt.published.length >= POLLS_OBSERVED) ? true : undefined;
     }, { intervalMs: 1 });
 
-    const worst = samples.reduce((lead, sample) => Math.max(lead, sample.fetches - sample.publishes), 0);
+    const worst = samples.reduce((lead, sample) => Math.max(lead, sample.fetches - sample.published), 0);
 
     assert.ok(samples.length > POLLS_OBSERVED, "the sampler took more than one reading per poll, so its verdict rests on more than the end state");
     assert.ok(worst <= 1, "the widest lead the wire half took over the projection was " + worst.toString() + " polls, expected at most one");
-    assert.ok(mqtt.publishes.length >= POLLS_OBSERVED, "the run observed the intended number of completed polls");
+    assert.ok(mqtt.published.length >= POLLS_OBSERVED, "the run observed the intended number of completed polls");
   });
 });

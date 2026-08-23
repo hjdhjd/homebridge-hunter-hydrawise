@@ -2,9 +2,10 @@
  *
  * platform.ts: homebridge-hunter-hydrawise platform class.
  */
-import type { API, Categories, DynamicPlatformPlugin, HAP, Logging, PlatformAccessory, PlatformConfig } from "homebridge";
+import type { API, DynamicPlatformPlugin, HAP, Logging, PlatformAccessory, PlatformConfig } from "homebridge";
 import { APIEvent, API_RETRY_STATUS_CODES, FeatureOptions, RateBudget, TimerRegistry, classifyTransportError, composeSignals, createApiDispatcher,
-  createMqttClient, loopFaultReporter, retry, sanitizeName, superviseLoop } from "homebridge-plugin-utils";
+  createMqttClient, debugGatedLog, loopFaultReporter, retry, sanitizeName, superviseLoop } from "homebridge-plugin-utils";
+import type { Categories, HomebridgePluginLogging, MqttClient, Nullable } from "homebridge-plugin-utils";
 import type { CustomerDetailsResponse, HydrawiseAccessory, HydrawiseAccessoryContext, HydrawiseControllerAccessory, HydrawiseControllerConfig,
   HydrawiseControllerIdentity, HydrawiseEndpoint, HydrawiseZoneIdentity, HydrawiseZoneSuspensionResult } from "./types.ts";
 import { HYDRAWISE_API_BASE_URL, HYDRAWISE_API_BUDGET_CALLS, HYDRAWISE_API_BUDGET_WINDOW, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_TIMEOUT,
@@ -12,7 +13,6 @@ import { HYDRAWISE_API_BASE_URL, HYDRAWISE_API_BUDGET_CALLS, HYDRAWISE_API_BUDGE
   HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_V2_MUTATION_BUDGET_CALLS, HYDRAWISE_V2_MUTATION_BUDGET_WINDOW,
   HYDRAWISE_V2_REFRESH_INTERVAL, HYDRAWISE_ZONE_ACCESSORY_CATEGORY, HYDRAWISE_ZONE_ACCESSORY_GRACE_POLLS, PLATFORM_NAME, PLUGIN_NAME } from "./settings.ts";
 import type { HydrawiseGlobalFlagOption, HydrawiseGlobalValueOption, HydrawiseOptions } from "./options.ts";
-import type { MqttClient, Nullable } from "homebridge-plugin-utils";
 import { controllerIdentity, isZoneAccessoryContext, sameControllerIdentity, sameZoneIdentity, zoneAccessoryId } from "./types.ts";
 import { featureOptionCategories, featureOptions } from "./options.ts";
 import { request, setGlobalDispatcher } from "undici";
@@ -41,7 +41,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   public config: HydrawiseOptions;
   public readonly configuredDevices: Record<string, HydrawiseController | undefined>;
   public readonly hap: HAP;
-  public readonly log: Logging;
+  public readonly log: HomebridgePluginLogging;
   public readonly mqtt: Nullable<MqttClient>;
   private readonly shutdownController: AbortController;
   public readonly signal: AbortSignal;
@@ -90,8 +90,12 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     this.configuredDevices = {};
     this.featureOptions = new FeatureOptions(featureOptionCategories, featureOptions, options);
     this.hap = api.hap;
-    this.log = log;
-    this.log.debug = this.debug.bind(this);
+
+    /* Wrap the Homebridge logger in the library's config-gated composition: our debug output emits through warn - visible without Homebridge's own debug switch -
+     * whenever the user's debug setting says so, read live on every call, and every other level passes straight through. Wrapping rather than mutating leaves the
+     * logger Homebridge handed us untouched, and that object stays Homebridge's own.
+     */
+    this.log = debugGatedLog(log, (): boolean => this.config.debug === true);
     this.mqtt = null;
 
     // Scope an AbortController to the platform's lifetime. We assign it and its signal at the top of the constructor, before the missing-API-key early return below,
@@ -819,16 +823,6 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
           return null;
       }
-    }
-  }
-
-  // Utility for debug logging. We route this through log.warn rather than log.debug so that plugin-level debug output stays visible regardless of whether
-  // Homebridge itself is run with its own debug flag, which is what gates log.debug.
-  public debug(message: string, ...parameters: unknown[]): void {
-
-    if(this.config.debug) {
-
-      this.log.warn(util.format(message, ...parameters));
     }
   }
 }

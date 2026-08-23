@@ -2,7 +2,7 @@
  *
  * settings.ts: Settings and constants for homebridge-hunter-hydrawise.
  */
-import type { Categories } from "homebridge";
+import { Categories } from "homebridge-plugin-utils";
 import type { HydrawiseEndpoint } from "./types.ts";
 import type { TransportFailure } from "homebridge-plugin-utils";
 
@@ -45,7 +45,7 @@ export type HydrawiseTransportFault = Extract<TransportFailure, { code: string }
  * deliberately absent: an abort is silent, a deadline re-arms the catching client's own connection pool and speaks for itself there, and an unmarked failure has
  * nothing better to offer than the error itself.
  */
-export const HYDRAWISE_TRANSPORT_FAULT_SENTENCES: Readonly<Record<HydrawiseTransportFault, string>> = Object.freeze({
+export const HYDRAWISE_TRANSPORT_FAULT_SENTENCES = Object.freeze({
 
   "connect-timeout": "Connection timed out.",
   "destroyed": "A request to the Hydrawise API was interrupted while the connection was being reset.",
@@ -53,7 +53,7 @@ export const HYDRAWISE_TRANSPORT_FAULT_SENTENCES: Readonly<Record<HydrawiseTrans
   "refused": "Connection refused.",
   "reset": "Connection has been reset.",
   "retries-exhausted": "Unable to connect to the Hydrawise API. This is usually temporary and will retry automatically."
-});
+} satisfies Record<HydrawiseTransportFault, string>);
 
 /* The Hydrawise v2 API. This group states endpoints and credentials, which is a different kind of constant from the durations and call counts the rest of this
  * file carries, so it is marked out as its own group. Everything below is optional at runtime: the v2 surface is reached only when the user has configured their
@@ -170,12 +170,9 @@ export const HAP_DEFAULT_MODEL = "Default-Model";
  */
 export const HAP_DURATION_CEILING = 3600;
 
-/* The HAP accessory category a standalone zone accessory declares - Apple's sprinkler category, so the Home app renders a lone irrigation valve as sprinkler rather
- * than as a generic accessory. The value is the Apple-defined protocol number, carried here as a typed numeric constant rather than read off the `Categories` enum:
- * HAP declares that enum as an AMBIENT const enum, and this repo compiles under `verbatimModuleSyntax`, where any value access to an ambient const enum's members
- * is a compile error. The cast keeps the number type-checked against the constructor parameter it feeds while never touching the enum as a value.
- */
-export const HYDRAWISE_ZONE_ACCESSORY_CATEGORY = 28 as Categories;
+// The HAP accessory category a standalone zone accessory declares - Apple's sprinkler category, so the Home app renders a lone irrigation valve as a sprinkler
+// rather than as a generic accessory. The mirror is compiler-locked against hap-nodejs's own declaration, so the value can never drift from what HAP defines.
+export const HYDRAWISE_ZONE_ACCESSORY_CATEGORY = Categories.SPRINKLER;
 
 /* How many consecutive polls a standalone zone accessory survives its zone's absence from the wire report before it is treated as genuinely gone. The rule this
  * encodes: a transient wire flake must never destroy a HomeKit identity the user placed in a room, so only SUSTAINED absence - or explicit configuration, which the

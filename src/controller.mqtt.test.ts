@@ -2,7 +2,7 @@
  *
  * controller.mqtt.test.ts: The controller's MQTT surface, driven through the recording MQTT double's invokeGet / invokeSet knobs. Covers the status
  * JSON the get handler answers, the set-command grammar (start / stop and the invalid-zone and invalid-command throws), and the per-poll publish including the
- * guarded-dispatch path that lands a publish rejection in the log rather than as an unhandled rejection.
+ * client's guarded publish, which lands a publish rejection in the log rather than as an unhandled rejection.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
@@ -43,7 +43,7 @@ describe("HydrawiseController MQTT", () => {
 
     await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
 
-    const payload = mqtt.invokeGet("controller");
+    const payload = await mqtt.invokeGet("controller/get");
 
     assert.ok(payload, "the get handler should answer a payload");
 
@@ -68,7 +68,7 @@ describe("HydrawiseController MQTT", () => {
     const mqtt = h.mqtt;
 
     await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
-    await mqtt.invokeSet("controller", "start 1 300");
+    await mqtt.invokeSet("controller/set", "start 1 300");
 
     const command = firstOf(h.retrieve.callsTo("setzone.php"), "setzone call");
 
@@ -90,7 +90,7 @@ describe("HydrawiseController MQTT", () => {
     const mqtt = h.mqtt;
 
     await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
-    await mqtt.invokeSet("controller", "stop 1");
+    await mqtt.invokeSet("controller/set", "stop 1");
 
     const command = firstOf(h.retrieve.callsTo("setzone.php"), "setzone call");
 
@@ -111,7 +111,7 @@ describe("HydrawiseController MQTT", () => {
     const mqtt = h.mqtt;
 
     await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
-    await mqtt.invokeSet("controller", "start 1 0");
+    await mqtt.invokeSet("controller/set", "start 1 0");
 
     // A run command with a non-positive duration returns null from sendCommand before it reaches the wire, so no setzone call is recorded.
     assert.equal(h.retrieve.callsTo("setzone.php").length, 0, "a zero-duration start should send no setzone command");
@@ -128,7 +128,7 @@ describe("HydrawiseController MQTT", () => {
     const mqtt = h.mqtt;
 
     await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
-    await assert.rejects(() => mqtt.invokeSet("controller", "start 99 300"), /Invalid zone specified/, "a command for an unknown zone should throw");
+    await assert.rejects(() => mqtt.invokeSet("controller/set", "start 99 300"), /Invalid zone specified/, "a command for an unknown zone should throw");
   });
 
   test("the set handler throws on an unknown command", async (t) => {
@@ -142,7 +142,7 @@ describe("HydrawiseController MQTT", () => {
     const mqtt = h.mqtt;
 
     await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
-    await assert.rejects(() => mqtt.invokeSet("controller", "toggle 1"), /Invalid command/, "an unknown command should throw");
+    await assert.rejects(() => mqtt.invokeSet("controller/set", "toggle 1"), /Invalid command/, "an unknown command should throw");
   });
 
   test("each poll publishes the controller status", async (t) => {
@@ -155,12 +155,12 @@ describe("HydrawiseController MQTT", () => {
     assert.ok(h.mqtt, "the MQTT recorder should be attached");
     const mqtt = h.mqtt;
 
-    await waitFor(() => (mqtt.publishes.length >= 1) ? true : undefined);
+    await waitFor(() => (mqtt.published.length >= 1) ? true : undefined);
 
-    const published = firstOf(mqtt.publishes, "MQTT publish");
+    const record = firstOf(mqtt.published, "MQTT publish");
 
-    assert.ok(published.topic.endsWith("controller"), "the publish topic should be the controller topic");
-    assert.ok(published.payload.includes("Alpha"), "the published payload should carry the zone status");
+    assert.ok(record.topic.endsWith("controller"), "the publish topic should be the controller topic");
+    assert.ok(String(record.payload).includes("Alpha"), "the published payload should carry the zone status");
   });
 
   test("a publish rejection is guarded into the log rather than an unhandled rejection", async (t) => {
@@ -174,12 +174,19 @@ describe("HydrawiseController MQTT", () => {
     assert.ok(h.mqtt, "the MQTT recorder should be attached");
     const mqtt = h.mqtt;
 
-    // Arm the publish rejection before the first poll's publish fires; the guarded dispatch must route it to the log.
+    // Arm the publish rejection before the first poll's publish fires; the client's guarded publish must route it to the log.
     mqtt.publishRejection = new Error("broker gone");
 
-    await waitFor(() => loggedAt(h.lines(), "error", "MQTT publish (controller) handler failed") ? true : undefined);
+    /* The failure line names the topic it could not reach, and that topic opens with this controller's serial. A household running several controllers reads
+     * which one lost its broker from exactly that, so the pin covers the named topic rather than the generic opening alone.
+     */
+    const failureLine = "Unable to publish to the MQTT topic " + h.controllerConfig.serial_number + "/controller";
 
-    assert.ok(loggedAt(h.lines(), "error", "MQTT publish (controller) handler failed"), "a rejected publish should be logged by the guarded dispatch");
+    await waitFor(() => loggedAt(h.lines(), "error", failureLine) ? true : undefined);
+
+    assert.ok(loggedAt(h.lines(), "error", failureLine), "a rejected publish should be reported by the client's guarded publish, naming its topic");
+    assert.equal(mqtt.published.length, 0, "and nothing should be recorded as published");
+    assert.ok(mqtt.rejectedPublishes >= 1, "while the refusal itself is counted");
 
     cleanup();
   });
@@ -218,11 +225,11 @@ describe("HydrawiseController MQTT with account facts", () => {
   }
 
   // The parsed payload the get handler answers, which every pin below reads rather than matching substrings against the raw JSON.
-  function payloadOf(h: BuildControllerResult): PublishedZone[] {
+  async function payloadOf(h: BuildControllerResult): Promise<PublishedZone[]> {
 
     assert.ok(h.mqtt, "the MQTT recorder should be attached");
 
-    const raw = h.mqtt.invokeGet("controller");
+    const raw = await h.mqtt.invokeGet("controller/get");
 
     assert.ok(raw, "the get handler should answer a payload");
 
@@ -241,7 +248,7 @@ describe("HydrawiseController MQTT with account facts", () => {
 
     await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
 
-    assert.deepEqual(payloadOf(h), [ { name: "Alpha", relay: 1, run: 0, time: HYDRAWISE_UNSCHEDULED_SENTINEL, timestr: "" },
+    assert.deepEqual(await payloadOf(h), [ { name: "Alpha", relay: 1, run: 0, time: HYDRAWISE_UNSCHEDULED_SENTINEL, timestr: "" },
       { name: "Beta", relay: 2, run: 0, time: HYDRAWISE_UNSCHEDULED_SENTINEL, timestr: "" } ], "no additive key reaches a key-based install");
   });
 
@@ -256,7 +263,7 @@ describe("HydrawiseController MQTT with account facts", () => {
 
     h.controller.applyFacts({ facts: oneSuspended(), fetchedAt: Math.floor(Date.now() / 1000) });
 
-    const parsed = payloadOf(h);
+    const parsed = await payloadOf(h);
 
     /* Attribution is the claim, so each zone is checked individually: the suspended zone carries its own instant and its sibling carries none at all. A substring
      * check against the whole payload could not tell a correctly attributed instant from one landed on the wrong zone.
@@ -285,7 +292,7 @@ describe("HydrawiseController MQTT with account facts", () => {
 
     h.controller.applyFacts({ facts: oneSuspended(), fetchedAt: Math.floor(Date.now() / 1000) - (HYDRAWISE_V2_FACTS_TTL + 1) });
 
-    assert.deepEqual(payloadOf(h), [ { name: "Alpha", relay: 1, run: 0, time: HYDRAWISE_UNSCHEDULED_SENTINEL, timestr: "" },
+    assert.deepEqual(await payloadOf(h), [ { name: "Alpha", relay: 1, run: 0, time: HYDRAWISE_UNSCHEDULED_SENTINEL, timestr: "" },
       { name: "Beta", relay: 2, run: 0, time: HYDRAWISE_UNSCHEDULED_SENTINEL, timestr: "" } ], "an expired snapshot publishes exactly what a key-based install does");
   });
 });

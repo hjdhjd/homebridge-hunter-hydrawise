@@ -210,8 +210,8 @@ describe("HydrawisePlatform configure", () => {
 
     t.after(() => emit(SHUTDOWN));
 
-    // The constructor reassigns log.debug to the platform's debug method and immediately logs the debug banner; with debug enabled that method emits through
-    // log.warn, so the banner surfaces at warning level in the capture.
+    // The constructor wraps the Homebridge logger in the library's config-gated composition and immediately logs the debug banner; with the user's debug setting
+    // on, the gate emits through warn, so the banner surfaces at warning level in the capture.
     assert.ok(loggedAt(lines(), "warn", "Debug logging on. Expect a lot of data."), "an enabled debug gate routes debug output to warning level");
   });
 

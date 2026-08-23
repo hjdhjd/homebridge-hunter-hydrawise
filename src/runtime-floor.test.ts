@@ -6,23 +6,21 @@
  * construct the platform without ever loading the entry point. The moment the floor is bumped to that release, the live assertion fails with an enumerated cleanup
  * list - the anti-forget mechanism that turns "delete the polyfill gesture" from a thing to remember into a thing the suite demands.
  *
+ * What sits here is this plugin's policy alone: which major closes the gap, which specifier makes the gesture, which modules must make it, what the checklist
+ * enumerates, and what the detectors look for. The mechanism those feed - reading the engines floor, deciding the regime, walking the shipped source, firing the
+ * sunset - is the shared machinery on homebridge-plugin-utils's testing surface, which every plugin in the family drives with its own policy.
+ *
  * One residual is accepted and stated rather than papered over. Node runs each test file in its own process, so a suite that constructed the platform without
  * transiting the harness module would run unpolyfilled on a sub-floor runtime. Every construction workhorse does transit it, and the presence and position pins
  * below are the mechanical guards that keep it that way; what no test here can do is exercise the sub-floor path itself, because the runtime running this suite is
  * above the floor and already supplies the globals.
  */
+import { assertRuntimeFloorCompat, composeSunsetCleanup, parseRuntimeFloor, planRuntimeFloorCheck, readEnginesNode,
+  sweepSourceFiles } from "homebridge-plugin-utils/testing";
 import { describe, test } from "node:test";
-import { readFile, readdir } from "node:fs/promises";
+import type { SweptFile } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
-import { fileURLToPath } from "node:url";
-import { join } from "node:path";
-
-// One shipped source file as the sweep reads it.
-interface SweptFile {
-
-  path: string;
-  text: string;
-}
+import { readFile } from "node:fs/promises";
 
 // The major version of the Node release that first ships DisposableStack (and the rest of the explicit-resource-management globals) as a platform global. At or
 // above this floor the polyfill is redundant and the sunset runs; below it the gesture is required.
@@ -51,8 +49,14 @@ const SUNSET_ARTIFACTS = [
 // The enumerated cleanup the live assertion emits once the engines floor reaches the platform-global release. It names every step so the sunset is a mechanical
 // checklist rather than an archaeology exercise, and it is composed from SUNSET_ARTIFACTS so the checklist and the fragments the synthetic sunset test looks for
 // cannot drift apart. That synthetic test asserts these fragments are present, so this path runs green today.
-const SUNSET_CLEANUP = "The Node runtime floor has reached the release that ships the explicit-resource-management globals, so the platform supplies what the " +
-  "polyfill installs and the gesture is redundant. Complete the sunset: delete " + SUNSET_ARTIFACTS.join("; ") + ".";
+const SUNSET_CLEANUP = composeSunsetCleanup({
+
+  artifacts: SUNSET_ARTIFACTS,
+  epilogue: ".",
+  prologue: "The Node runtime floor has reached the release that ships the explicit-resource-management globals, so the platform supplies what the polyfill " +
+    "installs and the gesture is redundant. Complete the sunset: delete ",
+  separator: "; "
+});
 
 // Detect a bare `new DisposableStack()` construction. The polyfill gesture exists precisely so this reads against the platform global rather than an imported
 // class, which is why the rule the sweep enforces is about the gesture rather than about an import in the constructing file. `using` / `await using` declarations
@@ -89,7 +93,8 @@ function gestureIsPresent(source: string): boolean {
 // Decide whether the shipped source is covered for one construction pattern: a tree that constructs the class anywhere needs the entry gesture, and a tree that
 // constructs it nowhere satisfies the rule trivially. This decision is a helper rather than an inline sweep body so the tests can drive it BOTH ways - across the
 // real shipped source, and against fabricated inputs whose verdicts are known - which matters most for the async arm, where no real construction site exists today
-// and an inline sweep body would therefore never run its rejecting branch.
+// and an inline sweep body would therefore never run its rejecting branch. It stays here rather than in the shared machinery because pairing a construction with an
+// entry-point gesture is this plugin's own remedy; a sibling in the family guards the same gap with an entirely different rule.
 function gestureCovers(files: SweptFile[], construction: RegExp, entryHasGesture: boolean): boolean {
 
   if(!files.some(file => construction.test(file.text))) {
@@ -100,82 +105,17 @@ function gestureCovers(files: SweptFile[], construction: RegExp, entryHasGesture
   return entryHasGesture;
 }
 
-// Parse the Node major version from an `engines.node` range and decide the regime: below the platform-global major the gesture is required (compat), at or above
-// it the gesture must go (sunset). We read the first integer run as the major, which is the semantics of every range form we accept (">=22.20", "^24", ">=24.0.0").
-// An unparseable value is a hard failure, never a silent default.
-function parseRuntimeFloor(enginesNode: string): { major: number; regime: "compat" | "sunset" } {
-
-  const digits = /(\d+)/.exec(enginesNode)?.[0];
-
-  if(digits === undefined) {
-
-    throw new Error("Unable to parse a Node major version from the engines.node value: " + JSON.stringify(enginesNode) + ".");
-  }
-
-  const major = Number(digits);
-
-  return { major, regime: (major >= NODE_ERM_GLOBAL_MAJOR) ? "sunset" : "compat" };
-}
-
-// Map an `engines.node` range to the action the live assertion takes: in the sunset regime it fails with the enumerated cleanup, in the compat regime it runs the
-// source sweep. Both arms execute on every suite run - the synthetic tests drive the sunset arm with ">=24" and the sweep arm with ">=22.20", and the live
-// assertion drives whichever the real package.json selects - so the sunset canary's firing path is never dead code proven only by a replica.
-function planRuntimeFloorCheck(enginesNode: string): { kind: "sunset"; message: string } | { kind: "sweep" } {
-
-  const { regime } = parseRuntimeFloor(enginesNode);
-
-  if(regime === "sunset") {
-
-    return { kind: "sunset", message: SUNSET_CLEANUP };
-  }
-
-  return { kind: "sweep" };
-}
-
-// Read the package's own `engines.node`. This suite derives its regime from nothing but the package's declared runtime floor - the single source of truth for what
-// the plugin supports.
-async function readEnginesNode(): Promise<string> {
-
-  const packageJsonText = await readFile(new URL("../package.json", import.meta.url), "utf8");
-  const packageJson = JSON.parse(packageJsonText) as { engines?: { node?: unknown } };
-  const enginesNode = packageJson.engines?.node;
-
-  if(typeof enginesNode !== "string") {
-
-    throw new Error("The package.json engines.node field is missing or is not a string.");
-  }
-
-  return enginesNode;
-}
-
 // Read one module's text by its URL-relative path from this file's own directory.
 async function readSourceModule(relativePath: string): Promise<string> {
 
   return readFile(new URL(relativePath, import.meta.url), "utf8");
 }
 
-// Enumerate the shipped source files the sweep inspects: every `.ts` under `src/` except test, helper, and fixture files. Reads run in parallel.
-async function sweptSourceFiles(): Promise<SweptFile[]> {
-
-  const srcDirectory = fileURLToPath(new URL(".", import.meta.url));
-  const relativePaths = await readdir(srcDirectory, { recursive: true });
-  const excludedSuffixes = [ ".fixtures.ts", ".helpers.ts", ".test.ts" ];
-  const candidatePaths = relativePaths.filter(relativePath => relativePath.endsWith(".ts") &&
-    !excludedSuffixes.some(suffix => relativePath.endsWith(suffix)));
-
-  return Promise.all(candidatePaths.map(async (relativePath) => {
-
-    const fullPath = join(srcDirectory, relativePath);
-
-    return { path: fullPath, text: await readFile(fullPath, "utf8") };
-  }));
-}
-
 describe("HBHH runtime floor - regime helper", () => {
 
   test("parses the compat floor and selects the compat regime", () => {
 
-    const result = parseRuntimeFloor(">=22.20");
+    const result = parseRuntimeFloor({ enginesNode: ">=22.20", sunsetMajor: NODE_ERM_GLOBAL_MAJOR });
 
     assert.equal(result.major, 22, "the first integer run is the major version");
     assert.equal(result.regime, "compat", "a floor below the platform-global release keeps the gesture");
@@ -183,7 +123,7 @@ describe("HBHH runtime floor - regime helper", () => {
 
   test("parses a >=24 floor and selects the sunset regime", () => {
 
-    const result = parseRuntimeFloor(">=24");
+    const result = parseRuntimeFloor({ enginesNode: ">=24", sunsetMajor: NODE_ERM_GLOBAL_MAJOR });
 
     assert.equal(result.major, 24, "the first integer run is the major version");
     assert.equal(result.regime, "sunset", "a floor at the platform-global release retires the gesture");
@@ -191,17 +131,12 @@ describe("HBHH runtime floor - regime helper", () => {
 
   test("parses a caret range and selects the sunset regime", () => {
 
-    assert.equal(parseRuntimeFloor("^24").regime, "sunset", "a caret range parses to the same major");
-  });
-
-  test("throws on an unparseable engines value", () => {
-
-    assert.throws(() => parseRuntimeFloor("not-a-version"), /Unable to parse/, "an engines value with no digits is a hard failure, never a silent default");
+    assert.equal(parseRuntimeFloor({ enginesNode: "^24", sunsetMajor: NODE_ERM_GLOBAL_MAJOR }).regime, "sunset", "a caret range parses to the same major");
   });
 
   test("the sunset regime produces the enumerated cleanup plan", () => {
 
-    const plan = planRuntimeFloorCheck(">=24");
+    const plan = planRuntimeFloorCheck({ enginesNode: ">=24", sunsetMajor: NODE_ERM_GLOBAL_MAJOR, sunsetMessage: SUNSET_CLEANUP });
 
     assert.equal(plan.kind, "sunset", "a sunset floor selects the failing plan");
 
@@ -210,6 +145,13 @@ describe("HBHH runtime floor - regime helper", () => {
 
       assert.ok(plan.message.includes(artifact), "the sunset cleanup enumerates " + artifact);
     }
+
+    /* Membership alone reads each artifact on its own, which a message that joined them with the wrong separator or lost its closing punctuation would still
+     * satisfy. Pinning the composed joins - the separator between two real artifacts, and the epilogue after the last one - is what covers the assembly itself,
+     * while an equality against SUNSET_CLEANUP would only compare the composition to itself.
+     */
+    assert.ok(plan.message.includes("; the mirrored"), "the artifacts are joined by the separator this checklist composes with");
+    assert.ok(plan.message.endsWith("src/runtime-floor.test.ts."), "and the epilogue closes the message after the last artifact");
   });
 
   test("no sunset artifact is a substring of another", () => {
@@ -226,7 +168,8 @@ describe("HBHH runtime floor - regime helper", () => {
 
   test("the compat regime selects the source sweep plan", () => {
 
-    assert.equal(planRuntimeFloorCheck(">=22.20").kind, "sweep", "a compat floor selects the sweep");
+    assert.equal(planRuntimeFloorCheck({ enginesNode: ">=22.20", sunsetMajor: NODE_ERM_GLOBAL_MAJOR, sunsetMessage: SUNSET_CLEANUP }).kind, "sweep",
+      "a compat floor selects the sweep");
   });
 });
 
@@ -284,15 +227,13 @@ describe("HBHH runtime floor - live conformance", () => {
 
   test("the engines floor keeps the polyfill regime, and the gesture covers every construction site", async () => {
 
-    const plan = planRuntimeFloorCheck(await readEnginesNode());
+    const plan = planRuntimeFloorCheck({ enginesNode: await readEnginesNode(new URL("../", import.meta.url)), sunsetMajor: NODE_ERM_GLOBAL_MAJOR,
+      sunsetMessage: SUNSET_CLEANUP });
 
     // The floor reached the platform-global release: fail with the enumerated cleanup so the gesture cannot silently outlive the runtime it works around.
-    if(plan.kind === "sunset") {
+    assertRuntimeFloorCompat(plan);
 
-      assert.fail(plan.message);
-    }
-
-    const files = await sweptSourceFiles();
+    const files = await sweepSourceFiles({ roots: [new URL(".", import.meta.url)] });
 
     assert.ok(files.length >= MINIMUM_SWEPT_FILES, "the source walk enumerated " + files.length.toString() + " files, expected at least " +
       MINIMUM_SWEPT_FILES.toString());

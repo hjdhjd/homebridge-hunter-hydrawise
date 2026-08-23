@@ -3,8 +3,8 @@
  * options.ts: Feature option and type definitions for Hydrawise.
  */
 import type { FeatureOptionEntry, FeatureOptionScope, Nullable } from "homebridge-plugin-utils";
+import { buildComposedScopeDescribers, mqttFeatureOptions } from "homebridge-plugin-utils";
 import { HYDRAWISE_MQTT_TOPIC } from "./settings.ts";
-import { mqttFeatureOptions } from "homebridge-plugin-utils";
 
 /* The plugin's effective configuration, assembled once by the platform constructor. Each consolidated setting resolves there - the configured feature option
  * first, the legacy configuration property as its fallback - so this describes what the plugin actually runs on rather than mirroring the shape of config.json.
@@ -145,35 +145,10 @@ export const featureOptions: Record<string, FeatureOptionEntry[]> = {
   [mqtt.category.name]: mqtt.options
 };
 
-// Human-readable expansion of each scope level, consulted by the documentation hook when rendering an option's scope prose. The framework's level names are generic
-// across plugins, so this is where they become the Hydrawise hierarchy the user actually sees.
-const scopeDescriptions: Record<FeatureOptionScope, string> = {
-
-  "controller": "the whole controller",
-  "device": "each zone",
-  "global": "globally, across every controller"
-};
-
-// Module-scope list formatter for the option scope sentence. It renders "X" and "X and Y" uniformly.
-const scopeListFormatter = new Intl.ListFormat("en", { style: "long", type: "conjunction" });
-
-/**
- * Documentation hook: returns the scope suffix appended to an option's description cell, naming the levels the option can be configured at, or `undefined` when the
- * option declares no scope. The parameter is typed to the renderer's own generic signature, whose entry keeps `scopes` optional; the required-scopes guarantee lives
- * at the catalog declaration above, so we guard `option.scopes` here rather than relying on the entry type.
- *
- * @param option - The option entry whose `scopes` to describe.
- *
- * @returns The full " <BR>*Configurable at ...*" suffix, or `undefined` to omit it.
+/* The documentation hooks the docs renderer consumes, composed by the library: the vocabulary below is this plugin's own name for each scope level, as a complete
+ * phrase carrying its own preposition, and the sentence around the list - the leading word, the "or" grammar, the italics - is the renderer family's.
  */
-export const describeOptionScope = (option: FeatureOptionEntry): string | undefined => {
+export const { describeCategoryScope, describeOptionScope } = buildComposedScopeDescribers({
 
-  const scopes = option.scopes;
-
-  if(!scopes) {
-
-    return undefined;
-  }
-
-  return " <BR>*Configurable at " + scopeListFormatter.format(scopes.map(scope => scopeDescriptions[scope])) + ".*";
-};
+  vocabulary: { "controller": "on the whole controller", "device": "on each zone", "global": "globally across every controller" }
+});

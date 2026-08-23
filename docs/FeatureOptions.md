@@ -48,34 +48,34 @@ Options whose key ends in `=<value>` take a value - replace `=<value>` with your
 
 | Option                                                     | Description
 |------------------------------------------------------------|-------------------------------------------------------------
-| <A NAME="Account.ApiKey"></A>`Account.ApiKey=<value>`      | The API key for your Hydrawise account, generated under Account Details → Account Settings on the Hydrawise website. **(default: none)**. <BR>*Configurable at globally, across every controller.*
-| <A NAME="Account.Username"></A>`Account.Username=<value>`  | The username for your Hydrawise account, which is the email address you sign in with. Optional: setting it alongside your password enables enhanced features - accurate rain and suspension state for each zone, whether each controller is reachable, and its real model and firmware details in HomeKit and the webUI. **(default: none)**. <BR>*Configurable at globally, across every controller.*
-| <A NAME="Account.Password"></A>`Account.Password=<value>`  | The password for your Hydrawise account. Optional: setting it alongside your username enables enhanced features - accurate rain and suspension state for each zone, whether each controller is reachable, and its real model and firmware details in HomeKit and the webUI. **(default: none)**. <BR>*Configurable at globally, across every controller.*
+| <A NAME="Account.ApiKey"></A>`Account.ApiKey=<value>`      | The API key for your Hydrawise account, generated under Account Details → Account Settings on the Hydrawise website. **(default: none)**. <BR>*Configurable globally across every controller.*
+| <A NAME="Account.Username"></A>`Account.Username=<value>`  | The username for your Hydrawise account, which is the email address you sign in with. Optional: setting it alongside your password enables enhanced features - accurate rain and suspension state for each zone, whether each controller is reachable, and its real model and firmware details in HomeKit and the webUI. **(default: none)**. <BR>*Configurable globally across every controller.*
+| <A NAME="Account.Password"></A>`Account.Password=<value>`  | The password for your Hydrawise account. Optional: setting it alongside your username enables enhanced features - accurate rain and suspension state for each zone, whether each controller is reachable, and its real model and firmware details in HomeKit and the webUI. **(default: none)**. <BR>*Configurable globally across every controller.*
 
 #### <A NAME="device"></A>Device feature options.
 
 | Option                                                   | Description
 |----------------------------------------------------------|-------------------------------------------------------------
-| <A NAME="Device"></A>`Device`                            | Make this device available in HomeKit. **(default: enabled)**. <BR>*Configurable at the whole controller, each zone, and globally, across every controller.*
-| <A NAME="Device.Name"></A>`Device.Name=<value>`          | Custom HomeKit name for this zone or controller. When unset, the name reported by Hydrawise is used. **(default: none)**. <BR>*Configurable at the whole controller and each zone.*
-| <A NAME="Device.Standalone"></A>`Device.Standalone`      | Expose this zone as its own HomeKit accessory, assignable to any room. Toggling this changes the zone's HomeKit identity, so automations, scenes, and room assignments tied to it must be recreated. **(default: disabled)**. <BR>*Configurable at the whole controller, each zone, and globally, across every controller.*
-| <A NAME="Device.Suspend.All"></A>`Device.Suspend.All`    | Enable a switch accessory that suspends and resumes every zone on the controller at once. **(default: disabled)**. <BR>*Configurable at the whole controller and globally, across every controller.*
-| <A NAME="Device.Suspend.Zone"></A>`Device.Suspend.Zone`  | Enable a switch accessory that suspends and resumes an individual zone. Requires your Hydrawise account login (enhanced features). **(default: disabled)**. <BR>*Configurable at the whole controller, each zone, and globally, across every controller.*
-| <A NAME="Device.SyncName"></A>`Device.SyncName`          | Synchronize zone and controller names one-way (Hydrawise → HomeKit), using the Name option when set, otherwise the name reported by Hydrawise. **(default: enabled)**. <BR>*Configurable at the whole controller, each zone, and globally, across every controller.*
+| <A NAME="Device"></A>`Device`                            | Make this device available in HomeKit. **(default: enabled)**. <BR>*Configurable on the whole controller, on each zone, or globally across every controller.*
+| <A NAME="Device.Name"></A>`Device.Name=<value>`          | Custom HomeKit name for this zone or controller. When unset, the name reported by Hydrawise is used. **(default: none)**. <BR>*Configurable on the whole controller or on each zone.*
+| <A NAME="Device.Standalone"></A>`Device.Standalone`      | Expose this zone as its own HomeKit accessory, assignable to any room. Toggling this changes the zone's HomeKit identity, so automations, scenes, and room assignments tied to it must be recreated. **(default: disabled)**. <BR>*Configurable on the whole controller, on each zone, or globally across every controller.*
+| <A NAME="Device.Suspend.All"></A>`Device.Suspend.All`    | Enable a switch accessory that suspends and resumes every zone on the controller at once. **(default: disabled)**. <BR>*Configurable on the whole controller or globally across every controller.*
+| <A NAME="Device.Suspend.Zone"></A>`Device.Suspend.Zone`  | Enable a switch accessory that suspends and resumes an individual zone. Requires your Hydrawise account login (enhanced features). **(default: disabled)**. <BR>*Configurable on the whole controller, on each zone, or globally across every controller.*
+| <A NAME="Device.SyncName"></A>`Device.SyncName`          | Synchronize zone and controller names one-way (Hydrawise → HomeKit), using the Name option when set, otherwise the name reported by Hydrawise. **(default: enabled)**. <BR>*Configurable on the whole controller, on each zone, or globally across every controller.*
 
 #### <A NAME="log"></A>Logging feature options.
 
 | Option                               | Description
 |--------------------------------------|-------------------------------------------------------------
-| <A NAME="Log.Debug"></A>`Log.Debug`  | Enable debug logging. **(default: disabled)**. <BR>*Configurable at globally, across every controller.*
-| <A NAME="Log.Zone"></A>`Log.Zone`    | Log zone start and stop events in Homebridge. **(default: enabled)**. <BR>*Configurable at the whole controller, each zone, and globally, across every controller.*
+| <A NAME="Log.Debug"></A>`Log.Debug`  | Enable debug logging. **(default: disabled)**. <BR>*Configurable globally across every controller.*
+| <A NAME="Log.Zone"></A>`Log.Zone`    | Log zone start and stop events in Homebridge. **(default: enabled)**. <BR>*Configurable on the whole controller, on each zone, or globally across every controller.*
 
 #### <A NAME="mqtt"></A>MQTT
 
 | Option                                         | Description
 |------------------------------------------------|-------------------------------------------------------------
-| <A NAME="Mqtt.Url"></A>`Mqtt.Url=<value>`      | URL of the MQTT broker to connect to (e.g. mqtt://1.2.3.4). **(default: none)**. <BR>*Configurable at globally, across every controller.*
-| <A NAME="Mqtt.Topic"></A>`Mqtt.Topic=<value>`  | Topic prefix for published and subscribed MQTT messages. **(default: hydrawise)**. <BR>*Configurable at globally, across every controller.*
+| <A NAME="Mqtt.Url"></A>`Mqtt.Url=<value>`      | URL of the MQTT broker to connect to (e.g. mqtt://1.2.3.4). **(default: none)**. <BR>*Configurable globally across every controller.*
+| <A NAME="Mqtt.Topic"></A>`Mqtt.Topic=<value>`  | Topic prefix for published and subscribed MQTT messages. **(default: hydrawise)**. <BR>*Configurable globally across every controller.*
 
 <!-- FEATURE OPTIONS:END -->
 
