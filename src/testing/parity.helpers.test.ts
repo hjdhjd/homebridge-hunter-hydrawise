@@ -1,7 +1,7 @@
 /* Copyright(C) 2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
  * parity.helpers.test.ts: Tests for the factory-parity utilities. assertSameShape and declareKeysOf together form the runtime + compile-time pair that
- * catches silent drift between a fixture factory and its target type. The test file pins assertSameShape's reporting contract (asymmetric difference, descriptive
+ * catches silent drift between a fixture factory and its target type. The test file locks in assertSameShape's reporting contract (asymmetric difference, descriptive
  * label embedding, no-op on equal sets); declareKeysOf's contract is fundamentally compile-time so we exercise it with a representative type and verify the
  * runtime return-as-passed-through behavior.
  */
@@ -126,9 +126,9 @@ describe("declareKeysOf", () => {
 
   test("supports the empty-key case for a type with no keys", () => {
 
-    // Boundary: a type with no keys (keyof resolves to never) passes an empty const array. The completeness check is trivially satisfied. Record<never, never>
-    // is the canonical "no keys" type - Record<string, never> has an index signature so keyof resolves to string, not never.
-    const keys = declareKeysOf<Record<never, never>>()([] as const);
+    // Boundary: a type with no keys (keyof resolves to never) passes an empty const array, and the completeness check is trivially satisfied. The object type is
+    // that keyless type - a Record with a string key would carry an index signature, so keyof would resolve to string rather than never.
+    const keys = declareKeysOf<object>()([] as const);
 
     assert.equal(keys.length, 0, "a keyless type should declare an empty array");
   });

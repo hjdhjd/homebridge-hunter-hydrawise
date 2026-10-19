@@ -7,9 +7,9 @@
 import { API_KEY_LENGTH, makeHydrawiseConfig, makeLegacyHydrawiseConfig } from "./hydrawise-config.mjs";
 import { FeatureOptions, buildCatalogIndex, enumerateConfiguredEntries, expandOption } from "homebridge-plugin-utils/featureOptions.js";
 import { ZONE_STATE_LABELS, deriveControllerDisplay, deriveZoneDisplay, formatRunTime, zoneScheduleState } from "./hydrawise-display.mjs";
+import { createActionGuard, withDeadline } from "homebridge-plugin-utils/webUi-liveness.mjs";
 import { PluginConfigSession } from "homebridge-plugin-utils/pluginConfigSession.mjs";
 import { webUi } from "homebridge-plugin-utils/webUi.mjs";
-import { withDeadline } from "homebridge-plugin-utils/webUi-liveness.mjs";
 
 // The feature-option category the controller-scope options this webUI reasons about live in. One constant anchors the category everywhere this file names it - the
 // floor-entry grammar, the catalog read, the enable-state oracle, and the custom-name override's own option key - while the plugin's runtime names it
@@ -28,6 +28,17 @@ const NOTICE_DISABLED_LISTED = "This controller is disabled in your Homebridge c
 const NOTICE_UNPUBLISHED = "The plugin has not published this controller's details yet. " +
   "Restart Homebridge, and its zones will appear here after the first update from Hydrawise completes.";
 const NOTICE_UNDISCOVERED = "The plugin has not discovered this controller yet. Restart Homebridge to discover it.";
+
+/* The copy the listing hooks hand the framework in place of its own wording, because the framework's defaults speak of a controller's connection details and of
+ * adding controllers in the main settings tab, and neither fits a plugin whose controllers come from the account behind its API key and whose listings read the
+ * local accessory cache. Complete sentences, shown verbatim to the user.
+ */
+const LIST_EMPTY = "No controllers were found for this API key. Check the key under the account settings, then use Refresh from Hydrawise.";
+const LIST_CACHE_FAILED = "Unable to read the Homebridge accessory cache.";
+const LIST_CACHE_GUIDANCE = "Retry, and restart Homebridge if the problem persists.";
+const LIST_ZONES_CACHE_FAILED = "Unable to read this controller's zones from the Homebridge accessory cache.";
+const LIST_ZONES_CLASSIFY_FAILED = "Unable to classify this controller's zones.";
+const LIST_ZONES_CLASSIFY_GUIDANCE = "Use Refresh from Hydrawise, and restart Homebridge if the problem persists.";
 
 /* The schedule ticker's cadence in milliseconds, one nominal poll interval. In the steady state a tick's cache read reaches the server fresh, because the browser's
  * own thirty-second cache has expired between ticks; interleaved page activity can instead serve a tick from that window, which bounds that tick's extra staleness
@@ -49,19 +60,12 @@ const sessionControllers = new Map();
 const sessionFloorSerials = new Set();
 const sessionZones = new Map();
 
-/* The bound in seconds on the shared option-catalog fetch below. The bound exists so a bridge call that never settles rejects rather than wedging the cached
- * promise for the life of the session, and it binds every consumer of that one fetch alike. The trade it carries: a fetch that is legitimately slow but would
- * eventually have settled costs a retry cycle rather than resolving, which is cheap beside the permanent wedge the bound prevents, because the cache clears on
- * rejection and a later read refetches fresh.
+/* The option catalog as this page reads it, derived from the framework's own read: the categories and options the framework fetched from the plugin's UI
+ * server, plus the index the config-floor walk reads. The framework's catalog() is the page's one request to /getOptions - a local IPC, never a cloud call -
+ * memoized for the page's life, bounded by its own deadline, and cleared when it fails. The derivation keeps a memo of its own keyed on the identity of the
+ * promise the framework answers, so a repeat read reuses the index already built while a fresh promise after a failure builds it again.
  */
-const CATALOG_DEADLINE = 5;
-
-/* The option catalog, fetched once per session from the plugin's own UI server (a local IPC to /getOptions, never a cloud call) and shared by every reader of
- * the catalog. The framework fetches the same endpoint for its own catalog on every show cycle; the two reads are independent by design, since the framework
- * exposes no handle to its copy - the duplication is one static local request per session. The cached promise is cleared on failure so a later read retries
- * rather than pinning a transient fault for the session, and the bound above is what makes a call that never answers a failure the clear can act on.
- */
-let catalogPromise = null;
+let catalogMemo = null;
 
 /* The schedule ticker's module state, all of it scoped to one mount and reset when that mount aborts. The ticker serves every schedule-bearing surface from one
  * read - the sidebar's zone dots and the details panel among them - and only the panel needs tracking here, because the dots are found by query at the moment
@@ -86,26 +90,31 @@ let inFlightTick = null;
  */
 let validatedCredentials = null;
 
+// Derive this page's catalog from one framework read: the categories and options it answered, checked for the Device category, and the index built over them.
+const deriveCatalog = async (source) => {
+
+  const { categories, options } = await source;
+
+  // The framework checks for categories and an options record but not for the Device category. A catalog without it would make the enable-state oracle read every
+  // controller as disabled off the engine's false fallback, so it is a failure rather than a default, and the guarded callers surface it.
+  if(!Array.isArray(options[DEVICE_CATEGORY])) {
+
+    throw new Error("Received a malformed response from the plugin option catalog.");
+  }
+
+  return { categories, index: buildCatalogIndex(categories, options), options };
+};
+
 const getCatalog = () => {
 
-  catalogPromise ??= withDeadline({ promise: homebridge.request("/getOptions"), seconds: CATALOG_DEADLINE }).then((response) => {
+  const source = ui.featureOptions.catalog();
 
-    // A response without the catalog shape the server publishes is a failure, not a default. Shaping it into an empty catalog would make the enable-state
-    // oracle read every controller as disabled off the engine's false fallback, so a malformed response throws and the guarded callers surface it instead.
-    if(!Array.isArray(response?.categories) || !response.categories.length || !Array.isArray(response?.options?.[DEVICE_CATEGORY])) {
+  if(catalogMemo?.source !== source) {
 
-      throw new Error("Received a malformed response from the plugin option catalog.");
-    }
+    catalogMemo = { derived: deriveCatalog(source), source };
+  }
 
-    return { categories: response.categories, index: buildCatalogIndex(response.categories, response.options), options: response.options };
-  }).catch((error) => {
-
-    catalogPromise = null;
-
-    throw error;
-  });
-
-  return catalogPromise;
+  return catalogMemo.derived;
 };
 
 /* The interpreter every configuration read in this file goes through. It is declared already holding the degraded-mode interpreter, so the binding is never
@@ -253,7 +262,7 @@ const notifyError = (message) => {
 // the persisted config rather than a reach into the feature-options page's state, and the interpreter is what knows where a key can live.
 const firstRunIsRequired = ({ config }) => hydrawiseConfig.apiKey(config).length !== API_KEY_LENGTH;
 
-/* The classes a credential result line wears in every state. The tone rides on top of this base, so a line's blank, failure, and success states are one layout with
+/* The classes a credential result line wears in every state. The tone is layered on top of this base, so a line's blank, failure, and success states are one layout with
  * one color decision between them rather than a separate class string per state, which is what would let the states drift apart.
  */
 const RESULT_ROW_CLASS = "hbhh-result small mt-2";
@@ -270,45 +279,45 @@ const renderResultRow = ({ id, text, tone }) => {
   row.textContent = text;
 };
 
-/* Build one validation surface: the generation that says which invocation the page is still listening to, and the cleanup that runs whenever the surface is retired.
+/* Build one validation surface: the action guard that says which invocation the page is still listening to, and the cleanup that runs whenever the surface is
+ * retired.
  *
- * A validation spends a cloud call and paints what it learns when the call answers, and the bridge request it rides carries no way to abort - so an edit made while
- * a call is in flight cannot stop the call, only decide that its answer no longer describes anything on screen. The generation is what carries that decision across
- * the await: an invocation captures the value begin() hands it, and anything it would do afterward is conditioned on that value still being the live one.
+ * A validation spends a cloud call and paints what it learns when the call answers, and the bridge request carrying it has no way to abort - so an edit made while a
+ * call is in flight cannot stop the call, only decide that its answer describes nothing on screen any more. The guard's signal is what carries that decision across
+ * the await: an invocation holds the claim begin() hands it, and anything it would do afterward is conditioned on that claim still being current.
  */
 const makeValidationScope = ({ inputs, onInvalidate }) => {
 
-  let generation = 0;
+  const guard = createActionGuard();
 
-  // Retire whatever this surface is currently showing or holding. Advancing the generation is what disowns an invocation still in flight, and the cleanup is what
-  // takes the retired verdict off screen...both halves are the same act, so no caller can perform one without the other.
+  // Retire whatever this surface is currently showing or holding. Cancelling the guard is what disowns an invocation still in flight, and the cleanup is what takes
+  // the retired verdict off screen...both halves are the same act, so no caller can perform one without the other.
   const invalidate = () => {
 
-    generation++;
-
+    guard.cancel();
     onInvalidate();
   };
 
   return {
 
-    // Start a validation and hand back this invocation's claim on the surface. Starting retires whatever came before it, which is the same clearing the surface
-    // does on an edit, so one bump covers both the retirement and the claim.
+    // Start a validation and hand back this invocation's claim on the surface, the signal of the guard's newest action. Starting retires whatever came before it,
+    // which is the same clearing the surface does on an edit.
     begin: () => {
 
       invalidate();
 
-      return generation;
+      return guard.start();
     },
     inputs,
     invalidate,
-    isCurrent: (captured) => captured === generation
+    isCurrent: (claim) => !claim.aborted
   };
 };
 
 /* The first-run screen's validation surfaces, one per endpoint it can call. This declaration is the whole mapping's single source of truth: each surface names the
  * inputs whose edits retire it and the cleanup that retirement runs, and both the handlers and the input wiring derive from here rather than restating it.
  *
- * The surfaces count separately on purpose. Each validation rides its own endpoint and its own rate budget, so an edit to the API key must not throw away an
+ * The surfaces count separately on purpose. Each validation calls its own endpoint against its own rate budget, so an edit to the API key must not throw away an
  * account-login answer the user already paid a call for, nor the reverse.
  */
 const validationScopes = {
@@ -418,7 +427,6 @@ const firstRunOnSubmit = async ({ commit, config }) => {
   if(result !== "success") {
 
     renderLoginError([], result);
-    homebridge.hideSpinner();
 
     return false;
   }
@@ -430,7 +438,7 @@ const firstRunOnSubmit = async ({ commit, config }) => {
    * rather than tidy: each interpreter write returns its own complete snapshot of the options array, so committing two of them would leave the shallow merge
    * holding only the second and silently dropping whatever the first composed.
    *
-   * Only a VALIDATED account login rides along. An unvalidated edit sitting in the fields is not committed, and an absent pair leaves whatever the configuration
+   * Only a VALIDATED account login joins the patch. An unvalidated edit sitting in the fields is not committed, and an absent pair leaves whatever the configuration
    * already held untouched.
    */
   await commit(hydrawiseConfig.withFirstRun(config, { apiKey, password: validatedCredentials?.password, username: validatedCredentials?.username }));
@@ -562,7 +570,8 @@ const getControllers = async ({ config }) => {
      * result's error half. Returning here rather than carrying on is deliberate: the later sources could still compose a partial roster, and a partial roster
      * rendered as though it were the whole account is a worse answer than an honest failure the user can retry.
      */
-    return { controllers: [], error: "Unable to read the Homebridge accessory cache: " + ((err instanceof Error) ? err.message : String(err)) };
+    return { controllers: [], error: "Unable to read the Homebridge accessory cache: " + ((err instanceof Error) ? err.message : String(err)),
+      guidance: LIST_CACHE_GUIDANCE, headline: LIST_CACHE_FAILED };
   }
 
   /* (b) The config floor, read through the option catalog. Each named serial is remembered for the session; one that is neither a known controller nor a known
@@ -605,9 +614,11 @@ const getControllers = async ({ config }) => {
     resolved.push({ controllerId: entry.controllerId, name: pendingRestart ? (entry.name + " (pending restart)") : entry.name, serialNumber: entry.serialNumber });
   }
 
-  // A successful read carries no error, empty roster or not: an account with every controller disabled and no floor entries is a legitimate empty listing, and the
-  // page's own no-controllers message is the right thing for the user to see there.
-  return { controllers: resolved, error: "" };
+  /* A successful read carries no error, empty roster or not: an account with every controller disabled and no floor entries is a legitimate empty listing. The
+   * plugin supplies its own message for that empty listing, which the framework reads only when the roster is empty and the error is too, because its default
+   * sends the user to the main settings tab while this plugin's controllers come from the account behind the API key.
+   */
+  return { controllers: resolved, emptyMessage: LIST_EMPTY, error: "" };
 };
 
 /* Return a selected controller's zones for the two-level sidebar, with zero automatic cloud calls. We resolve the zones from the accessory whose own controller
@@ -647,7 +658,7 @@ const getDevices = async (controller, { config } = {}) => {
     }
   } catch(err) {
 
-    return { devices: [], error: (err instanceof Error) ? err.message : String(err) };
+    return { devices: [], error: (err instanceof Error) ? err.message : String(err), guidance: LIST_CACHE_GUIDANCE, headline: LIST_ZONES_CACHE_FAILED };
   }
 
   // A context-less controller (no live accessory, or a malformed cache) falls back to the zones an explicit refresh stored this session.
@@ -707,7 +718,8 @@ const getDevices = async (controller, { config } = {}) => {
       return { devices: [{ kind: "controller", name: name ?? controller.name, notice, serialNumber: controller.serialNumber, sidebarGroup: "hidden" }], error: "" };
     } catch(error) {
 
-      return { devices: [], error: (error instanceof Error) ? error.message : String(error) };
+      return { devices: [], error: (error instanceof Error) ? error.message : String(error), guidance: LIST_ZONES_CLASSIFY_GUIDANCE,
+        headline: LIST_ZONES_CLASSIFY_FAILED };
     }
   }
 
@@ -1204,8 +1216,8 @@ const showDeviceDetails = ({ device, panel, signal }) => {
    * from stacking a second interval. The teardown is registered BEFORE the interval, because the handle is this block's own re-entry guard: arming first and then
    * throwing on the registration would leave an interval nothing can stop behind a guard that never re-enters.
    *
-   * The MOUNT signal, not the page epoch, is the deliberate lifetime. This data is per-selected-device and its read is a cheap local call, so the ticker dies with
-   * the view and re-arms on the next mount; nothing here is worth keeping warm across a navigation the way an expensive cloud fetch would be.
+   * The MOUNT signal is the deliberate lifetime. This data is per-selected-device and its read is a cheap local call, so the ticker dies with the view and re-arms
+   * on the next mount; nothing here is worth keeping warm across a navigation the way an expensive cloud fetch would be.
    */
   if(scheduleTimer === undefined) {
 
@@ -1220,8 +1232,8 @@ const showDeviceDetails = ({ device, panel, signal }) => {
     scheduleTimer = setInterval(() => void scheduleTick(), SCHEDULE_TICK_MS);
   }
 
-  // A wake from an OS-level freeze should not have to wait out the remainder of a tick, so the page's resume detector runs one the moment it notices. It rides the
-  // same mount signal the interval does, and the mount-identity guard registers it exactly once per mount.
+  // A wake from an OS-level freeze should not have to wait out the remainder of a tick, so the page's resume detector runs one the moment it notices. It is bound to
+  // the same mount signal the interval is, and the mount-identity guard registers it exactly once per mount.
   if(scheduleMountSignal !== signal) {
 
     scheduleMountSignal = signal;
@@ -1262,9 +1274,7 @@ const featureOptionsParams = {
      * declines to re-enter, so a refresh that learned nothing cannot present as one that did. The partial failures after the roster is seeded resolve instead, and
      * report through a toast of their own - the fresh roster is real by then, and rejecting would withhold the very re-entry that puts it on screen.
      *
-     * The epoch guard after each await answers the module copy. A reopened settings panel mints a successor copy of this module and retires this one, and a retired
-     * copy must not toast, seed a store the live copy reads, or spend another call against the account's rate budget. Resolving on a dead mount is inert, since the
-     * re-entry that follows answers to that mount's own aborted signal.
+     * Resolving on a dead mount is inert, since the re-entry that follows answers to that mount's own aborted signal.
      */
     refresh: {
 
@@ -1272,18 +1282,7 @@ const featureOptionsParams = {
       onRefresh: async () => {
 
         const apiKey = hydrawiseConfig.apiKey((await homebridge.getPluginConfig())?.[0]);
-
-        if(ui.epochSignal.aborted) {
-
-          return;
-        }
-
         const { controllers, error } = await homebridge.request("/refreshControllers", { apiKey });
-
-        if(ui.epochSignal.aborted) {
-
-          return;
-        }
 
         if(error) {
 
@@ -1302,12 +1301,6 @@ const featureOptionsParams = {
         try {
 
           const cached = await homebridge.getCachedAccessories();
-
-          if(ui.epochSignal.aborted) {
-
-            return;
-          }
-
           const contextSerials = new Set();
 
           for(const accessory of cached) {
@@ -1321,11 +1314,6 @@ const featureOptionsParams = {
           contextless = identities.filter((identity) => !contextSerials.has(foldSerial(identity.serialNumber)));
         } catch(err) {
 
-          if(ui.epochSignal.aborted) {
-
-            return;
-          }
-
           notifyError((err instanceof Error) ? err.message : String(err));
         }
 
@@ -1335,11 +1323,6 @@ const featureOptionsParams = {
 
           const { error: zonesError, zones } = await homebridge.request("/refreshZones", { apiKey,
             controllers: contextless.map((identity) => ({ controllerId: identity.controllerId, serialNumber: identity.serialNumber })) });
-
-          if(ui.epochSignal.aborted) {
-
-            return;
-          }
 
           if(zonesError) {
 
@@ -1382,9 +1365,9 @@ const webUiParams = {
 const ui = new webUi(webUiParams);
 
 /* Adopt the framework's theming for this page - the design tokens, the themed canvas, the dark-mode corrections, the page-kit classes, and the host's own accent -
- * with one call that holds for as long as this module copy owns the window. Theming is a page concern rather than a view one, so first run, the settings form, and
- * support all wear it from here. The promise is voided rather than awaited because the framework owns its rejection posture: a failed initial lighting-mode read
- * still leaves the sheets adopted and the host's theme signals followed, so the next announcement the host makes brings the page into step.
+ * with one call that holds for the life of the page. Theming is a page concern rather than a view one, so first run, the settings form, and support all wear it
+ * from here. The promise is voided rather than awaited because the framework owns its rejection posture: a failed initial lighting-mode read still leaves the
+ * sheets adopted and the host's theme signals followed, so the next announcement the host makes brings the page into step.
  */
 void ui.registerTheming();
 
@@ -1408,7 +1391,7 @@ const onValidateApiKey = async () => {
 
   // Whatever the last validation said is stale the moment a new one starts, so the line is blanked before the call rather than after it - a call that never
   // resolves must not leave an older verdict standing beside newer input. Beginning the validation is what blanks it, and what hands this invocation its claim.
-  const generation = validationScopes.apiKey.begin();
+  const claim = validationScopes.apiKey.begin();
 
   button.disabled = true;
 
@@ -1416,13 +1399,10 @@ const onValidateApiKey = async () => {
 
     const { result } = await homebridge.request("/login", apiKey);
 
-    /* Every way this invocation can have been superseded while the call was out is answered here, and a verdict lands only when none of them happened. The epoch
-     * signal answers the module copy, for the reason the refresh handler states: a reopened panel mints a successor copy of this module, and a retired copy must
-     * not paint over what the copy the user is looking at is showing. The generation answers the surface: an edit to the key, or a newer validation of it, retires
-     * this call, and its verdict would otherwise land beside a key it never described. A superseded invocation discards silently - the surface has already
-     * cleared itself.
+    /* A verdict lands only while this invocation's claim is still current. An edit to the key, or a newer validation of it, retires this call, and its verdict
+     * would otherwise land beside a key it never described. A superseded invocation discards silently - the surface has already cleared itself.
      */
-    if(ui.epochSignal.aborted || !validationScopes.apiKey.isCurrent(generation)) {
+    if(!validationScopes.apiKey.isCurrent(claim)) {
 
       return;
     }
@@ -1437,8 +1417,8 @@ const onValidateApiKey = async () => {
     renderResultRow({ id: "apiKeyResult", text: "Your Hydrawise API key is valid.", tone: "text-success" });
   } finally {
 
-    /* The re-enable is unconditional, superseded copy or not: the invocation that disabled the control is the only thing that can balance its own disable, and the
-     * button element outlives any one module copy, so a copy that bailed out without re-enabling would leave the control disabled with no other owner of that duty.
+    /* The re-enable is unconditional, superseded or not: the invocation that disabled the control is the only thing that can balance its own disable, so an
+     * invocation that returned without re-enabling would leave the control disabled with no other owner of that duty.
      */
     button.disabled = false;
   }
@@ -1449,6 +1429,9 @@ const onValidateApiKey = async () => {
  *
  * Staging rather than writing is what makes the button's meaning honest. The pair that gets committed is the pair the cloud confirmed, so a user who validates and
  * then edits a field cannot end up with an unchecked credential written as though it had been checked - the edit handlers below clear the staged pair.
+ *
+ * The validation begins before the empty-field check here, the reverse of the API key handler's order, so a press with a field left empty retires any account
+ * validation still in flight and clears the staged pair before it reports the missing field, and it does so without locking the button.
  */
 const onValidateV2 = async () => {
 
@@ -1458,7 +1441,7 @@ const onValidateV2 = async () => {
 
   // Anything already staged is stale the moment a new validation starts, so it is cleared before the call rather than after it - a call that never resolves must
   // not leave an older result standing beside newer input. Beginning the validation is what clears it, and what hands this invocation its claim.
-  const generation = validationScopes.account.begin();
+  const claim = validationScopes.account.begin();
 
   if(!username.length || !password.length) {
 
@@ -1473,14 +1456,11 @@ const onValidateV2 = async () => {
 
     const { result: outcome } = await homebridge.request("/loginV2", { password, username });
 
-    /* Every way this invocation can have been superseded while the call was out is answered here, and neither a verdict nor a staged pair lands unless the guard
-     * says this is still the invocation the page is listening to. The epoch signal answers the module copy, for the reason the refresh handler states: a reopened
-     * panel mints a successor copy of this module, and a retired copy must not paint over what the copy the user is looking at is showing. The generation answers
-     * the surface, and it is what makes the button's meaning honest across the await: a user who edits either field while the call is out has retired this pair,
-     * so staging it here would commit a login the cloud confirmed for input that is no longer on screen. A superseded invocation discards silently - the surface
-     * has already cleared itself, and there is no wire to cancel.
+    /* Neither a verdict nor a staged pair lands unless this invocation's claim is still current, and that check is what makes the button's meaning honest across
+     * the await: a user who edits either field while the call is out has retired this pair, so staging it here would commit a login the cloud confirmed for input
+     * that has since left the screen. A superseded invocation discards silently - the surface has already cleared itself, and there is no wire to cancel.
      */
-    if(ui.epochSignal.aborted || !validationScopes.account.isCurrent(generation)) {
+    if(!validationScopes.account.isCurrent(claim)) {
 
       return;
     }
@@ -1497,8 +1477,8 @@ const onValidateV2 = async () => {
     renderResultRow({ id: "validateV2Result", text: "Your Hydrawise account login is valid.", tone: "text-success" });
   } finally {
 
-    /* The re-enable is unconditional, superseded copy or not, for the reason the API key validation's own finally states: the invocation that disabled the control
-     * is the only thing that can balance its own disable, and the button element outlives any one module copy.
+    /* The re-enable is unconditional, superseded or not, for the reason the API key validation's own finally states: the invocation that disabled the control is
+     * the only thing that can balance its own disable.
      */
     button.disabled = false;
   }
@@ -1526,14 +1506,11 @@ const toggleReveal = (toggle) => {
   toggle.setAttribute("aria-pressed", revealed ? "true" : "false");
 };
 
-/* Wire the first-run validations, the credential reveals, and the edits that invalidate a verdict already on screen. Every binding registers through the facade,
- * whose registration joins it to the page epoch, so a superseded module copy's handlers die when a newer copy claims the window.
- *
- * The lookups hand their result straight to the facade: a nullish target declares that surface absent, so registering against a control this page's markup omits
- * is the facade's own documented no-op and costs that control's wiring alone.
+/* Wire the first-run validations, the credential reveals, and the edits that invalidate a verdict already on screen. Each lookup by id reaches its listener
+ * through an optional chain, so a control this page's markup omits costs that control's wiring alone rather than the whole page's.
  */
-ui.on(document.getElementById("validateApiKey"), "click", () => void onValidateApiKey());
-ui.on(document.getElementById("validateV2"), "click", () => void onValidateV2());
+document.getElementById("validateApiKey")?.addEventListener("click", () => void onValidateApiKey());
+document.getElementById("validateV2")?.addEventListener("click", () => void onValidateV2());
 
 // The edits that retire a verdict, derived from the surface declarations rather than restated here: a field earns its invalidation by being named in its surface's
 // inputs, so the mapping of which field retires which validation is stated once and read everywhere.
@@ -1541,14 +1518,15 @@ for(const scope of Object.values(validationScopes)) {
 
   for(const id of scope.inputs) {
 
-    ui.on(document.getElementById(id), "input", scope.invalidate);
+    document.getElementById(id)?.addEventListener("input", scope.invalidate);
   }
 }
 
 // Each masked credential's reveal, bound from the markup itself: a toggle declares the field it serves, so the page grows a reveal without this wiring changing.
+// The query answers only toggles that exist, so these bindings need no absent-target tolerance.
 for(const toggle of document.querySelectorAll("[data-reveal]")) {
 
-  ui.on(toggle, "click", () => toggleReveal(toggle));
+  toggle.addEventListener("click", () => toggleReveal(toggle));
 }
 
 /* The bound in seconds on the whole load-time wiring below. Five seconds settles the envelope provably inside the page boot monitor's ten-second watchdog, so a
@@ -1556,16 +1534,9 @@ for(const toggle of document.querySelectorAll("[data-reveal]")) {
  */
 const WIRING_DEADLINE = 5;
 
-// The load-time wiring's own lifecycle. Aborting it is how an envelope that failed or expired tells a continuation still running underneath it that it must not
-// stage anything after the fact.
+// The load-time wiring's own lifecycle, and the signal its cancellation points read. Aborting it is how an envelope that failed or expired tells a continuation
+// still running underneath it that it must not stage anything after the fact.
 const wiringController = new AbortController();
-
-/* The signal the wiring's cancellation points read: the envelope's own controller, bounded by this module copy's claim on the window through the facade's
- * composition surface. The epoch half matters because a reopened settings panel mints a successor copy and retires this one: whichever of the two aborts first
- * cancels a superseded copy's wiring at the same chokepoints the deadline uses, rather than letting a retired copy write config underneath the copy the user is
- * looking at.
- */
-const wiringSignal = ui.epochBounded(wiringController.signal);
 
 /* Wire the configuration interpreter and run the legacy-settings migration, once, at load.
  *
@@ -1583,16 +1554,15 @@ const wiringSignal = ui.epochBounded(wiringController.signal);
  * The weaker outcomes are deliberate. A save the deadline overtakes, and a save the host rejects, both leave the migration sitting in the modal's pending
  * configuration, where the user's own Save picks it up.
  *
- * Reopening the panel is convergent rather than racing. The settings frame is reused and each open imports a fresh copy of this module whose wiring runs
- * independently, but a second copy reads the saved configuration, finds no legacy keys in it, and so composes nothing and writes nothing. Two genuinely
- * simultaneous wirings read the same configuration and compose identical patches, so either ordering of their commits and saves leaves the same disk state.
- * The sidebar's refresh handler reads the interpreter too, and it cannot outrun the envelope: the framework builds that action inside ui.show(), which this
- * module reaches only once the envelope has settled, so what the handler reads is always whatever the wiring left behind.
+ * Reopening the panel is convergent rather than racing. Each open runs a fresh copy of this module in a fresh frame, with wiring of its own, but a second open
+ * reads the saved configuration, finds no legacy keys in it, and so composes nothing and writes nothing. Two genuinely simultaneous wirings read the same
+ * configuration and compose identical patches, so either ordering of their commits and saves leaves the same disk state. The sidebar's refresh handler reads
+ * the interpreter too, and it cannot outrun the envelope: the framework builds that action inside ui.show(), which this module reaches only once the envelope
+ * has settled, so what the handler reads is always whatever the wiring left behind.
  *
  * One bound stated honestly: the check before the commit is the last cancellation point. A commit whose bridge round trip is already in flight cannot be
- * recalled - the session takes no signal, and the deadline bounds only the await - so composing the epoch into the signal narrows the stale-write window to
- * that in-flight instant rather than closing it. It is harmful only if a successor commits a differing edit inside the same instant, and two migration wirings
- * are convergent regardless.
+ * recalled - the session takes no signal, and the deadline bounds only the await - so an envelope that expires during that round trip still lands its commit,
+ * and only the save after it is skipped.
  *
  * When the envelope fails, the interpreter settles at whatever the wiring reached. A catalog fetch that never succeeded leaves the degraded-mode interpreter in
  * place, which reads and writes the legacy properties, so the page still loads and first run still works; a migration that stumbled after the catalog arrived
@@ -1608,15 +1578,14 @@ const wireHydrawiseConfig = async () => {
   const session = await PluginConfigSession.open({ host: homebridge, name: "Hydrawise" });
   const patch = hydrawiseConfig.migrate(session.platform);
 
-  // The signal is read immediately before the write, so an envelope that expired while the session was still opening - or a copy the window has retired -
-  // cannot stage a patch after the fact.
-  if(patch && !wiringSignal.aborted) {
+  // The signal is read immediately before the write, so an envelope that expired while the session was still opening cannot stage a patch after the fact.
+  if(patch && !wiringController.signal.aborted) {
 
     await session.commit(patch);
 
     // The signal is read a second time, because the commit itself was an await and the envelope may have expired across it. A save the deadline overtakes is
     // skipped rather than forced, which leaves the migration staged for the user's own save - the weaker outcome, and the honest one.
-    if(!wiringSignal.aborted) {
+    if(!wiringController.signal.aborted) {
 
       await homebridge.savePluginConfig();
     }
@@ -1625,7 +1594,7 @@ const wireHydrawiseConfig = async () => {
 
 try {
 
-  await withDeadline({ promise: wireHydrawiseConfig(), seconds: WIRING_DEADLINE, signal: wiringSignal });
+  await withDeadline({ promise: wireHydrawiseConfig(), seconds: WIRING_DEADLINE, signal: wiringController.signal });
 } catch(error) {
 
   wiringController.abort(error);

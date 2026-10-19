@@ -22,6 +22,6 @@
     "src/**/*.test.cts", "src/**/*.test.mts", "src/**/*.test.ts",
     "src/utils"
   ],
-  "extends": "./node_modules/homebridge-plugin-utils/build/tsconfig.json",
+  "extends": "./node_modules/homebridge-plugin-utils/build/tsconfig.plugin.json",
   "include": [ "src" ]
 }

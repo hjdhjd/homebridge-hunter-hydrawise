@@ -69,7 +69,7 @@ const SUSPENDED_UNTIL = 1903928399;
 /* The 2026-08-10 suspension probe's own values, kept verbatim. The instant is the one the account echoed back as the suspension it had recorded, and the two
  * documents are the request bodies the account accepted, byte for byte.
  *
- * Pinning the composed text against the capture rather than against this plugin's own idea of the shape is the whole point: the argument names, the quoting, the
+ * Asserting the composed text against the capture rather than against this plugin's own idea of the shape is the whole point: the argument names, the quoting, the
  * two-digit year, and the explicit offset are all things the account enforces and none of them can be derived from the schema.
  */
 const PROBE_SUSPEND_UNTIL = 1786392682;
@@ -104,7 +104,7 @@ const GRAPH_ERRORS_BODY = { data: { me: { controllers: [] } },
     path: [ "me", "controllers", 0, "sensors", 0, "model", "mode" ] }] };
 
 // One recorded request the injected dispatcher served, in the order it was served. The path is what tells a token grant from a query, and the order is what a
-// budget-before-dispatch pin reads. Every ceiling the client draws against is sampled, because a draw attributed to the wrong one is exactly what a split
+// budget-before-dispatch assertion reads. Every ceiling the client draws against is sampled, because a draw attributed to the wrong one is exactly what a split
 // budget can get wrong.
 interface RecordedCall {
 
@@ -129,7 +129,7 @@ interface V2Harness {
  *
  * Each intercept records the call before it replies, capturing both ceilings' free slots AT DISPATCH. Those numbers are what prove the draw is awaited rather than
  * merely present: a call that reached the wire without waiting would be recorded with its ceiling untouched. Each capacity is settable on its own, which is what
- * lets a test saturate one ceiling and leave the other roomy - the arrangement every independence pin below rests on.
+ * lets a test saturate one ceiling and leave the other roomy - the arrangement every independence assertion below rests on.
  */
 function makeV2Harness(program: (agent: MockAgent, record: (path: string) => void) => void,
   options: { capacity?: number; mutationCapacity?: number; signal?: AbortSignal } = {}): V2Harness {
@@ -156,7 +156,7 @@ function makeV2Harness(program: (agent: MockAgent, record: (path: string) => voi
 }
 
 // Spend every slot of ONE ceiling, leaving the other exactly as it was. Saturating one bucket and watching the traffic that draws the other carry on is the whole
-// shape of an independence pin, and naming the bucket at the call site is what says which direction the pin is testing.
+// shape of an independence assertion, and naming the bucket at the call site is what says which direction the assertion is testing.
 async function saturate(budget: RateBudget): Promise<void> {
 
   while(budget.available > 0) {
@@ -186,7 +186,7 @@ function programReply(agent: MockAgent, record: (path: string) => void, path: st
   }).persist();
 }
 
-/* Program the graph endpoint on the same terms, additionally capturing the query text of every request it serves. That capture is what lets a test pin the exact
+/* Program the graph endpoint on the same terms, additionally capturing the query text of every request it serves. That capture is what lets a test assert the exact
  * document that went on the wire, which every other intercept here - matching on path and method alone - is blind to.
  */
 function programGraph(agent: MockAgent, record: (path: string) => void, body: object, queries: string[], statusCode = 200): void {
@@ -308,7 +308,7 @@ describe("HydrawiseV2Client tokens", () => {
 
 describe("HydrawiseV2Client grant body", () => {
 
-  /* These pin what actually goes ON THE WIRE, which every other test in this file is blind to: the intercepts elsewhere match on path and method alone, so a grant
+  /* These assert what actually goes ON THE WIRE, which every other test in this file is blind to: the intercepts elsewhere match on path and method alone, so a grant
    * that swapped the client id and secret, or one that never sent the renewal grant type at all, would satisfy the entire suite. The account would simply fail to
    * authenticate in the field with nothing red anywhere.
    *
@@ -434,7 +434,7 @@ describe("HydrawiseV2Client account facts", () => {
 
     await harness.client.fetchAccountFacts();
 
-    /* The controller selection as it goes on the wire, pinned as text. The name is what the key-based API truncates, and the 2026-08-09 capture records it at the
+    /* The controller selection as it goes on the wire, asserted as text. The name is what the key-based API truncates, and the 2026-08-09 capture records it at the
      * controller level as a plain scalar - so it takes no subselection, and asking for it with one would fail the whole query rather than just this field. A
      * substring naming the block is what tells this selection from the zone block's own name a few characters later.
      */
@@ -457,7 +457,7 @@ describe("HydrawiseV2Client account facts", () => {
 
     const entry = facts.get(1058515);
 
-    // The model is pinned to the DESCRIPTION, which is the full name a user recognizes. The capture carries the shorter name field beside it, so a mapping that
+    // The model is held to the DESCRIPTION, which is the full name a user recognizes. The capture carries the shorter name field beside it, so a mapping that
     // reached for that instead would answer "38 Zones" here.
     assert.deepEqual(entry?.hardware, { firmware: "4.76", model: "HCC 38 Zones" }, "the captured controller composes its captured model and firmware");
     assert.equal(entry?.online, true, "the captured controller reports itself reachable");
@@ -566,7 +566,7 @@ describe("HydrawiseV2Client account facts", () => {
 
   test("a sensor reporting itself quiet composes a definite NOT-stopped rather than an unknown", async () => {
 
-    // The distinction this pin exists for: a live sensor that is not tripped is real evidence the zones it covers are not rain-stopped, and it has to reach the
+    // The distinction this assertion exists for: a live sensor that is not tripped is real evidence the zones it covers are not rain-stopped, and it has to reach the
     // classifier as false so that the key-based group inference is retired rather than consulted.
     const quiet = [{ ...CAPTURED_SENSORS[0], status: { active: false } }];
 
@@ -584,7 +584,7 @@ describe("HydrawiseV2Client account facts", () => {
 
   test("two sensors covering one zone read as stopped when ANY of them is tripped", async () => {
 
-    /* The some-versus-every pin an all-single-sensor suite cannot see. One tripped sensor stops the zones it covers whatever its siblings report, so a composer
+    /* The some-versus-every assertion an all-single-sensor suite cannot see. One tripped sensor stops the zones it covers whatever its siblings report, so a composer
      * written with `every` would answer false here and silently suppress a real rain stop on a controller with more than one sensor.
      */
     const mixed = [ { ...CAPTURED_SENSORS[0], status: { active: false } },
@@ -768,7 +768,7 @@ describe("HydrawiseV2Client failure classification", () => {
     assert.equal(await harness.client.fetchAccountFacts(), null, "a body-level errors array classifies as a failed query");
 
     // The reported line is read as the operator sees it, whole. The read's own sentence and the account's message reach the log as separate printf arguments, so
-    // an assertion against either argument alone would pin half the sentence and pass while the other half went missing.
+    // an assertion against either argument alone would check half the sentence and pass while the other half went missing.
     assert.deepEqual(errorLines(harness.lines()), ["Unable to retrieve enhanced controller details: Internal server error."],
       "the reported failure names the read that failed and what the API said was wrong");
   });
@@ -783,8 +783,8 @@ describe("HydrawiseV2Client failure classification", () => {
 
     assert.equal(await harness.client.fetchAccountFacts(), null, "a throttled query answers null rather than a partial result");
 
-    // The status branch's own sentence, pinned whole for the same reason the errors branch above is: the read states what it was doing and the transport states
-    // what it got, and the two now reach the log as separate arguments of one line.
+    // The status branch's own sentence, asserted whole for the same reason the errors branch above is: the read states what it was doing and the transport states
+    // what it got, and the two reach the log as separate arguments of one line.
     assert.deepEqual(errorLines(harness.lines()), ["Unable to retrieve enhanced controller details. The Hydrawise API answered with status 429."],
       "the throttled read is reported under the read's own sentence");
   });
@@ -1234,9 +1234,9 @@ describe("HydrawiseV2Client zone suspension", () => {
 
     t.after(() => controller.abort("test-teardown"));
 
-    /* The WARM TOKEN is the precondition that gives this pin its meaning, and the order it is established in is the whole of the setup. A token comfortably inside
+    /* The WARM TOKEN is the precondition that gives this assertion its meaning, and the order it is established in is the whole of the setup. A token comfortably inside
      * its lifetime short-circuits the chokepoint without touching any ceiling at all, so the only bucket this command goes on to draw is the one under test. Cold,
-     * the command's grant would block on the drained read ceiling under either wiring and the pin would prove nothing about which bucket admits a command.
+     * the command's grant would block on the drained read ceiling under either wiring and the assertion would prove nothing about which bucket admits a command.
      */
     assert.equal(await harness.client.ensureToken(), "access-one", "the client is warmed with a token good for the rest of the test");
 
@@ -1352,7 +1352,7 @@ describe("HydrawiseV2Client dispatcher", () => {
     second.disableNetConnect();
 
     // The transport's own header deadline is a deadline elapsing exactly as the composed per-request timeout is, so it takes the same arm: the same sentence, and
-    // the same replacement of a pool whose single connection every in-flight request was riding.
+    // the same replacement of a pool whose single connection every in-flight request was using.
     first.get(V2_ORIGIN).intercept({ method: "POST", path: TOKEN_PATH }).replyWithError(new errors.HeadersTimeoutError()).persist();
 
     const client = new HydrawiseV2Client({ budget: new RateBudget({ capacity: HYDRAWISE_V2_BUDGET_CALLS, signal, window: HYDRAWISE_V2_BUDGET_WINDOW * 1000 }),
@@ -1369,12 +1369,13 @@ describe("HydrawiseV2Client dispatcher", () => {
   test("every coded transport fault is reported as the sentence the plugin keeps for its kind", async () => {
 
     /* Each row pairs a wire code with the kind it classifies as, and the expected sentence is READ from the shared table rather than restated here - so what this
-     * pins is the wiring: that a fault of a given kind reaches that kind's entry, joined to the caller's sentence by a period. The prose of each sentence is pinned
+     * asserts is the wiring: that a fault of a given kind reaches that kind's entry, joined to the caller's sentence by a period. The prose of each sentence is asserted
      * literally by the retrieve suite's substring assertions over the same table, which divides the work between them: a mis-paired kind fails here, and a mistyped
      * sentence fails there.
      */
     const faultRows: { code: string; kind: HydrawiseTransportFault }[] = [
 
+      { code: "CERT_HAS_EXPIRED", kind: "certificate" },
       { code: "ECONNREFUSED", kind: "refused" },
       { code: "ECONNRESET", kind: "reset" },
       { code: "ENOTFOUND", kind: "dns" },
@@ -1416,7 +1417,7 @@ describe("HydrawiseV2Client dispatcher", () => {
   test("a transport fault on a suspension command travels back as the sentence the controller says", async () => {
 
     /* The command path is where a transport fault reaches a user under the name of the zone they touched: the failure travels back in the result rather than being
-     * logged here, so the reason the controller is handed is what this pins.
+     * logged here, so the reason the controller is handed is what this asserts.
      */
     const harness = makeV2Harness((agent, record) => {
 

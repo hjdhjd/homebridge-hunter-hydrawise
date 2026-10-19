@@ -70,32 +70,11 @@ export const makeHydrawiseConfig = ({ FeatureOptions, catalog }) => {
   // path is a pure transform that composes a fresh array and reassigns its own field, so the array it was given is never written to.
   const engineFor = (config) => new FeatureOptions(catalog.categories, catalog.options, Array.isArray(config?.options) ? config.options : []);
 
-  /* The value the catalog registers as an option's default, read from the served entry's own defaultValue field. The engine exposes a same-named method that
-   * answers a different question - the boolean enabled-state default - so this walks the catalog data instead. The migration needs this to tell a value the
-   * user chose from a value that merely restates what the option already does, and only the first is worth writing an entry for.
-   */
-  const registeredDefault = (option) => {
-
-    for(const [ category, entries ] of Object.entries(catalog?.options ?? {})) {
-
-      for(const entry of entries) {
-
-        if((entry.name ? category + "." + entry.name : category) === option) {
-
-          return entry.defaultValue;
-        }
-      }
-    }
-
-    return undefined;
-  };
-
   /* Every option key the SERVED catalog currently declares, lowercased. The composition is the feature-option engine's own rule - a category name joined to an
    * option name by a dot, with a nameless option addressing its category alone - stated here rather than imported because this module is deliberately
    * import-free and receives the catalog as data.
    *
-   * This set is what makes the rename below catalog-anchored instead of hand-rolled string surgery, and it is the same composition the registered-default walk
-   * above performs, so the two readings of the catalog cannot drift.
+   * This set is what makes the rename below catalog-anchored instead of hand-rolled string surgery.
    */
   const currentOptionKeys = () => {
 
@@ -262,7 +241,7 @@ export const makeHydrawiseConfig = ({ FeatureOptions, catalog }) => {
       for(const [ property, option ] of carried) {
 
         const value = config[property];
-        const catalogDefault = registeredDefault(option);
+        const catalogDefault = engine.valueDefault(option);
 
         patch[property] = undefined;
 
@@ -289,7 +268,7 @@ export const makeHydrawiseConfig = ({ FeatureOptions, catalog }) => {
         composed = true;
       }
 
-      // The entries ride the patch when this pass composed one, and otherwise whenever the rename rewrote something, so a config whose properties all decline
+      // The entries go into the patch when this pass composed one, and otherwise whenever the rename rewrote something, so a config whose properties all decline
       // stages a pure deletion and one whose only work was the rename still carries it.
       if(composed) {
 
@@ -320,7 +299,7 @@ export const makeHydrawiseConfig = ({ FeatureOptions, catalog }) => {
     username: (config) => engineFor(config).value(CREDENTIAL_SETTINGS.username) ?? "",
 
     /* The first-run write: compose every value first run collected as its feature option, replacing any entry already addressing it. The legacy API-key property
-     * rides along as an explicitly undefined key, so a configuration that carried one is left with exactly one home for the key once the patch is written.
+     * goes into the patch as an explicitly undefined key, so a configuration that carried one is left with exactly one home for the key once the patch is written.
      *
      * All of it composes through ONE engine and returns ONE patch, which is the whole reason this is a single writer rather than a call per value. Each engine
      * answers `configuredOptions` as its own complete snapshot of the options array, so two independent writers would produce two whole arrays and the session's

@@ -2,14 +2,14 @@
  *
  * controller.schedule.test.ts: The zone schedule projection the runtime persists into accessory context - the classifier that turns one wire zone into a
  * schedule state, the whole-body projection and its self-describing header, the guards that classify a cache read, and the single flush chokepoint that carries
- * both persisted projections. These pins fix the zero-cloud-call source the webUI's schedule display reads back, and above all its change-shaped cost: a poll whose
- * facts did not move must cost no cache write at all, however far the wire's countdowns have fallen.
+ * both persisted projections. These assertions lock in the zero-cloud-call source the webUI's schedule display reads back, and above all its change-shaped
+ * cost: a poll whose facts did not move must cost no cache write at all, however far the wire's countdowns have fallen.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
 import { HYDRAWISE_RAIN_SENSOR_TYPE, HYDRAWISE_UNSCHEDULED_SENTINEL, isScheduleStatus, isZoneAccessoryContext, isZoneScheduleStatus, sameScheduleStatus,
-  scheduleStatus } from "./types.ts";
+  scheduleStatus, zoneIdentity } from "./types.ts";
 import type { HydrawiseAccessoryContext, HydrawiseScheduleStatus, HydrawiseZoneConfig, HydrawiseZoneIdentity, HydrawiseZoneScheduleState,
   StatusScheduleResponse } from "./types.ts";
 import { bareSensors, normalZoneMatrix, rainSensors, sentinelZoneMatrix, syntheticController } from "./api.fixtures.ts";
@@ -20,7 +20,6 @@ import type { BuildControllerResult } from "./testing/platform.helpers.ts";
 import { HYDRAWISE_ACTIVE_ZONE_INDICATOR } from "./settings.ts";
 import assert from "node:assert/strict";
 import { firstOf } from "./testing.helpers.ts";
-import { zoneIdentity } from "./types.ts";
 
 // The wire root time the bespoke scenarios stamp, and the one-poll-interval step the drift scenarios advance it by. A nominal Hydrawise poll is sixty seconds, so
 // stepping the root clock by sixty while the zones' countdowns fall by the same sixty is exactly the steady state a live controller reports.
@@ -32,7 +31,7 @@ const POLL_STEP = 60;
 const ALPHA_RELAY_ID = 700001;
 const BETA_RELAY_ID = 700002;
 
-// The suspension instant the live 2026-08-09 account capture recorded, kept verbatim so these pins run against a real far-future value rather than a round number.
+// The suspension instant the live 2026-08-09 account capture recorded, kept verbatim so these assertions run against a real far-future value rather than a round number.
 const SUSPENDED_UNTIL = 1903928399;
 
 // Compose a fast-cadence schedule around a zone list and a sensor block, so a live-loop test cycles in roughly 250ms rather than the wire-realistic minute.
@@ -221,7 +220,7 @@ describe("HydrawiseController schedule classification", () => {
 
   test("a zone two sensors cover is stopped when either group is stopped", () => {
 
-    // Alpha rides both sensors: the first covers Alpha alone and is entirely sentineled, while the second also covers the scheduled Beta and is therefore not
+    // Alpha sits under both sensors: the first covers Alpha alone and is entirely sentineled, while the second also covers the scheduled Beta and is therefore not
     // stopping anything. A walk that required every covering sensor to agree would read Alpha as unscheduled.
     const projection = scheduleStatus(makeStatusSchedule({ relays: [ sentinelZone(), scheduledZone() ],
       sensors: sensorsCovering([ALPHA_RELAY_ID], [ ALPHA_RELAY_ID, BETA_RELAY_ID ]), time: ROOT_TIME }), HYDRAWISE_ACTIVE_ZONE_INDICATOR);
@@ -303,7 +302,7 @@ describe("HydrawiseController schedule persistence (poll)", () => {
 
     const persisted = scheduleOf(h.accessory);
 
-    assert.equal(h.flushes.length, 1, "the roster seed and the schedule seed ride one flush, and the unchanged second poll adds none");
+    assert.equal(h.flushes.length, 1, "the roster seed and the schedule seed share one flush, and the unchanged second poll adds none");
     assert.equal(persisted.zones.length, normalZoneMatrix.length, "the projection carries every reported zone");
     assert.equal(persisted.asOf, normalSchedule().time, "the seeded projection carries the wire's root time");
   });
@@ -317,7 +316,7 @@ describe("HydrawiseController schedule persistence (poll)", () => {
 
     await waitFor(() => (h.flushes.length >= 1) ? true : undefined);
 
-    // The projection takes no feature parameter and structurally cannot exclude a zone, so this pin guards a future writer who threads the enabled-zone set into
+    // The projection takes no feature parameter and structurally cannot exclude a zone, so this assertion guards a future writer who threads the enabled-zone set into
     // it rather than distinguishing what the code does today.
     assert.ok(scheduleOf(h.accessory).zones.some(zone => zone.relayId === 700002), "the persisted projection is the complete reported set, feature options aside");
   });
@@ -429,7 +428,7 @@ describe("HydrawiseController schedule persistence (poll)", () => {
     await pollsCompleted(h, 2);
     h.abort();
 
-    // A flush count alone cannot say which projection moved, because both ride the one channel, so the schedule half's no-change claim is asserted on the
+    // A flush count alone cannot say which projection moved, because both travel through the one channel, so the schedule half's no-change claim is asserted on the
     // persisted value itself: a rename changes no schedule fact, and asOf therefore holds too.
     assert.equal(h.flushes.length, 1, "the matching first poll flushes nothing and the rename flushes exactly once");
     assert.deepEqual(scheduleOf(h.accessory), seeded, "a zone rename moves no schedule fact, asOf included");
@@ -537,8 +536,8 @@ describe("HydrawiseController schedule exclusivity", () => {
     platform.reconcileZoneAccessories({ controller: syntheticController, presentRelayIds: new Set([ALPHA_RELAY_ID]),
       zones: [{ displayName: zone.name, identity: zoneIdentity(zone) }] });
 
-    // Declared reach: the reconcile assigns a complete fresh two-field object today, so this pin guards a future writer who reaches for a field write rather than
-    // distinguishing what the code does now.
+    // Declared reach: the reconcile assigns a complete fresh object, so this assertion passes against the code as written and guards a future writer who reaches
+    // for a field write instead.
     assert.deepEqual(Object.keys(firstOf(registered, "accessory").context).toSorted(), [ "ownerController", "zone" ],
       "no schedule projection reaches a standalone zone accessory's context");
   });
@@ -575,7 +574,7 @@ describe("HydrawiseController schedule classification with account facts", () =>
 
   test("a live sensor reporting itself quiet RETIRES the group inference that would have called the zone stopped", () => {
 
-    /* The fixture is the all-covered rain shape, which the key-based group inference classifies as sensor-stopped on its own - that is what lets this pin tell the
+    /* The fixture is the all-covered rain shape, which the key-based group inference classifies as sensor-stopped on its own - that is what lets this assertion tell the
      * two readings apart, where a fixture the inference already agreed with could not. With the account API reporting the sensor quiet, it is not consulted.
      */
     const stopped = scheduleStatus(rainStopped(), HYDRAWISE_ACTIVE_ZONE_INDICATOR);
@@ -598,7 +597,7 @@ describe("HydrawiseController schedule classification with account facts", () =>
 
   test("a zone both suspended and covered by a tripped sensor classifies as suspended", () => {
 
-    // The precedence pin. Suspension is the longer-lived, user-created fact, and the sensor's claim returns on its own the moment the suspension clears.
+    // The precedence assertion. Suspension is the longer-lived, user-created fact, and the sensor's claim returns on its own the moment the suspension clears.
     const projection = scheduleStatus(schedule([sentinelZone()]), HYDRAWISE_ACTIVE_ZONE_INDICATOR,
       { facts: makeV2Facts({ zones: [[ ALPHA_RELAY_ID, { name: null, sensorStopped: true, suspendedUntil: SUSPENDED_UNTIL } ]] }) });
 
@@ -625,7 +624,7 @@ describe("HydrawiseController schedule classification with account facts", () =>
 
   test("a suspended zone's projection is byte-stable across polls, so it costs no repeated write", () => {
 
-    /* The flush-storm pin. The suspension instant is ABSOLUTE, so it holds still while the wire's root clock advances; storing a countdown instead would move the
+    /* The flush-storm assertion. The suspension instant is ABSOLUTE, so it holds still while the wire's root clock advances; storing a countdown instead would move the
      * field every poll and turn every poll into a cache write.
      */
     const facts = makeV2Facts({ zones: [[ ALPHA_RELAY_ID, makeZoneV2Facts({ suspendedUntil: SUSPENDED_UNTIL }) ]] });
@@ -657,7 +656,7 @@ describe("HydrawiseController sticky suspension", () => {
 
   test("a suspended zone carries forward across a pass that has no fresh facts about it", () => {
 
-    /* The restart-and-gap pin. Without the carry a suspended zone flaps to "not scheduled" and back every time a refresh is missed or the plugin restarts, which
+    /* The restart-and-gap assertion. Without the carry a suspended zone flaps to "not scheduled" and back every time a refresh is missed or the plugin restarts, which
      * is both a wrong display and a cache write each way.
      */
     const projection = scheduleStatus(schedule([sentinelZone()]), HYDRAWISE_ACTIVE_ZONE_INDICATOR, { priorSuspended: priorSuspended() });
@@ -730,7 +729,7 @@ describe("HydrawiseController sticky suspension across a restart", () => {
     /* The restart-churn case. The plugin comes back with the cached projection but no facts yet, and the zone still presents the ambiguous sentinel shape, so
      * without the carry it would flap to "not scheduled" and back the moment the first refresh landed - a wrong display and a pair of cache writes.
      */
-    // The zone roster is seeded alongside the projection so the roster half of the flush chokepoint matches too, isolating the schedule half this pin is about.
+    // The zone roster is seeded alongside the projection so the roster half of the flush chokepoint matches too, isolating the schedule half this assertion is about.
     const h = buildController({ hasV2Client: true,
       program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([sentinelZone()]), kind: "response" }),
       seedContext: (seed) => { seed.context = { schedule: priorProjection(), zones: zoneRoster([sentinelZone()]) }; }, signalAborted: false });

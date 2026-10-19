@@ -5,7 +5,7 @@
  * the shutdown-abort short circuit, the connection-error taxonomy, and the bounded timeout branch.
  *
  * The Pool's TLS posture is not observable through this MockAgent swap: the swap stands in for the global dispatcher, so the real Pool's connect options never run
- * and it exposes no reflectable view of them. The connection's certificate validation therefore has no executable pin here, in either direction.
+ * and it exposes no reflectable view of them. The connection's certificate validation therefore has no executable assertion here, in either direction.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
@@ -225,7 +225,7 @@ describe("HydrawisePlatform retrieve", () => {
     await using dispatcher = installMockDispatcher();
 
     /* The shape a real socket failure arrives in on this path: a plain Error carrying the errno at the top level, with no cause beneath it. The wrapped rows above
-     * pin the shape a fetch() rejection carries instead, so between them the classification is pinned against both of the shapes a caller can be handed rather
+     * assert the shape a fetch() rejection carries instead, so between them the classification is asserted against both of the shapes a caller can be handed rather
      * than against one of them.
      */
     dispatcher.agent.get(HYDRAWISE_ORIGIN).intercept({ method: "GET", path: (path: string): boolean => path.includes("customerdetails.php") })
@@ -287,6 +287,24 @@ describe("HydrawisePlatform retrieve", () => {
     assert.ok(loggedAt(lines(), "error", "interrupted while the connection was being reset"), "a destroyed pool should log the interrupted-request message");
   });
 
+  test("classifies an expired certificate as a certificate verification failure", async (t) => {
+
+    const { emit, lines, platform } = buildPlatform();
+
+    t.after(() => emit(SHUTDOWN_EVENT));
+    await using dispatcher = installMockDispatcher();
+
+    // An expired certificate arrives carrying the platform's own verification verdict as its code, and a host clock set wrong is its usual cause, which is why
+    // the sentence asks the user to check the host's date and time.
+    dispatcher.agent.get(HYDRAWISE_ORIGIN).intercept({ method: "GET", path: (path: string): boolean => path.includes("customerdetails.php") })
+      .replyWithError(Object.assign(new Error("certificate has expired"), { code: "CERT_HAS_EXPIRED" }));
+
+    const response = await platform.retrieve("customerdetails.php");
+
+    assert.equal(response, null, "a certificate failure should return null");
+    assert.ok(loggedAt(lines(), "error", "Certificate verification failed for the Hydrawise API"), "CERT_HAS_EXPIRED should log the certificate message");
+  });
+
   test("returns null and re-arms networking on the request timeout branch", { timeout: 15000 }, async (t) => {
 
     const { emit, lines, platform } = buildPlatform();
@@ -313,7 +331,7 @@ describe("HydrawisePlatform retrieve", () => {
     await using dispatcher = installMockDispatcher();
 
     // The transport's own header deadline is a deadline elapsing exactly as the composed per-request timeout is, so it takes the same arm: the same sentence, and
-    // the same replacement of a pool whose single connection every in-flight request was riding.
+    // the same replacement of a pool whose single connection every in-flight request was using.
     dispatcher.agent.get(HYDRAWISE_ORIGIN).intercept({ method: "GET", path: (path: string): boolean => path.includes("customerdetails.php") })
       .replyWithError(new errors.HeadersTimeoutError());
 

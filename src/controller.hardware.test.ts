@@ -1,7 +1,7 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
  * controller.hardware.test.ts: The controller's projection of optional hardware facts onto HomeKit's AccessoryInformation service. The design under test is
- * cache-resident: the characteristics are the only store these facts have, so every pin here is a claim about what a characteristic READS after a construction or
+ * cache-resident: the characteristics are the only store these facts have, so every assertion here is a claim about what a characteristic READS after a construction or
  * an enrichment, never about a parallel copy.
  *
  * That makes the pre-seeded value the whole method. HAP round-trips characteristic values through Homebridge's accessory cache, so a warm restart begins with real
@@ -77,7 +77,7 @@ describe("HydrawiseController hardware display without credentials", () => {
 
   test("removing the credentials resets values a credentialed session left behind", () => {
 
-    /* This is the pin that omitting the writes would fail, and the seeded start is what gives it teeth. The characteristics outlive the credentials that populated
+    /* This is the assertion that omitting the writes would fail, and the seeded start is what gives it teeth. The characteristics outlive the credentials that populated
      * them, so a controller that simply skipped these writes when it had no facts would leave a real model and a real firmware version on display permanently,
      * with nothing left in the plugin that could ever refresh or correct them.
      */
@@ -118,7 +118,7 @@ describe("HydrawiseController hardware display with credentials", () => {
 
   test("the preserve arm is decided by HAP's default alone, not by the credentials", () => {
 
-    // Stated as its own pin because an implementation that keyed on something other than HAP's default could still pass the warm-restart and fresh-accessory
+    // Stated as its own assertion because an implementation that keyed on something other than HAP's default could still pass the warm-restart and fresh-accessory
     // tests above it. A model that is neither HAP's default nor a real controller name - the placeholder a previous unenriched session wrote - is still a
     // value the plugin put there, so it is preserved.
     const { accessory } = buildController({ hasV2Client: true,
@@ -150,7 +150,7 @@ describe("HydrawiseController facts adoption", () => {
     assert.equal(informationValue(h.accessory, Characteristic.Model), FETCHED.model, "the real model replaces the placeholder");
     assert.equal(informationValue(h.accessory, Characteristic.FirmwareRevision), FETCHED.firmware, "the real firmware replaces HAP's default");
 
-    /* The flush count is the pin, and it is exact in both directions. The characteristics are the only store these facts have, so zero flushes would lose them at
+    /* The flush count is the assertion, and it is exact in both directions. The characteristics are the only store these facts have, so zero flushes would lose them at
      * the next restart and spend a cloud call relearning something that never changes; more than one would be churn on a write that moved a single accessory.
      *
      * This is also the case that distinguishes a hardware comparison made against the PRIOR snapshot from one made after the new snapshot was stored. Nothing
@@ -349,6 +349,21 @@ describe("HydrawiseController controller availability", () => {
     assert.equal(faultValue(h), Characteristic.StatusFault.NO_FAULT, "and it starts stating no fault");
   });
 
+  test("a credentialed restore carrying a cached fault starts at no-fault", () => {
+
+    /* The kept arm of the presence gate. The accessory comes back from the cache with the irrigation system service already carrying a fault reading, so the gate
+     * keeps the characteristic rather than attaching it, and the starting state is written on that arm too: until a refresh answers, the cached reading is a
+     * reachability nothing in this session has confirmed.
+     */
+    const h = buildController({ hasV2Client: true, seedContext: (seed) => {
+
+      seed.addService(Service.IrrigationSystem).updateCharacteristic(Characteristic.StatusFault, Characteristic.StatusFault.GENERAL_FAULT);
+    } });
+
+    assert.equal(hasFault(h), true, "the characteristic stays on a credentialed install");
+    assert.equal(faultValue(h), Characteristic.StatusFault.NO_FAULT, "and it starts stating no fault rather than the cached reading");
+  });
+
   test("an accessory restored from a credentialed past has the characteristic REMOVED once the credentials are gone", () => {
 
     /* The same clean revert the firmware reset performs, and for the same reason: HAP round-trips characteristics through the accessory cache, so an accessory
@@ -393,7 +408,7 @@ describe("HydrawiseController controller availability", () => {
 
   test("the freshness boundary is inclusive, so a snapshot exactly at its lifetime still counts as fresh", () => {
 
-    // The off-by-one pin on the comparison operator itself.
+    // The off-by-one assertion on the comparison operator itself.
     const h = buildController({ hasV2Client: true });
 
     h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: now() - HYDRAWISE_V2_FACTS_TTL });

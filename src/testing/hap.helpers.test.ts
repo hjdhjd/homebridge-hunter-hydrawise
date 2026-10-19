@@ -1,16 +1,15 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * hap.helpers.test.ts: Self-test for the HAP double. Pins that the REAL homebridge-plugin-utils service helpers (acquireService, validService, getServiceName,
+ * hap.helpers.test.ts: Self-test for the HAP double. Asserts that the REAL homebridge-plugin-utils service helpers (acquireService, validService, getServiceName,
  * setServiceName) run unmodified against the marker namespaces - the seeded first characteristic lets getCharacteristicConstructor recover a constructor without
  * throwing, and the cross-kind statics let the name predicates answer per kind the way they do against real HAP - and that the characteristic trigger knobs, the
  * write recorder, the service accessors, and the accessory accessors behave as production expects.
  */
 import { Characteristic, Service, TestService, makeTestAccessory } from "./hap.helpers.ts";
+import type { Service as HapService, PlatformAccessory } from "homebridge";
 import { acquireService, getServiceName, setServiceName, validService } from "homebridge-plugin-utils";
 import { describe, test } from "node:test";
 import type { AcquireServiceTarget } from "homebridge-plugin-utils";
-import type { Service as HapService } from "homebridge";
-import type { PlatformAccessory } from "homebridge";
 import assert from "node:assert/strict";
 
 // Confine the double-to-HAP casts the real service helpers require to these adapters, so most test bodies below stay cast-free; the one exception is the
@@ -38,9 +37,9 @@ function asHapService(service: object): HapService {
 // Acquire a service against a fresh accessory and hand back the double, which the assertions below cast through asHapService() when they need the HAP view.
 function acquireDouble(kind: typeof Service[keyof typeof Service], name: string, subtype?: string): TestService {
 
-  const service = acquireService(asAccessory(makeTestAccessory()), asTarget(kind), name, subtype);
+  const { service, transition } = acquireService({ accessory: asAccessory(makeTestAccessory()), name, serviceType: asTarget(kind), subtype });
 
-  assert.ok(service, "the double should acquire a " + name + " service");
+  assert.equal(transition, "attached", "the double should acquire a " + name + " service");
 
   return asTestService(service);
 }
@@ -50,9 +49,9 @@ describe("acquireService against the HAP double", () => {
   test("creates a new service and recovers the characteristic constructor without throwing", () => {
 
     const accessory = makeTestAccessory();
-    const service = acquireService(asAccessory(accessory), asTarget(Service.Valve), "Test Valve", "700001");
+    const { transition } = acquireService({ accessory: asAccessory(accessory), name: "Test Valve", serviceType: asTarget(Service.Valve), subtype: "700001" });
 
-    assert.ok(service, "the real acquireService should create a valve against the double");
+    assert.equal(transition, "attached", "the real acquireService should create a valve against the double");
     assert.ok(accessory.getServiceById(Service.Valve, "700001"), "the created valve should be retrievable by its subtype");
   });
 
@@ -60,11 +59,13 @@ describe("acquireService against the HAP double", () => {
 
     const accessory = makeTestAccessory();
 
-    acquireService(asAccessory(accessory), asTarget(Service.Valve), "Test Valve", "700001");
-    acquireService(asAccessory(accessory), asTarget(Service.Valve), "Test Valve", "700001");
+    acquireService({ accessory: asAccessory(accessory), name: "Test Valve", serviceType: asTarget(Service.Valve), subtype: "700001" });
+
+    const { transition } = acquireService({ accessory: asAccessory(accessory), name: "Test Valve", serviceType: asTarget(Service.Valve), subtype: "700001" });
 
     const valves = accessory.services.filter(service => service.UUID === "Valve");
 
+    assert.equal(transition, "kept", "re-acquiring the same subtype should answer the existing service");
     assert.equal(valves.length, 1, "re-acquiring the same subtype should not duplicate the service");
   });
 
@@ -72,10 +73,10 @@ describe("acquireService against the HAP double", () => {
 
     const accessory = makeTestAccessory();
 
-    acquireService(asAccessory(accessory), asTarget(Service.Switch), "Test Switch", "All");
+    acquireService({ accessory: asAccessory(accessory), name: "Test Switch", serviceType: asTarget(Service.Switch), subtype: "All" });
     assert.ok(accessory.getServiceById(Service.Switch, "All"), "the switch should exist before validation");
 
-    validService(asAccessory(accessory), asTarget(Service.Switch), false, "All");
+    validService({ accessory: asAccessory(accessory), name: "Test Switch", serviceType: asTarget(Service.Switch), subtype: "All", validate: false });
     assert.equal(accessory.getServiceById(Service.Switch, "All"), undefined, "a false validation should remove the service");
   });
 });
@@ -221,9 +222,9 @@ describe("TestService and TestAccessory accessors", () => {
   test("removeService detaches a service from the accessory", () => {
 
     const accessory = makeTestAccessory();
-    const service = acquireService(asAccessory(accessory), asTarget(Service.Valve), "Test Valve", "700001");
+    const { service, transition } = acquireService({ accessory: asAccessory(accessory), name: "Test Valve", serviceType: asTarget(Service.Valve), subtype: "700001" });
 
-    assert.ok(service, "the valve should be created");
+    assert.equal(transition, "attached", "the valve should be created");
     accessory.removeService(asTestService(service));
     assert.equal(accessory.getServiceById(Service.Valve, "700001"), undefined, "the removed valve should be gone");
   });

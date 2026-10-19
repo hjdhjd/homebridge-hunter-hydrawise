@@ -1,8 +1,8 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
  * controller.mqtt.test.ts: The controller's MQTT surface, driven through the recording MQTT double's invokeGet / invokeSet knobs. Covers the status
- * JSON the get handler answers, the set-command grammar (start / stop and the invalid-zone and invalid-command throws), and the per-poll publish including the
- * client's guarded publish, which lands a publish rejection in the log rather than as an unhandled rejection.
+ * JSON the get handler answers, the set-command grammar (a start with or without a duration, a stop, and the throws for an invalid zone, command, or duration),
+ * and the per-poll publish including the client's guarded publish, which lands a publish rejection in the log rather than as an unhandled rejection.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
@@ -117,6 +117,70 @@ describe("HydrawiseController MQTT", () => {
     assert.equal(h.retrieve.callsTo("setzone.php").length, 0, "a zero-duration start should send no setzone command");
   });
 
+  test("a start with no duration runs the zone for its own run value", async (t) => {
+
+    const zone = runningZone();
+    const h = buildController({ mqtt: true, program: (recorder) => {
+
+      recorder.programDefault("statusschedule.php", { body: schedule([zone]), kind: "response" });
+      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
+    }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    assert.ok(h.mqtt, "the MQTT recorder should be attached");
+    const mqtt = h.mqtt;
+
+    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
+    await mqtt.invokeSet("controller/set", "start 1");
+
+    const command = firstOf(h.retrieve.callsTo("setzone.php"), "setzone call");
+
+    assert.equal(command.params?.["action"], "run", "a start with no duration should still send the run action");
+    assert.equal(command.params?.["custom"], zone.run.toString(), "and carry the zone's own run value as its duration");
+  });
+
+  test("a start whose duration is not an integer is refused and sends no wire command", async (t) => {
+
+    const h = buildController({ mqtt: true, program: (recorder) => {
+
+      recorder.programDefault("statusschedule.php", { body: schedule([runningZone()]), kind: "response" });
+      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
+    }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    assert.ok(h.mqtt, "the MQTT recorder should be attached");
+    const mqtt = h.mqtt;
+
+    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
+    await assert.rejects(() => mqtt.invokeSet("controller/set", "start 1 abc"), /^Error: MQTT: Invalid duration specified\.$/,
+      "a duration that does not parse to an integer should throw");
+
+    assert.equal(h.retrieve.callsTo("setzone.php").length, 0, "and no setzone command should be sent");
+  });
+
+  test("a start with no duration on a zone with no scheduled run is refused and sends no wire command", async (t) => {
+
+    const h = buildController({ mqtt: true, program: (recorder) => {
+
+      recorder.programDefault("statusschedule.php", { body: schedule([makeZone({ name: "Alpha", relay: 1, relay_id: 700001, run: 0,
+        time: HYDRAWISE_UNSCHEDULED_SENTINEL, timestr: "" })]), kind: "response" });
+      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
+    }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    assert.ok(h.mqtt, "the MQTT recorder should be attached");
+    const mqtt = h.mqtt;
+
+    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
+    await assert.rejects(() => mqtt.invokeSet("controller/set", "start 1"), /^Error: MQTT: No duration given and the zone has no scheduled run\.$/,
+      "a start with no duration has nothing to run for on a zone with no scheduled run");
+
+    assert.equal(h.retrieve.callsTo("setzone.php").length, 0, "and no setzone command should be sent");
+  });
+
   test("the set handler throws on an unknown zone", async (t) => {
 
     const h = buildController({ mqtt: true, program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([runningZone()]),
@@ -178,7 +242,7 @@ describe("HydrawiseController MQTT", () => {
     mqtt.publishRejection = new Error("broker gone");
 
     /* The failure line names the topic it could not reach, and that topic opens with this controller's serial. A household running several controllers reads
-     * which one lost its broker from exactly that, so the pin covers the named topic rather than the generic opening alone.
+     * which one lost its broker from exactly that, so the assertion covers the named topic rather than the generic opening alone.
      */
     const failureLine = "Unable to publish to the MQTT topic " + h.controllerConfig.serial_number + "/controller";
 
@@ -212,7 +276,7 @@ describe("HydrawiseController MQTT with account facts", () => {
   }
 
   // One zone entry as the payload publishes it: the base wire fields this topic carries, and the fields the account credentials add. Every field is optional
-  // because the additive pair is present only on a credentialed install whose facts are current, which is exactly what these pins are checking.
+  // because the additive pair is present only on a credentialed install whose facts are current, which is exactly what these assertions are checking.
   interface PublishedZone {
 
     name?: string;
@@ -224,7 +288,7 @@ describe("HydrawiseController MQTT with account facts", () => {
     timestr?: string;
   }
 
-  // The parsed payload the get handler answers, which every pin below reads rather than matching substrings against the raw JSON.
+  // The parsed payload the get handler answers, which every assertion below reads rather than matching substrings against the raw JSON.
   async function payloadOf(h: BuildControllerResult): Promise<PublishedZone[]> {
 
     assert.ok(h.mqtt, "the MQTT recorder should be attached");
@@ -238,7 +302,7 @@ describe("HydrawiseController MQTT with account facts", () => {
 
   test("an install with no credentials publishes exactly the five-field shape", async (t) => {
 
-    /* The parity pin, asserted as a DEEP EQUALITY rather than a field spot-check: any additive key leaking into an install that configured no credentials would
+    /* The parity check, asserted as a DEEP EQUALITY rather than a field spot-check: any additive key leaking into an install that configured no credentials would
      * show up here, which a substring or per-field assertion would miss.
      */
     const h = buildController({ mqtt: true,

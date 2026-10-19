@@ -16,8 +16,8 @@ import util from "node:util";
 
 /* The whole-account query, stated once. It asks for every controller on the account in ONE request, which is what lets the platform fetch a single time and hand
  * each controller its own facts: the v2 ceiling is measured in single digits per half hour, so a query per controller would spend an account's whole budget on a
- * multi-controller install before it enriched anything. It feeds the recurring refresh, with the hardware fields riding along on the same call rather than
- * spending one of their own.
+ * multi-controller install before it enriched anything. It feeds the recurring refresh, with the hardware fields fetched by the same call rather than spending
+ * one of their own.
  *
  * The selection is deliberately narrow, because every field asked for is a field that can fail: neighboring fields on these same types answer with a server-side
  * error, and a GraphQL error anywhere in a selection is reported against the whole response. Two omissions rest on probe evidence rather than caution - the
@@ -34,8 +34,8 @@ const ACCOUNT_QUERY = "query { me { controllers { id name status { online } hard
 // here, so the operator sees the same words whichever of them failed.
 const READ_FAILURE_SENTENCE = "Unable to retrieve enhanced controller details";
 
-// The sentence a sign-in failure is reported under once it reaches classification as a thrown error; the two response-shape failures acquireToken() checks
-// directly state their own sentences without drawing on this constant. A suspension command has no sentence of its own here: its failures travel back to the
+// The sentence a sign-in failure is reported under once it reaches classification as a thrown error; the response-shape failures acquireToken() checks directly
+// state their own sentences without drawing on this constant. A suspension command has no sentence of its own here: its failures travel back to the
 // controller, which is the layer that knows which zone the user just touched and speaks the one sentence naming it.
 const TOKEN_FAILURE_SENTENCE = "Unable to sign in to your Hydrawise account for enhanced features";
 
@@ -227,7 +227,7 @@ export class HydrawiseV2Client {
   /** Suspend a single zone until an absolute instant, or resume it, and answer what became of the command - the plugin's one WRITE against the account API.
    *
    * The shape is admission, then transport, and the split is the point. Everything that decides whether this command may be ATTEMPTED happens here, outside the
-   * transport method entirely, so a command the ceiling never admitted cannot be mistaken downstream for a request that reached the wire and failed. Both admission
+   * transport method entirely, so a command the ceiling never admitted cannot be mistaken downstream for a request that reached the wire and failed. The admission
    * steps share ONE window: a beat, composed with this client's own lifetime.
    *
    * Step one takes a slot on the COMMAND ceiling, with that window as its per-call signal. Commands pace on a ceiling of their own precisely so that a burst of them
@@ -440,7 +440,7 @@ export class HydrawiseV2Client {
   }
 
   /* Acquire an access token, by renewal when a refresh token is in hand and by the account password grant otherwise. This is the only method that writes the token
-   * state to anything but "refreshing", and it always writes exactly one of the two terminal states: "valid" on success, "none" on failure.
+   * state to anything but "refreshing", and it always writes exactly one terminal state: "valid" on success, "none" on failure.
    *
    * Returning to "none" on failure is what keeps a broken renewal from wedging the client. The next caller finds no token, runs the password grant, and recovers on
    * its own, where leaving a stale "valid" behind would spend every later call on a token the server has already rejected.
@@ -459,7 +459,7 @@ export class HydrawiseV2Client {
       params.set("client_secret", HYDRAWISE_V2_CLIENT_SECRET);
       params.set("scope", "all");
 
-      // The two grant types differ only in what they present as proof. A renewal spends the refresh token the last grant returned; the password grant presents the
+      // The grant types differ only in what they present as proof. A renewal spends the refresh token the last grant returned; the password grant presents the
       // account credentials the user configured.
       if(refreshToken) {
 
@@ -540,7 +540,9 @@ export class HydrawiseV2Client {
 
         return { joiner: ".", reason: "The Hydrawise API took too long to respond, which can usually be safely ignored." };
 
-      // A concrete network fault reads as the sentence the plugin keeps for it, a complete sentence in its own right, so it follows the report's sentence as one.
+      // A concrete transport fault - a network failure, or a certificate the platform refused to trust - reads as the sentence the plugin keeps for it, a complete
+      // sentence in its own right, so it follows the report's sentence as one.
+      case "certificate":
       case "connect-timeout":
       case "destroyed":
       case "dns":

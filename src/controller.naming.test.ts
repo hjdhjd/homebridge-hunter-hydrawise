@@ -1,6 +1,6 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * controller.naming.test.ts: Zone and controller naming, and the synchronization behind both. Pins the effective name a valve is created with (the user's Name
+ * controller.naming.test.ts: Zone and controller naming, and the synchronization behind both. Asserts the effective name a valve is created with (the user's Name
  * option when set, otherwise the name Hydrawise reports), the synchronization that keeps it current while SyncName holds, the exact-compare that keeps a matching
  * name from being rewritten on every poll, the creation-only behavior a SyncName opt-out restores, the same contract applied to the controller's own surfaces -
  * its irrigation system service, its accessory, and its suspend-all switch - and the scopes the framework enforces for the Name option at either grain.
@@ -14,6 +14,7 @@ import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_V2_FACTS_TTL } from "./setti
 import type { HydrawiseAccessoryContext, HydrawiseControllerIdentity, HydrawiseControllerV2Facts, HydrawiseZoneConfig, HydrawiseZoneIdentity,
   StatusScheduleResponse } from "./types.ts";
 import type { HydrawiseControllerOption, HydrawiseControllerValueOption, HydrawiseZoneOption, HydrawiseZoneValueOption } from "./options.ts";
+import { HydrawiseReservedNames, scheduleStatus } from "./types.ts";
 import type { TestAccessory, TestService } from "./testing/hap.helpers.ts";
 import { buildController, makeV2Facts, makeZoneV2Facts, waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
@@ -21,10 +22,8 @@ import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
 import { featureOptionCategories, featureOptions } from "./options.ts";
 import type { BuildControllerResult } from "./testing/platform.helpers.ts";
 import type { Service as HapService } from "homebridge";
-import { HydrawiseReservedNames } from "./types.ts";
 import assert from "node:assert/strict";
 import { bareSensors } from "./api.fixtures.ts";
-import { scheduleStatus } from "./types.ts";
 
 // The single zone every scenario here works against, and the names standing in for each source a valve's name can come from: what the wire reports, what a user
 // renamed it to in the Home app, and what the Name option configures.
@@ -36,7 +35,7 @@ const WIRE_RENAMED = "Front Lawn North";
 const HOME_APP_NAME = "Sprinklers Out Front";
 const OVERRIDE_NAME = "Front Lawn Drip Line";
 
-// A free-form override exercising the value grammar's full latitude: interior periods and an "=" past the payload delimiter both ride through to the runtime
+// A free-form override exercising the value grammar's full latitude: interior periods and an "=" past the payload delimiter both pass through to the runtime
 // verbatim, and HomeKit's own naming rules then decide what the valve can actually be called.
 const FREE_FORM_OVERRIDE = "Front Lawn 2.0 = North Bed";
 const FREE_FORM_SANITIZED = "Front Lawn 2.0 North Bed";
@@ -61,7 +60,7 @@ const CONTROLLER_WIRE_NAME = "Test Controller";
 const CONTROLLER_ACCOUNT_NAME = "Backyard Irrigation System";
 
 // The account's name for a controller whose wire name is the CUT form of it, which is the only shape the name carry offers anything under. The controller-grain
-// outage pin needs it, because a pair of unrelated names would leave that pin asserting nothing at all.
+// outage assertion needs it, because a pair of unrelated names would leave that assertion proving nothing at all.
 const CONTROLLER_ACCOUNT_EXTENDED = CONTROLLER_WIRE_NAME + " North Wing";
 
 const CONTROLLER_OVERRIDE_NAME = "Garden Controller";
@@ -77,7 +76,7 @@ const UNUSABLE_NAME = "***";
 
 const SUSPEND_ALL_SUFFIX = " Suspend All Zones";
 
-// The per-zone suspension switch's own suffix and the subtype it is published under, so the zone-grain naming pins can read the companion the walk composes.
+// The per-zone suspension switch's own suffix and the subtype it is published under, so the zone-grain naming assertions can read the companion the walk composes.
 const ZONE_SUSPEND_SUFFIX = " Suspend";
 
 const ZONE_SUSPEND_SUBTYPE = "Suspend." + ZONE_SUBTYPE;
@@ -446,7 +445,7 @@ describe("the zone name option's declared scope", () => {
     const engine = new FeatureOptions(featureOptionCategories, featureOptions, ["Enable.Device.Name." + CONTROLLER_SERIAL + "=Every Zone"]);
 
     /* The contract the runtime's zone reader actually rests on. The Name option resolves at the controller as well as the zone, so an engine ASKED with the serial
-     * beside the zone id answers the controller's entry - which is why the zone reader presents the relay id alone. This pins the call the runtime makes, and a
+     * beside the zone id answers the controller's entry - which is why the zone reader presents the relay id alone. This asserts the call the runtime makes, and a
      * reader that reintroduced the serial argument would resolve "Every Zone" here and rename every unnamed zone on the controller.
      */
     assert.equal(engine.value("Device.Name", ZONE_SUBTYPE), null, "a zone read presenting its own id alone never reaches the controller's entry");
@@ -494,7 +493,7 @@ describe("the zone name option's declared scope", () => {
      * The name has to hold at the account's own, because falling back would rewrite every label to the wire's cut form and heal it again a refresh later - the
      * flap this carry exists to end.
      *
-     * The fixture must be TRUNCATION-SHAPED for this pin to mean anything: the carry fires only where the account name extends the wire's, so an unrelated pair
+     * The fixture must be TRUNCATION-SHAPED for this assertion to mean anything: the carry fires only where the account name extends the wire's, so an unrelated pair
      * of names would sail through asserting nothing. The guard below states that relationship rather than trusting the constants to keep it.
      */
     assert.ok(ACCOUNT_NAME.startsWith(WIRE_NAME), "the account's name must extend the wire's for the carry to be under test at all");
@@ -566,7 +565,7 @@ describe("the zone name option's declared scope", () => {
 
     h.controller.applyFacts({ facts: v2Facts(ACCOUNT_NAME), fetchedAt: nowSeconds() });
 
-    // The roster rewrite rides the same change-gated persistence any Hydrawise-side rename does, so it lands on the poll that first sees the new name.
+    // The roster rewrite goes through the same change-gated persistence any Hydrawise-side rename does, so it lands on the poll that first sees the new name.
     await waitFor(() => (rosterOf(h)[0]?.name === ACCOUNT_NAME) ? true : undefined);
 
     assert.equal(rosterOf(h)[0]?.name, ACCOUNT_NAME, "the roster persists the account's name");
@@ -827,7 +826,7 @@ describe("controller naming", () => {
 
   test("a name configured for the controller never reaches a zone that has none of its own", async (t) => {
 
-    /* The no-cascade pin. The Name option resolves at the controller as well as the zone, so the zone reader presents the relay id ALONE - reintroducing the
+    /* The no-cascade assertion. The Name option resolves at the controller as well as the zone, so the zone reader presents the relay id ALONE - reintroducing the
      * controller serial beside it would resolve the controller's entry here and rename every unnamed zone on the controller.
      */
     const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }),
@@ -888,9 +887,9 @@ describe("controller naming", () => {
 
     const irrigation = irrigationOf(h);
 
-    /* The controller grain's own mid-session outage, and the fixture rule the zone grain's pin states applies here identically: the carry offers a name only
+    /* The controller grain's own mid-session outage, and the fixture rule the zone grain's assertion states applies here identically: the carry offers a name only
      * where the account's extends the wire's, so the account name under test is the wire name plus a suffix. An unrelated pair would fall through to the wire
-     * name and the pin would pass while proving nothing.
+     * name and the assertion would pass while proving nothing.
      */
     assert.ok(CONTROLLER_ACCOUNT_EXTENDED.startsWith(CONTROLLER_WIRE_NAME), "the account's name must extend the wire's for the carry to be under test");
 
@@ -917,7 +916,7 @@ describe("controller naming", () => {
     const irrigation = irrigationOf(h);
     const suspendSwitch = suspendSwitchOf(h);
 
-    // The first poll seeds the roster and the schedule projection through the one flush the chokepoint performs; what this pins is the poll after it.
+    // The first poll seeds the roster and the schedule projection through the one flush the chokepoint performs; what this asserts is the poll after it.
     await waitFor(() => (h.flushes.length >= 1) ? true : undefined);
 
     const flushesAfterFirstPoll = h.flushes.length;
@@ -934,14 +933,14 @@ describe("controller naming", () => {
     assert.deepEqual(nameWrites(suspendSwitch), [], "and the switch composed from it is left alone too");
   });
 
-  test("a rename rides the poll's single cache write, and costs none when nothing moved", async (t) => {
+  test("a rename joins the poll's single cache write, and costs none when nothing moved", async (t) => {
 
     /* A rename has to reach Homebridge's cache, because the accessory's display name lives there rather than being derived at each start - without the write the
      * controller comes back under its old label at the next restart.
      *
      * The rename under test is a changed Name OPTION, deliberately, because it is the only rename that moves the display and NOTHING else: the persisted identity
      * carries what the controller is rather than what the user calls it, and the roster and schedule are untouched. Any other trigger would flush on its own
-     * account and the pin could not tell which reason paid for the write.
+     * account and the assertion could not tell which reason paid for the write.
      */
     const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }),
       signalAborted: false, userOptions: ["Enable.Device.Suspend.All"] });
@@ -996,7 +995,7 @@ describe("controller naming", () => {
      * consult has to happen at CREATION for that to hold, because the rename step returns immediately under the opt-out - a service born under the wire's name
      * would keep it for the life of the accessory, with the option the user set to correct it unreachable.
      *
-     * Facts land carrying a different name as well, so the pin distinguishes "established from the override" from "never renamed at all": an implementation that
+     * Facts land carrying a different name as well, so the assertion distinguishes "established from the override" from "never renamed at all": an implementation that
      * ignored the override at creation would show the wire's name here, and one that ignored the opt-out would show the account's.
      */
     const h = buildController({ hasV2Client: true,
@@ -1019,7 +1018,7 @@ describe("controller naming", () => {
 
   test("creation consults the Name option for an opted-out zone's own accessory too", async (t) => {
 
-    /* The same contract at the zone grain, on a zone promoted to an accessory of its own. The existing standalone pins cover an override under synchronization
+    /* The same contract at the zone grain, on a zone promoted to an accessory of its own. The existing standalone assertions cover an override under synchronization
      * ON and an opt-out with no override configured; what neither can show is the two together, which is where a creation that ignored the override would
      * strand the accessory under the wire's name permanently.
      */
@@ -1042,7 +1041,7 @@ describe("controller naming", () => {
 
     /* HomeKit's naming rules can empty a name outright, and a service has to answer to something. The library's accessory helper declines a blank rename on its
      * own, but the service helper writes whatever it is handed, so every service this step renames needs the emptiness decided before the write - otherwise an
-     * unusable name blanks the very labels the user navigates by. This pins all of them against a name every character of which HomeKit's rules discard.
+     * unusable name blanks the very labels the user navigates by. This asserts all of them against a name every character of which HomeKit's rules discard.
      */
     const h = buildController({ hasV2Client: true,
       program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }), signalAborted: false,

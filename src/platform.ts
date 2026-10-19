@@ -111,7 +111,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
      *
      * The account-wide and zone-command budgets make the ceilings Hydrawise publishes for its key-based API enforceable. The account-credentialed budgets are
      * envelopes instead, because that API publishes no ceiling at all and throttles hard, and they are separate from each other because the traffic they pace is:
-     * the scheduled reads and the token grants riding them draw one, while the per-zone commands a user is standing at a switch waiting for draw the other.
+     * the scheduled reads and the token grants they carry draw one, while the per-zone commands a user is standing at a switch waiting for draw the other.
      */
     this.accountBudget = new RateBudget({ capacity: HYDRAWISE_API_BUDGET_CALLS, signal: this.signal, window: HYDRAWISE_API_BUDGET_WINDOW * 1000 });
     this.commandBudget = new RateBudget({ capacity: HYDRAWISE_COMMAND_BUDGET_CALLS, signal: this.signal, window: HYDRAWISE_COMMAND_BUDGET_WINDOW * 1000 });
@@ -124,20 +124,31 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     // leaves every later registration inert - so it takes no teardown-stack registration of its own, on the same terms as the MQTT client below.
     this.timers = new TimerRegistry({ signal: this.signal });
 
-    // Assemble the effective configuration. This is the one place a raw configuration property and a configured feature option meet: every consolidated setting
-    // resolves through the same precedence here, so no reader downstream has to know that a setting has two possible homes.
+    /* Assemble the effective configuration. This is the one place a raw configuration property and a configured feature option meet: every consolidated setting
+     * resolves through the engine's one precedence here - an explicitly configured option rules in every state it can be in, a legacy configuration property
+     * otherwise outranks the catalog default, and the default closes the chain - so no reader downstream has to know that a setting has two possible homes. The
+     * legacy arm is transitional and sunsets at the plugin's next major version, at which point the option is the only home a setting has.
+     *
+     * The engine takes any option name, so each read states its name against the catalog's global unions through `satisfies`, which keeps a misspelled or
+     * wrongly scoped name a compile error. A legacy property keeps this file's bracket-access cast posture, and a non-string smuggled past that cast by a
+     * hand-edited configuration degrades safely at every consumer: the API key gate reads it as no key, and the MQTT factory reads it as nothing configured.
+     */
     this.config = {
 
-      apiKey: this.consolidatedValue("Account.ApiKey", config?.["apiKey"] as string | undefined) ?? "",
-      debug: this.consolidatedFlag("Log.Debug", typeof config?.["debug"] === "boolean" ? config["debug"] : undefined),
-      mqttTopic: this.consolidatedValue("Mqtt.Topic", config?.["mqttTopic"] as string | undefined),
-      mqttUrl: this.consolidatedValue("Mqtt.Url", config?.["mqttUrl"] as string | undefined),
+      apiKey: this.featureOptions.consolidatedValue({ fallback: config?.["apiKey"] as string | undefined,
+        option: "Account.ApiKey" satisfies HydrawiseGlobalValueOption }) ?? "",
+      debug: this.featureOptions.consolidatedFlag({ fallback: (typeof config?.["debug"] === "boolean") ? config["debug"] : undefined,
+        option: "Log.Debug" satisfies HydrawiseGlobalFlagOption }),
+      mqttTopic: this.featureOptions.consolidatedValue({ fallback: config?.["mqttTopic"] as string | undefined,
+        option: "Mqtt.Topic" satisfies HydrawiseGlobalValueOption }),
+      mqttUrl: this.featureOptions.consolidatedValue({ fallback: config?.["mqttUrl"] as string | undefined,
+        option: "Mqtt.Url" satisfies HydrawiseGlobalValueOption }),
       options,
 
-      // The account credentials have no legacy configuration property of their own, so they resolve from the feature option alone. The resolver's legacy argument
-      // is passed as undefined rather than omitted, which is what says that plainly at the call site.
-      password: this.consolidatedValue("Account.Password", undefined),
-      username: this.consolidatedValue("Account.Username", undefined)
+      // The account credentials have no legacy configuration property of their own, so they resolve from the feature option alone and their reads carry no
+      // fallback.
+      password: this.featureOptions.consolidatedValue({ option: "Account.Password" satisfies HydrawiseGlobalValueOption }),
+      username: this.featureOptions.consolidatedValue({ option: "Account.Username" satisfies HydrawiseGlobalValueOption })
     };
 
     // No Hydrawise API key, we're done.
@@ -162,7 +173,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       this.log.info("Enhanced features are enabled using your Hydrawise account login.");
     }
 
-    /* Initialize MQTT, if needed. The guarded factory answers null for both of the ways MQTT can fail to start - a broker URL or topic prefix that resolves to
+    /* Initialize MQTT, if needed. The guarded factory answers null for each of the ways MQTT can fail to start - a broker URL or topic prefix that resolves to
      * nothing, and a URL the client cannot parse - so a mistyped MQTT setting degrades to MQTT being off rather than keeping the rest of the plugin from
      * loading. An unusable URL is reported once at error level, with the URL itself redacted so a broker password embedded in it never reaches the log. The
      * platform's shutdown signal ties the client's lifetime to ours.
@@ -184,8 +195,8 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
      * first here run LAST and the signal abort named last runs FIRST: the abort cancels every signal-aware resource we own - the MQTT client, the retry waits, the
      * polling loops, the rate-budget waits - and the destroys then close the keep-alive Pool connections so they do not outlive us.
      *
-     * Each dispatcher is read live at disposal time rather than captured here, which keeps these registrations correct across the destroy-and-rearm both transports
-     * perform when a request times out. The v2 client registers only its dispatcher, because that pool is the whole of what it holds: its token renewal is lazy, so
+     * Each dispatcher is read live at disposal time rather than captured here, which keeps these registrations correct across the destroy-and-rearm each transport
+     * performs when a request times out. The v2 client registers only its dispatcher, because that pool is the whole of what it holds: its token renewal is lazy, so
      * there is no timer to drain. The MQTT client gets no registration of its own: its lifetime IS the composed shutdown signal the abort already ends, so
      * registering it here would tear it down a second time.
      */
@@ -439,29 +450,6 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     return this.featureOptions.test("Device", undefined, serialNumber);
   }
 
-  /* Resolve one consolidated setting to its effective value. An explicitly configured feature option always rules - its enabled, disabled, and valueless states
-   * alike - because configuring an option is the user saying what they want. A legacy configuration property, where one is present, otherwise outranks the
-   * catalog default, so a configuration that names only the properties runs correctly without the webUI ever being opened. The legacy arm is transitional and
-   * sunsets at the plugin's next major version, at which point the option is the only home a setting has.
-   *
-   * The legacy argument keeps this file's bracket-access cast posture. A non-string smuggled past that cast by a hand-edited configuration degrades safely at
-   * every consumer: the API key gate reads it as no key, and the MQTT factory reads it as nothing configured.
-   */
-  private consolidatedValue(option: HydrawiseGlobalValueOption, legacy: string | undefined): Nullable<string | undefined> {
-
-    return this.featureOptions.exists(option) ? this.featureOptions.value(option) : legacy ?? this.featureOptions.value(option);
-  }
-
-  /* Resolve one consolidated boolean setting to its effective state, the flag twin of the resolver above and the same rule in boolean terms. An explicitly
-   * configured feature option rules, enabled or disabled alike, because configuring an option is the user saying what they want. A legacy configuration property,
-   * where one carries an actual boolean, otherwise decides. The catalog's own declared default closes the chain, which is what lets a flag whose default is on
-   * resolve honestly without a line changing here. The legacy arm sunsets alongside the others.
-   */
-  private consolidatedFlag(option: HydrawiseGlobalFlagOption, legacy: boolean | undefined): boolean {
-
-    return this.featureOptions.exists(option) ? this.featureOptions.test(option) : legacy ?? this.featureOptions.defaultValue(option);
-  }
-
   // Configure a discovered irrigation controller. The account roster is threaded through to the controller so it can seed its accessory context with every sibling's
   // identity.
   private configureController(controller: HydrawiseControllerConfig, roster: HydrawiseControllerIdentity[]): Nullable<HydrawiseController> {
@@ -574,7 +562,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     const hosts = new Map<number, HydrawiseAccessory>();
     const requestedIds = new Set(zones.map(zone => zone.identity.relayId));
 
-    /* Derive this controller's own zone accessories, projected to the pair each arm below reads. Filtering on the owning controller id is what keeps a
+    /* Derive this controller's own zone accessories, projected to the fields each arm below reads. Filtering on the owning controller id is what keeps a
      * multi-controller account isolated: another controller's zone accessories are never this call's business. The projection is a SNAPSHOT, so the removals the
      * arms perform - which splice the tracked array - never race the walk that drives them.
      */
@@ -712,7 +700,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
     // The request URL, assembled inside the try below once the budgets have admitted this call. It is declared out here because the timeout branch of the catch
     // reports it, and a variable assigned only inside a try cannot be read from its own catch. The empty starting value is never what reaches that log: the only
-    // steps preceding the assignment are the two budget waits, and the sole way either ends early is a shutdown rejection, which the catch answers above the
+    // steps preceding the assignment are the budget waits, and the sole way any of them ends early is a shutdown rejection, which the catch answers above the
     // timeout branch.
     let url = "";
 
@@ -720,12 +708,12 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
       /* Pace this call against both ceilings Hydrawise publishes, at the one place every request to the API passes through. A zone command draws the stricter
        * command budget first and the account-wide budget second, so a command queued behind a saturated command window is not also holding an account slot while
-       * it waits. Both waits sit inside this try, which is what makes an escaping budget rejection unrepresentable: a shutdown while a caller is queued rejects
+       * it waits. Every wait sits inside this try, which is what makes an escaping budget rejection unrepresentable: a shutdown while a caller is queued rejects
        * into the classification below, whose aborted-signal branch returns the same quiet null every other teardown path returns.
        *
        * Two limits on what these budgets can promise, stated plainly. They admit LOGICAL calls and sit above undici's retry interceptor, so one admitted call can
        * still put more than one request on the wire during a failure storm - the initial attempt plus whatever retries the dispatcher factory's retry policy
-       * allows - accepted headroom, because retries exist to ride out exactly the trouble a ceiling is not the cause of. And they account only for this process:
+       * allows - accepted headroom, because retries exist to recover from exactly the trouble a ceiling is not the cause of. And they account only for this process:
        * the Homebridge config UI runs its own server process against the same account, one customerdetails call per refresh plus one statusschedule call per
        * controller it holds no cached context for, which an in-process window cannot see.
        */
@@ -745,7 +733,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       url = HYDRAWISE_API_BASE_URL + endpoint + "?" + queryParams.toString();
 
       // Compose a per-request timeout with the platform's shutdown signal, so a slow request aborts on the timeout and an in-flight request aborts on shutdown, all
-      // through one signal handed to undici. The timeout is armed only now, after both budgets have admitted the call, so a wait for a rate-limit slot never eats
+      // through one signal handed to undici. The timeout is armed only now, after the budgets have admitted the call, so a wait for a rate-limit slot never eats
       // into the time the request itself is allowed.
       const signal = composeSignals(AbortSignal.timeout(HYDRAWISE_API_TIMEOUT * 1000), this.signal);
 
@@ -804,7 +792,8 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
           return null;
 
-        // A concrete network fault, named by the sentence the plugin keeps for it.
+        // A concrete transport fault - a network failure, or a certificate the platform refused to trust - named by the sentence the plugin keeps for it.
+        case "certificate":
         case "connect-timeout":
         case "destroyed":
         case "dns":

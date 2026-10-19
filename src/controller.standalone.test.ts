@@ -1,6 +1,6 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * controller.standalone.test.ts: The controller's projection of standalone zones onto accessories of their own. Pins where a zone's valve is hosted and
+ * controller.standalone.test.ts: The controller's projection of standalone zones onto accessories of their own. Asserts where a zone's valve is hosted and
  * where it is not, the enumeration difference a standalone host implies, the controller aggregates that deliberately still span standalone zones, the reconcile
  * request the projection builds, the zone accessory's information and name synchronization, the warm-restart handler attach, the fall back to controller hosting,
  * and the default-off parity floor.
@@ -10,14 +10,13 @@
 /* eslint-disable camelcase */
 import { Characteristic, Service, TestAccessory } from "./testing/hap.helpers.ts";
 import type { HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
-import { UNSCHEDULED_SENTINEL, bareSensors, rainSensors } from "./api.fixtures.ts";
+import { UNSCHEDULED_SENTINEL, bareSensors, rainSensors, syntheticController } from "./api.fixtures.ts";
 import { buildController, loggedAt, waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
 import type { BuildControllerResult } from "./testing/platform.helpers.ts";
 import assert from "node:assert/strict";
 import { getServiceName } from "homebridge-plugin-utils";
-import { syntheticController } from "./api.fixtures.ts";
 
 const CONTROLLER_SERIAL = "SN0A1B2C3D4";
 const STANDALONE_RELAY_ID = 700001;
@@ -28,7 +27,7 @@ const HOSTED_SUBTYPE = "700002";
 // The option entry that promotes the first zone. Every scenario that wants a standalone zone names this one, so the grammar lives in one place.
 const STANDALONE_ON = "Enable.Device.Standalone." + STANDALONE_SUBTYPE;
 
-/* The wire name of the zone under test carries a character HomeKit disallows, so its raw and sanitized forms are observably different values. Every pin that
+/* The wire name of the zone under test carries a character HomeKit disallows, so its raw and sanitized forms are observably different values. Every assertion that
  * asserts on a name states that difference as a precondition, which is what stops the assertion from passing vacuously against an implementation that writes the
  * raw name.
  */
@@ -38,13 +37,13 @@ const WIRE_RENAMED = "Rear/Lawn South";
 const WIRE_RENAMED_SANITIZED = "Rear Lawn South";
 const OVERRIDE_NAME = "Front Bed Drip Line";
 
-// The standalone zone, running now by default, with the remaining runtime the aggregate pin reads back off the controller accessory.
+// The standalone zone, running now by default, with the remaining runtime the aggregate assertion reads back off the controller accessory.
 function standaloneZone(overrides: Partial<HydrawiseZoneConfig> = {}): HydrawiseZoneConfig {
 
   return makeZone({ name: WIRE_NAME, relay: 1, relay_id: STANDALONE_RELAY_ID, run: 600, time: 1, timestr: "", ...overrides });
 }
 
-// The overrides that make the zone scheduled rather than running. A manual-run pin needs them: the walk writes SetDuration only for a zone that is not already
+// The overrides that make the zone scheduled rather than running. A manual-run assertion needs them: the walk writes SetDuration only for a zone that is not already
 // running, and the run command the handler sends is a no-op without one.
 const SCHEDULED: Partial<HydrawiseZoneConfig> = { run: 480, time: 68000, timestr: "16:00" };
 
@@ -118,7 +117,7 @@ describe("HydrawiseController standalone zones", () => {
 
     const valve = h.zoneAccessories.get(STANDALONE_RELAY_ID)?.getServiceById(Service.Valve, STANDALONE_SUBTYPE);
 
-    // A standalone accessory hosts no ServiceLabel service for an index to enumerate against. The controller-hosted polarity is already pinned by the
+    // A standalone accessory hosts no ServiceLabel service for an index to enumerate against. The controller-hosted polarity is already asserted by the
     // updateState suite, so only the new signal is asserted here.
     assert.equal(valve?.writesFor(Characteristic.ServiceLabelIndex).length, 0, "a standalone valve takes no service label index");
     assert.equal(valve?.getCharacteristic(Characteristic.IsConfigured).value, Characteristic.IsConfigured.CONFIGURED, "a standalone valve is still configured");
@@ -164,7 +163,7 @@ describe("HydrawiseController standalone zones", () => {
 
   test("sends the wire name in the reconcile identity and the effective name as the display name", async (t) => {
 
-    /* Two distinguishing inputs ride in this one scenario. The active Name override is what tells a wire-name identity from an effective-name one: without an
+    /* Two distinguishing inputs share this one scenario. The active Name override is what tells a wire-name identity from an effective-name one: without an
      * override both names coincide and the assertion would pass either way. And the second zone is DEVICE-DISABLED, so the pre-enablement rule for the
      * present-relay set has a witness - a set built from the enabled projection instead of the raw report would omit it.
      */
@@ -293,7 +292,7 @@ describe("HydrawiseController standalone zones", () => {
 
     /* Seed a zone accessory that ALREADY carries the zone's valve, the shape Homebridge restores from its cache. Seeding synchronously here is safe: the polling
      * loop's first fetch awaits before any projection runs, so this lands ahead of the first poll. The pre-built valve is mandatory - without it the valve would
-     * be created this pass and the pin would pass vacuously through the new-valve arm instead of proving the first-run arm covers a restored one.
+     * be created this pass and the assertion would pass vacuously through the new-valve arm instead of proving the first-run arm covers a restored one.
      */
     const restored = new TestAccessory(WIRE_NAME_SANITIZED, "500001.Zone.700001");
 
@@ -366,7 +365,7 @@ describe("HydrawiseController standalone zones", () => {
 
     /* Opt the zone in through the platform double's REAL feature-options engine - the same instance the controller consults on every poll - so the promotion
      * arrives at a controller that ALREADY holds a hint entry for this zone. Building a second controller would seed a fresh ledger and quietly defeat the
-     * existing-entry premise this pin exists to exercise. The paced cadence is what lets the option and the body change together: the gap after one poll's
+     * existing-entry premise this assertion exists to exercise. The paced cadence is what lets the option and the body change together: the gap after one poll's
      * projection is wide enough to make both changes before the next poll fetches.
      */
     h.platform.featureOptions.configuredOptions = [ ...h.platform.featureOptions.configuredOptions, STANDALONE_ON ];

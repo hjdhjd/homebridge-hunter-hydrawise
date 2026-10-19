@@ -4,7 +4,7 @@
  */
 import { Categories } from "homebridge-plugin-utils";
 import type { HydrawiseEndpoint } from "./types.ts";
-import type { TransportFailure } from "homebridge-plugin-utils";
+import type { TransportFailureCodedKind } from "homebridge-plugin-utils";
 
 // Hydrawise API response timeout, in seconds.
 export const HYDRAWISE_API_TIMEOUT = 7;
@@ -37,16 +37,18 @@ export const HYDRAWISE_COMMAND_ENDPOINT: HydrawiseEndpoint = "setzone.php";
 // and the host the pool connects to can never disagree - the same rule the account-credentialed API group below states for its own endpoints.
 export const HYDRAWISE_API_BASE_URL = "https://api.hydrawise.com/api/v1/";
 
-// The transport failures the classifier reaches only by matching a transport or errno code - each one a concrete network fault with a sentence of its own below.
-export type HydrawiseTransportFault = Extract<TransportFailure, { code: string }>["kind"];
+// The transport failures the classifier names from a code the error carries - an errno, a transport code, or a certificate verdict - each one a concrete fault
+// with a sentence of its own below. The library names this union, so the plugin reads its name rather than deriving it a second time.
+export type HydrawiseTransportFault = TransportFailureCodedKind;
 
-/* What each concrete network fault means to a Hydrawise user, stated once and read by both API clients. The key type is derived from the library's own union, so a
- * fault kind the library learns to name is a compile error here until this plugin gives it a sentence. The lifetime abort, the deadline, and the unmarked failure are
+/* What each concrete transport fault means to a Hydrawise user, stated once and read by each API client. The key type is the library's own coded-kind union, so
+ * a fault kind the library learns to name is a compile error here until this plugin gives it a sentence. The lifetime abort, the deadline, and the unmarked failure are
  * deliberately absent: an abort is silent, a deadline re-arms the catching client's own connection pool and speaks for itself there, and an unmarked failure has
  * nothing better to offer than the error itself.
  */
 export const HYDRAWISE_TRANSPORT_FAULT_SENTENCES = Object.freeze({
 
+  "certificate": "Certificate verification failed for the Hydrawise API. Please check the date and time on your Homebridge host.",
   "connect-timeout": "Connection timed out.",
   "destroyed": "A request to the Hydrawise API was interrupted while the connection was being reset.",
   "dns": "Hostname or IP address not found. Please ensure you're connected to the Internet.",
@@ -165,7 +167,7 @@ export const HOMEBRIDGE_UNKNOWN_FIRMWARE = "0";
  */
 export const HAP_DEFAULT_MODEL = "Default-Model";
 
-/* The ceiling HomeKit itself pins on the RemainingDuration and SetDuration characteristics - hap-nodejs declares 3600 seconds as each characteristic's maximum
+/* The ceiling HomeKit itself places on the RemainingDuration and SetDuration characteristics - hap-nodejs declares 3600 seconds as each characteristic's maximum
  * value - so every duration written to them is capped to this first, and a longer runtime reports as the ceiling rather than tripping HAP's own value clamping.
  */
 export const HAP_DURATION_CEILING = 3600;

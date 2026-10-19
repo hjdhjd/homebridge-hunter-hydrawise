@@ -8,7 +8,7 @@
  * suspension reconciling against the first fresh facts to arrive.
  *
  * Every command but one runs against the platform double's recording suspension surface, so most of this file never reaches the account API or its client - the
- * client's own admission and transport behavior is pinned in its own suite, and what these tests pin is the projection above it. The one exception drives a real
+ * client's own admission and transport behavior is asserted in its own suite, and what these tests assert is the projection above it. The one exception drives a real
  * account-credentialed client over a mocked transport, proving that a transport failure produces exactly one sentence for the user across every layer that could
  * have spoken about it.
  */
@@ -18,22 +18,19 @@
 import { Characteristic, Service } from "./testing/hap.helpers.ts";
 import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_SUSPEND_DURATION, HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_V2_FACTS_TTL,
   HYDRAWISE_V2_GRAPH_ENDPOINT, HYDRAWISE_V2_MUTATION_BUDGET_CALLS, HYDRAWISE_V2_MUTATION_BUDGET_WINDOW, HYDRAWISE_V2_TOKEN_ENDPOINT } from "./settings.ts";
+import { HYDRAWISE_RAIN_SENSOR_TYPE, scheduleStatus, suspendZoneSubtype } from "./types.ts";
 import type { HydrawiseAccessoryContext, HydrawiseZoneConfig, HydrawiseZoneScheduleStatus, HydrawiseZoneV2Facts,
   StatusScheduleResponse } from "./types.ts";
+import { RateBudget, getServiceName } from "homebridge-plugin-utils";
 import type { TestAccessory, TestService } from "./testing/hap.helpers.ts";
 import { UNSCHEDULED_SENTINEL, bareSensors } from "./api.fixtures.ts";
 import { buildController, countLogged, loggedAt, makeV2Facts, makeZoneV2Facts, waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
 import type { BuildControllerResult } from "./testing/platform.helpers.ts";
-import { HYDRAWISE_RAIN_SENSOR_TYPE } from "./types.ts";
 import { HydrawiseV2Client } from "./v2.ts";
 import { MockAgent } from "undici";
-import { RateBudget } from "homebridge-plugin-utils";
 import assert from "node:assert/strict";
-import { getServiceName } from "homebridge-plugin-utils";
-import { scheduleStatus } from "./types.ts";
-import { suspendZoneSubtype } from "./types.ts";
 
 const CONTROLLER_SERIAL = "SN0A1B2C3D4";
 const ALPHA_RELAY_ID = 700001;
@@ -41,7 +38,7 @@ const BETA_RELAY_ID = 700002;
 const ALPHA_VALVE_SUBTYPE = "700001";
 
 /* The composed subtypes, written as LITERALS rather than through the composer. The composer is production's single home for this shape, so a test that called it
- * would agree with any shape it ever produced; the literal is what pins the shape itself - and it is what a cached accessory in the field carries, so changing it
+ * would agree with any shape it ever produced; the literal is what locks in the shape itself - and it is what a cached accessory in the field carries, so changing it
  * silently orphans every switch already published.
  */
 const ALPHA_SWITCH_SUBTYPE = "Suspend.700001";
@@ -66,7 +63,7 @@ const SUSPENDED_UNTIL = 1903928399;
 // The reason a refused command carries back, which the controller's one sentence has to name.
 const REFUSAL_SUMMARY = "Hydrawise refused this one.";
 
-// The v2 origin and paths the real client used by the combined-layers pin below targets, derived from the endpoint constants exactly as the client derives its own.
+// The v2 origin and paths the real client used by the combined-layers assertion below targets, derived from the endpoint constants exactly as the client derives its own.
 const V2_ORIGIN = new URL(HYDRAWISE_V2_GRAPH_ENDPOINT).origin;
 
 const GRAPH_PATH = new URL(HYDRAWISE_V2_GRAPH_ENDPOINT).pathname;
@@ -199,7 +196,7 @@ describe("HydrawiseController per-zone suspension switches", () => {
 
   test("the composed subtype is the shape every cached accessory in the field carries", () => {
 
-    // Production's own composer, pinned against the literal the rest of this suite - and every accessory already published - depends on.
+    // Production's own composer, asserted against the literal the rest of this suite - and every accessory already published - depends on.
     assert.equal(suspendZoneSubtype(ALPHA_RELAY_ID), ALPHA_SWITCH_SUBTYPE, "a zone's switch subtype is the reserved prefix and its relay id");
     assert.notEqual(suspendZoneSubtype(ALPHA_RELAY_ID), ALPHA_VALVE_SUBTYPE, "and it cannot collide with the valve subtype the same zone already carries");
   });
@@ -217,7 +214,7 @@ describe("HydrawiseController per-zone suspension switches", () => {
     assert.equal(serviceName(service), "Alpha Suspend", "the switch takes the zone's effective name and the suspend suffix");
     assert.ok(h.accessory.getServiceById(Service.Valve, ALPHA_VALVE_SUBTYPE), "and it sits beside the valve rather than replacing it");
 
-    // ON means the zone is suspended, so an unsuspended zone reads off. The pin that this one cannot make - a switch established on an ALREADY suspended zone,
+    // ON means the zone is suspended, so an unsuspended zone reads off. The assertion that this one cannot make - a switch established on an ALREADY suspended zone,
     // where HAP's own default would be the wrong answer rather than accidentally the right one - is driven separately below.
     assert.equal(readsSuspended(h.accessory), false, "a zone under no suspension reads as unsuspended");
     assert.ok(loggedAt(h.lines(), "info", "Per-zone suspension switches enabled."), "the enabled feature is reported once at the startup grain");
@@ -225,7 +222,7 @@ describe("HydrawiseController per-zone suspension switches", () => {
 
   test("a switch established on an already-suspended zone starts ON", async (t) => {
 
-    /* The establishment write's own pin, and the one the common case cannot make: an unsuspended zone's answer happens to coincide with HAP's own default for a
+    /* The establishment write's own assertion, and the one the common case cannot make: an unsuspended zone's answer happens to coincide with HAP's own default for a
      * fresh characteristic, so a walk that wrote nothing at all would pass it. Here the answer is the opposite of that default, so only a real write satisfies it.
      *
      * The zone is brought in on a LATER poll, after facts have landed, because that is the only way a switch is first established with a classified suspension
@@ -404,7 +401,7 @@ describe("HydrawiseController per-zone suspension commands", () => {
     assert.ok(loggedAt(h.lines(), "error", "Alpha [Zone 1]: Unable to suspend this zone. " + REFUSAL_SUMMARY),
       "and the one sentence names the zone and what the account said");
 
-    /* The one-voice pin. The layers below this one carry their outcome in a value rather than in a line, so a user reads exactly one sentence about a command they
+    /* The one-voice assertion. The layers below this one carry their outcome in a value rather than in a line, so a user reads exactly one sentence about a command they
      * made - the one written by the layer that knows which zone they touched.
      */
     assert.equal(h.lines().filter(line => line.level === "error").length, 1, "a refused command produces exactly one error line");
@@ -434,7 +431,7 @@ describe("HydrawiseController per-zone suspension commands", () => {
 
   test("a transport failure is narrated ONCE across every layer that saw it", async (t) => {
 
-    /* The combined-layers pin, and the one a per-layer suite structurally cannot write. Below the controller sits a REAL account-credentialed client over a mocked
+    /* The combined-layers assertion, and the one a per-layer suite structurally cannot write. Below the controller sits a REAL account-credentialed client over a mocked
      * transport, and every layer writes into one capture buffer, so what is counted here is every voice that could speak about one failed command.
      *
      * Both transport failure shapes are driven, because they classify in different places: a non-2xx status is read off the response, while a GraphQL errors array
@@ -483,8 +480,9 @@ describe("HydrawiseController per-zone suspension commands", () => {
 
   test("a command that finds no account client at all says what is missing", async (t) => {
 
-    /* The missing-client answer, which no LIVE switch can produce: the switches exist only where a client does, and that is fixed at construction. Its sentence is pinned
-     * here all the same, because the handler answers to every outcome the surface declares - and an unnamed one would compile into a switch reverting in silence.
+    /* The missing-client answer, which no LIVE switch can produce: the switches exist only where a client does, and that is fixed at construction. Its sentence is
+     * asserted here all the same, because the handler answers to every outcome the surface declares - and an unnamed one would compile into a switch reverting in
+     * silence.
      */
     const h = buildController({ hasV2Client: true,
       program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" }), signalAborted: false,
@@ -624,7 +622,7 @@ describe("HydrawiseController per-zone suspension command guard", () => {
 
   test("an account-wide command stamps every zone the WIRE reported, enabled or not", async (t) => {
 
-    /* The source pin. The account-wide command has to stamp every zone the wire named, not the enabled projection: that projection is empty before the first poll
+    /* The source assertion. The account-wide command has to stamp every zone the wire named, not the enabled projection: that projection is empty before the first poll
      * completes and silently omits any zone a feature option turned off. Bravo is turned off here precisely so the two populations differ - a fixture where they
      * matched could not tell the right source from the wrong one.
      */
@@ -666,7 +664,7 @@ describe("HydrawiseController per-zone suspension command guard", () => {
     t.after(() => h.abort());
 
     // The account-wide switch is established at construction while a zone's own switch waits on the first poll, so both are awaited before the account-wide command
-    // is driven - the zone switch is what this pin reads its answer off.
+    // is driven - the zone switch is what this assertion reads its answer off.
     const all = await waitFor(() => suspendSwitch(h.accessory, SUSPEND_ALL_SUBTYPE));
 
     await waitFor(() => suspendSwitch(h.accessory));
@@ -865,7 +863,7 @@ describe("HydrawiseController suspension commands composed into the projection",
 
     await waitFor(() => (entryOf(h)?.state === "scheduled") ? true : undefined);
 
-    // A refresh lands first, for the same reason the pin above states, and every count below is taken after it settles.
+    // A refresh lands first, for the same reason the assertion above states, and every count below is taken after it settles.
     applyFacts(h, { [ALPHA_RELAY_ID]: false }, now());
 
     const flushesBefore = h.flushes.length;
