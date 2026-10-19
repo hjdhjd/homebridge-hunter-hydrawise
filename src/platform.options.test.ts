@@ -6,14 +6,15 @@
  *
  * Every value pair here is deliberately distinct, so a resolver reading the wrong arm cannot echo the right answer back and pass.
  */
-import { buildPlatform, loggedAt } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
+import { buildPlatform } from "./testing/platform.helpers.ts";
+import { loggedAt } from "homebridge-plugin-utils/testing";
 
 // APIEvent.SHUTDOWN's string value. Firing it aborts the platform's shutdown signal, which is what ends any MQTT client a test constructed.
 const SHUTDOWN = "shutdown";
 
-// The two API keys the pins tell apart: the one a legacy configuration property carries, and the one a configured feature option carries.
+// The two API keys the assertions tell apart: the one a legacy configuration property carries, and the one a configured feature option carries.
 const LEGACY_KEY = "AAAA-BBBB-CCCC-DDD";
 const OPTION_KEY = "EEEE-FFFF-GGGG-HHH";
 
@@ -96,54 +97,54 @@ describe("HydrawisePlatform consolidated options", () => {
 
   test("a valueless API key entry outranks the legacy key and stops startup", (t) => {
 
-    const { emit, lines, platform } = buildPlatform({ apiKey: LEGACY_KEY, options: ["Enable.Account.ApiKey"] });
+    const { emit, entries, platform } = buildPlatform({ apiKey: LEGACY_KEY, options: ["Enable.Account.ApiKey"] });
 
     t.after(() => emit(SHUTDOWN));
 
     assert.equal(platform.config.apiKey, "", "an explicit entry carrying no value resolves to an empty key rather than deferring to the legacy property");
-    assert.ok(loggedAt(lines(), "error", "no Hunter Hydrawise API key"), "an empty effective key stops startup at the missing-key gate");
+    assert.ok(loggedAt(entries, "error", "no Hunter Hydrawise API key"), "an empty effective key stops startup at the missing-key gate");
   });
 
   test("an explicitly disabled API key outranks the legacy key and stops startup", (t) => {
 
-    const { emit, lines, platform } = buildPlatform({ apiKey: LEGACY_KEY, options: ["Disable.Account.ApiKey"] });
+    const { emit, entries, platform } = buildPlatform({ apiKey: LEGACY_KEY, options: ["Disable.Account.ApiKey"] });
 
     t.after(() => emit(SHUTDOWN));
 
     assert.equal(platform.config.apiKey, "", "an explicitly disabled key is no key, whatever the legacy property carries");
-    assert.ok(loggedAt(lines(), "error", "no Hunter Hydrawise API key"), "an empty effective key stops startup at the missing-key gate");
+    assert.ok(loggedAt(entries, "error", "no Hunter Hydrawise API key"), "an empty effective key stops startup at the missing-key gate");
   });
 
   test("a legacy debug property resolves the flag on", (t) => {
 
-    const { emit, lines, platform } = buildPlatform({ debug: true });
+    const { emit, entries, platform } = buildPlatform({ debug: true });
 
     t.after(() => emit(SHUTDOWN));
 
     assert.equal(platform.config.debug, true, "a legacy debug property resolves as the effective flag");
-    assert.ok(loggedAt(lines(), "warn", "Debug logging on."), "the resolved flag reaches behavior, routing debug output to warning level");
+    assert.ok(loggedAt(entries, "warn", "Debug logging on."), "the resolved flag reaches behavior, routing debug output to warning level");
   });
 
   test("a configured debug option resolves the flag on over a legacy property that says otherwise", (t) => {
 
     // The harness leaves the legacy debug property unset by default, so a resolver preferring it would fall through to the catalog's own default of false rather
     // than reading a configured value.
-    const { emit, lines, platform } = buildPlatform({ options: ["Enable.Log.Debug"] });
+    const { emit, entries, platform } = buildPlatform({ options: ["Enable.Log.Debug"] });
 
     t.after(() => emit(SHUTDOWN));
 
     assert.equal(platform.config.debug, true, "an explicitly enabled option outranks the legacy property");
-    assert.ok(loggedAt(lines(), "warn", "Debug logging on."), "an option-resolved flag reaches behavior just as a legacy property does");
+    assert.ok(loggedAt(entries, "warn", "Debug logging on."), "an option-resolved flag reaches behavior just as a legacy property does");
   });
 
   test("an explicitly disabled debug option outranks a legacy property that says on", (t) => {
 
-    const { emit, lines, platform } = buildPlatform({ debug: true, options: ["Disable.Log.Debug"] });
+    const { emit, entries, platform } = buildPlatform({ debug: true, options: ["Disable.Log.Debug"] });
 
     t.after(() => emit(SHUTDOWN));
 
     assert.equal(platform.config.debug, false, "an explicit disable rules, whatever the legacy property carries");
-    assert.ok(!loggedAt(lines(), "warn", "Debug logging on."), "a disabled flag emits no debug output");
+    assert.ok(!loggedAt(entries, "warn", "Debug logging on."), "a disabled flag emits no debug output");
   });
 
   test("debug resolves off when neither the option nor the legacy property asks for it", (t) => {

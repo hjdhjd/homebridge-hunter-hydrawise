@@ -10,8 +10,9 @@
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { HYDRAWISE_ORIGIN, buildPlatform, dispatcherOf, installMockDispatcher, loggedAt, programJsonReply, programStatusReply } from "./testing/platform.helpers.ts";
+import { HYDRAWISE_ORIGIN, buildPlatform, dispatcherOf, installMockDispatcher, programJsonReply, programStatusReply } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
+import { errnoError, loggedAt } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
 import { errors } from "undici";
 
@@ -39,7 +40,7 @@ describe("HydrawisePlatform retrieve", () => {
 
   test("returns null and logs an invalid-key error on a 404", async (t) => {
 
-    const { emit, lines, platform } = buildPlatform();
+    const { emit, entries, platform } = buildPlatform();
 
     t.after(() => emit(SHUTDOWN_EVENT));
     await using dispatcher = installMockDispatcher();
@@ -48,12 +49,12 @@ describe("HydrawisePlatform retrieve", () => {
     const response = await platform.retrieve("customerdetails.php");
 
     assert.equal(response, null, "a 404 should classify as an error and return null");
-    assert.ok(loggedAt(lines(), "error", "Invalid API key"), "a 404 should log the invalid-key message");
+    assert.ok(loggedAt(entries, "error", "Invalid API key"), "a 404 should log the invalid-key message");
   });
 
   test("returns null and logs a rate-limit error on a 429", async (t) => {
 
-    const { emit, lines, platform } = buildPlatform();
+    const { emit, entries, platform } = buildPlatform();
 
     t.after(() => emit(SHUTDOWN_EVENT));
     await using dispatcher = installMockDispatcher();
@@ -62,12 +63,12 @@ describe("HydrawisePlatform retrieve", () => {
     const response = await platform.retrieve("customerdetails.php");
 
     assert.equal(response, null, "a 429 should classify as an error and return null");
-    assert.ok(loggedAt(lines(), "error", "rate limit"), "a 429 should log the rate-limit message");
+    assert.ok(loggedAt(entries, "error", "rate limit"), "a 429 should log the rate-limit message");
   });
 
   test("a 403 outside the 2xx range classifies as an error and returns null (the bug 1 fix)", async (t) => {
 
-    const { emit, lines, platform } = buildPlatform();
+    const { emit, entries, platform } = buildPlatform();
 
     t.after(() => emit(SHUTDOWN_EVENT));
     await using dispatcher = installMockDispatcher();
@@ -78,12 +79,12 @@ describe("HydrawisePlatform retrieve", () => {
     const response = await platform.retrieve("customerdetails.php");
 
     assert.equal(response, null, "a 403 outside the 2xx range classifies as an error and returns null");
-    assert.ok(loggedAt(lines(), "error", "403"), "a 403 logs its raw status code at error level");
+    assert.ok(loggedAt(entries, "error", "403"), "a 403 logs its raw status code at error level");
   });
 
   test("a 500 in the retryable-statuses set returns null and logs the temporarily-unavailable message (the bug 1 fix)", async (t) => {
 
-    const { emit, lines, platform } = buildPlatform();
+    const { emit, entries, platform } = buildPlatform();
 
     t.after(() => emit(SHUTDOWN_EVENT));
     await using dispatcher = installMockDispatcher();
@@ -94,12 +95,12 @@ describe("HydrawisePlatform retrieve", () => {
     const response = await platform.retrieve("customerdetails.php");
 
     assert.equal(response, null, "a 500 classifies as an error and returns null");
-    assert.ok(loggedAt(lines(), "error", "temporarily unavailable"), "a retryable status logs the temporarily-unavailable message");
+    assert.ok(loggedAt(entries, "error", "temporarily unavailable"), "a retryable status logs the temporarily-unavailable message");
   });
 
   test("returns null quietly when the platform signal is already aborted", async () => {
 
-    const { emit, lines, platform } = buildPlatform();
+    const { emit, entries, platform } = buildPlatform();
 
     await using dispatcher = installMockDispatcher();
     programJsonReply(dispatcher.agent, "customerdetails.php", { controller_id: 500001 });
@@ -110,12 +111,12 @@ describe("HydrawisePlatform retrieve", () => {
     const response = await platform.retrieve("customerdetails.php");
 
     assert.equal(response, null, "an aborted platform signal short-circuits retrieve to null");
-    assert.ok(!loggedAt(lines(), "error", "Invalid API key"), "the abort path logs no error");
+    assert.ok(!loggedAt(entries, "error", "Invalid API key"), "the abort path logs no error");
   });
 
   test("returns null on a connection timeout", async (t) => {
 
-    const { emit, lines, platform } = buildPlatform();
+    const { emit, entries, platform } = buildPlatform();
 
     t.after(() => emit(SHUTDOWN_EVENT));
     await using dispatcher = installMockDispatcher();
@@ -125,12 +126,12 @@ describe("HydrawisePlatform retrieve", () => {
     const response = await platform.retrieve("customerdetails.php");
 
     assert.equal(response, null, "a connection timeout should return null");
-    assert.ok(loggedAt(lines(), "error", "Connection timed out"), "a connection timeout should be logged");
+    assert.ok(loggedAt(entries, "error", "Connection timed out"), "a connection timeout should be logged");
   });
 
   test("returns null on a request retry error", async (t) => {
 
-    const { emit, lines, platform } = buildPlatform();
+    const { emit, entries, platform } = buildPlatform();
 
     t.after(() => emit(SHUTDOWN_EVENT));
     await using dispatcher = installMockDispatcher();
@@ -142,12 +143,12 @@ describe("HydrawisePlatform retrieve", () => {
     const response = await platform.retrieve("customerdetails.php");
 
     assert.equal(response, null, "a request retry error should return null");
-    assert.ok(loggedAt(lines(), "error", "Unable to connect to the Hydrawise API"), "a request retry error should be logged");
+    assert.ok(loggedAt(entries, "error", "Unable to connect to the Hydrawise API"), "a request retry error should be logged");
   });
 
   test("classifies a wrapped refused connection by the errno in its cause", async (t) => {
 
-    const { emit, lines, platform } = buildPlatform();
+    const { emit, entries, platform } = buildPlatform();
 
     t.after(() => emit(SHUTDOWN_EVENT));
     await using dispatcher = installMockDispatcher();
@@ -160,12 +161,12 @@ describe("HydrawisePlatform retrieve", () => {
     const response = await platform.retrieve("customerdetails.php");
 
     assert.equal(response, null, "a refused connection should return null");
-    assert.ok(loggedAt(lines(), "error", "Connection refused"), "ECONNREFUSED should log the refused message");
+    assert.ok(loggedAt(entries, "error", "Connection refused"), "ECONNREFUSED should log the refused message");
   });
 
   test("classifies a wrapped reset connection by the errno in its cause", async (t) => {
 
-    const { emit, lines, platform } = buildPlatform();
+    const { emit, entries, platform } = buildPlatform();
 
     t.after(() => emit(SHUTDOWN_EVENT));
     await using dispatcher = installMockDispatcher();
@@ -178,12 +179,12 @@ describe("HydrawisePlatform retrieve", () => {
     const response = await platform.retrieve("customerdetails.php");
 
     assert.equal(response, null, "a reset connection should return null");
-    assert.ok(loggedAt(lines(), "error", "Connection has been reset"), "ECONNRESET should log the reset message");
+    assert.ok(loggedAt(entries, "error", "Connection has been reset"), "ECONNRESET should log the reset message");
   });
 
   test("classifies a wrapped unresolved hostname by the errno in its cause", async (t) => {
 
-    const { emit, lines, platform } = buildPlatform();
+    const { emit, entries, platform } = buildPlatform();
 
     t.after(() => emit(SHUTDOWN_EVENT));
     await using dispatcher = installMockDispatcher();
@@ -196,12 +197,12 @@ describe("HydrawisePlatform retrieve", () => {
     const response = await platform.retrieve("customerdetails.php");
 
     assert.equal(response, null, "an unresolved hostname should return null");
-    assert.ok(loggedAt(lines(), "error", "Hostname or IP address not found"), "ENOTFOUND should log the not-found message");
+    assert.ok(loggedAt(entries, "error", "Hostname or IP address not found"), "ENOTFOUND should log the not-found message");
   });
 
   test("logs the raw error for a cause code no sentence covers", async (t) => {
 
-    const { emit, lines, platform } = buildPlatform();
+    const { emit, entries, platform } = buildPlatform();
 
     t.after(() => emit(SHUTDOWN_EVENT));
     await using dispatcher = installMockDispatcher();
@@ -214,12 +215,12 @@ describe("HydrawisePlatform retrieve", () => {
     const response = await platform.retrieve("customerdetails.php");
 
     assert.equal(response, null, "an unrecognized cause should still return null");
-    assert.ok(loggedAt(lines(), "error", "EPIPE"), "an unrecognized cause code should be logged verbatim");
+    assert.ok(loggedAt(entries, "error", "EPIPE"), "an unrecognized cause code should be logged verbatim");
   });
 
   test("classifies a refused connection in the bare shape undici's request() throws", async (t) => {
 
-    const { emit, lines, platform } = buildPlatform();
+    const { emit, entries, platform } = buildPlatform();
 
     t.after(() => emit(SHUTDOWN_EVENT));
     await using dispatcher = installMockDispatcher();
@@ -229,49 +230,49 @@ describe("HydrawisePlatform retrieve", () => {
      * than against one of them.
      */
     dispatcher.agent.get(HYDRAWISE_ORIGIN).intercept({ method: "GET", path: (path: string): boolean => path.includes("customerdetails.php") })
-      .replyWithError(Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }));
+      .replyWithError(errnoError("connect ECONNREFUSED", "ECONNREFUSED"));
 
     const response = await platform.retrieve("customerdetails.php");
 
     assert.equal(response, null, "a refused connection should return null");
-    assert.ok(loggedAt(lines(), "error", "Connection refused"), "a bare ECONNREFUSED should log the refused message");
+    assert.ok(loggedAt(entries, "error", "Connection refused"), "a bare ECONNREFUSED should log the refused message");
   });
 
   test("classifies a reset connection in the bare shape undici's request() throws", async (t) => {
 
-    const { emit, lines, platform } = buildPlatform();
+    const { emit, entries, platform } = buildPlatform();
 
     t.after(() => emit(SHUTDOWN_EVENT));
     await using dispatcher = installMockDispatcher();
     dispatcher.agent.get(HYDRAWISE_ORIGIN).intercept({ method: "GET", path: (path: string): boolean => path.includes("customerdetails.php") })
-      .replyWithError(Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }));
+      .replyWithError(errnoError("socket hang up", "ECONNRESET"));
 
     const response = await platform.retrieve("customerdetails.php");
 
     assert.equal(response, null, "a reset connection should return null");
-    assert.ok(loggedAt(lines(), "error", "Connection has been reset"), "a bare ECONNRESET should log the reset message");
+    assert.ok(loggedAt(entries, "error", "Connection has been reset"), "a bare ECONNRESET should log the reset message");
   });
 
   test("classifies a temporary resolver failure as a hostname that did not resolve", async (t) => {
 
-    const { emit, lines, platform } = buildPlatform();
+    const { emit, entries, platform } = buildPlatform();
 
     t.after(() => emit(SHUTDOWN_EVENT));
     await using dispatcher = installMockDispatcher();
 
     // EAI_AGAIN is what a struggling resolver answers with in place of ENOTFOUND. Both mean the name did not resolve, so both read as the one sentence that says so.
     dispatcher.agent.get(HYDRAWISE_ORIGIN).intercept({ method: "GET", path: (path: string): boolean => path.includes("customerdetails.php") })
-      .replyWithError(Object.assign(new Error("getaddrinfo EAI_AGAIN"), { code: "EAI_AGAIN" }));
+      .replyWithError(errnoError("getaddrinfo EAI_AGAIN", "EAI_AGAIN"));
 
     const response = await platform.retrieve("customerdetails.php");
 
     assert.equal(response, null, "a temporary resolver failure should return null");
-    assert.ok(loggedAt(lines(), "error", "Hostname or IP address not found"), "EAI_AGAIN should log the not-found message");
+    assert.ok(loggedAt(entries, "error", "Hostname or IP address not found"), "EAI_AGAIN should log the not-found message");
   });
 
   test("reports a request dispatched against a destroyed connection pool", async (t) => {
 
-    const { emit, lines, platform } = buildPlatform();
+    const { emit, entries, platform } = buildPlatform();
 
     t.after(() => emit(SHUTDOWN_EVENT));
     await using dispatcher = installMockDispatcher();
@@ -284,12 +285,12 @@ describe("HydrawisePlatform retrieve", () => {
     const response = await platform.retrieve("customerdetails.php");
 
     assert.equal(response, null, "a request against a destroyed pool should return null");
-    assert.ok(loggedAt(lines(), "error", "interrupted while the connection was being reset"), "a destroyed pool should log the interrupted-request message");
+    assert.ok(loggedAt(entries, "error", "interrupted while the connection was being reset"), "a destroyed pool should log the interrupted-request message");
   });
 
   test("classifies an expired certificate as a certificate verification failure", async (t) => {
 
-    const { emit, lines, platform } = buildPlatform();
+    const { emit, entries, platform } = buildPlatform();
 
     t.after(() => emit(SHUTDOWN_EVENT));
     await using dispatcher = installMockDispatcher();
@@ -297,17 +298,17 @@ describe("HydrawisePlatform retrieve", () => {
     // An expired certificate arrives carrying the platform's own verification verdict as its code, and a host clock set wrong is its usual cause, which is why
     // the sentence asks the user to check the host's date and time.
     dispatcher.agent.get(HYDRAWISE_ORIGIN).intercept({ method: "GET", path: (path: string): boolean => path.includes("customerdetails.php") })
-      .replyWithError(Object.assign(new Error("certificate has expired"), { code: "CERT_HAS_EXPIRED" }));
+      .replyWithError(errnoError("certificate has expired", "CERT_HAS_EXPIRED"));
 
     const response = await platform.retrieve("customerdetails.php");
 
     assert.equal(response, null, "a certificate failure should return null");
-    assert.ok(loggedAt(lines(), "error", "Certificate verification failed for the Hydrawise API"), "CERT_HAS_EXPIRED should log the certificate message");
+    assert.ok(loggedAt(entries, "error", "Certificate verification failed for the Hydrawise API"), "CERT_HAS_EXPIRED should log the certificate message");
   });
 
   test("returns null and re-arms networking on the request timeout branch", { timeout: 15000 }, async (t) => {
 
-    const { emit, lines, platform } = buildPlatform();
+    const { emit, entries, platform } = buildPlatform();
 
     t.after(() => emit(SHUTDOWN_EVENT));
     await using dispatcher = installMockDispatcher();
@@ -320,12 +321,12 @@ describe("HydrawisePlatform retrieve", () => {
     const response = await platform.retrieve("customerdetails.php");
 
     assert.equal(response, null, "a request that exceeds the timeout budget should return null");
-    assert.ok(loggedAt(lines(), "error", "taking too long"), "the timeout branch should log the slow-response message");
+    assert.ok(loggedAt(entries, "error", "taking too long"), "the timeout branch should log the slow-response message");
   });
 
   test("returns null and re-arms networking on a response deadline", async (t) => {
 
-    const { emit, lines, platform } = buildPlatform();
+    const { emit, entries, platform } = buildPlatform();
 
     t.after(() => emit(SHUTDOWN_EVENT));
     await using dispatcher = installMockDispatcher();
@@ -340,7 +341,7 @@ describe("HydrawisePlatform retrieve", () => {
     const response = await platform.retrieve("customerdetails.php");
 
     assert.equal(response, null, "a response deadline should return null");
-    assert.ok(loggedAt(lines(), "error", "taking too long"), "a response deadline should log the slow-response message");
+    assert.ok(loggedAt(entries, "error", "taking too long"), "a response deadline should log the slow-response message");
     assert.notEqual(dispatcherOf(platform), armed, "the deadline re-arms the stack, so the platform holds a different dispatcher");
     assert.equal(armed?.destroyed, true, "and the pool it replaced was destroyed rather than left open");
   });

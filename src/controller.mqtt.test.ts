@@ -8,8 +8,8 @@
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
 /* eslint-disable camelcase */
 import type { HydrawiseControllerV2Facts, HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
-import { assertNoUnhandledRejections, firstOf } from "./testing.helpers.ts";
-import { buildController, loggedAt, makeV2Facts, makeZoneV2Facts, waitFor } from "./testing/platform.helpers.ts";
+import { assertNoUnhandledRejections, expectAt, loggedAt, waitUntil } from "homebridge-plugin-utils/testing";
+import { buildController, makeV2Facts, makeZoneV2Facts } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
 import type { BuildControllerResult } from "./testing/platform.helpers.ts";
@@ -41,14 +41,14 @@ describe("HydrawiseController MQTT", () => {
     assert.ok(h.mqtt, "the MQTT recorder should be attached");
     const mqtt = h.mqtt;
 
-    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
+    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
 
     const payload = await mqtt.invokeGet("controller/get");
 
     assert.ok(payload, "the get handler should answer a payload");
 
     const parsed = JSON.parse(payload) as { name: string; relay: number }[];
-    const zone = firstOf(parsed, "status zone");
+    const zone = expectAt(parsed, 0, "status zone");
 
     assert.equal(zone.relay, 1, "the status JSON should carry the zone relay number");
     assert.equal(zone.name, "Alpha", "the status JSON should carry the zone name");
@@ -67,13 +67,13 @@ describe("HydrawiseController MQTT", () => {
     assert.ok(h.mqtt, "the MQTT recorder should be attached");
     const mqtt = h.mqtt;
 
-    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
+    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
     await mqtt.invokeSet("controller/set", "start 1 300");
 
-    const command = firstOf(h.retrieve.callsTo("setzone.php"), "setzone call");
+    const command = expectAt(h.retrieve.callsTo("setzone.php"), 0, "setzone call");
 
     assert.equal(command.params?.["action"], "run", "a start command should send the run action");
-    assert.equal(command.params?.["custom"], "300", "a start command should carry the requested duration");
+    assert.equal(command.params["custom"], "300", "a start command should carry the requested duration");
   });
 
   test("the set handler stops a zone on a stop command", async (t) => {
@@ -89,10 +89,10 @@ describe("HydrawiseController MQTT", () => {
     assert.ok(h.mqtt, "the MQTT recorder should be attached");
     const mqtt = h.mqtt;
 
-    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
+    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
     await mqtt.invokeSet("controller/set", "stop 1");
 
-    const command = firstOf(h.retrieve.callsTo("setzone.php"), "setzone call");
+    const command = expectAt(h.retrieve.callsTo("setzone.php"), 0, "setzone call");
 
     assert.equal(command.params?.["action"], "stop", "a stop command should send the stop action");
   });
@@ -110,7 +110,7 @@ describe("HydrawiseController MQTT", () => {
     assert.ok(h.mqtt, "the MQTT recorder should be attached");
     const mqtt = h.mqtt;
 
-    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
+    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
     await mqtt.invokeSet("controller/set", "start 1 0");
 
     // A run command with a non-positive duration returns null from sendCommand before it reaches the wire, so no setzone call is recorded.
@@ -131,13 +131,13 @@ describe("HydrawiseController MQTT", () => {
     assert.ok(h.mqtt, "the MQTT recorder should be attached");
     const mqtt = h.mqtt;
 
-    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
+    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
     await mqtt.invokeSet("controller/set", "start 1");
 
-    const command = firstOf(h.retrieve.callsTo("setzone.php"), "setzone call");
+    const command = expectAt(h.retrieve.callsTo("setzone.php"), 0, "setzone call");
 
     assert.equal(command.params?.["action"], "run", "a start with no duration should still send the run action");
-    assert.equal(command.params?.["custom"], zone.run.toString(), "and carry the zone's own run value as its duration");
+    assert.equal(command.params["custom"], zone.run.toString(), "and carry the zone's own run value as its duration");
   });
 
   test("a start whose duration is not an integer is refused and sends no wire command", async (t) => {
@@ -153,7 +153,7 @@ describe("HydrawiseController MQTT", () => {
     assert.ok(h.mqtt, "the MQTT recorder should be attached");
     const mqtt = h.mqtt;
 
-    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
+    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
     await assert.rejects(() => mqtt.invokeSet("controller/set", "start 1 abc"), /^Error: MQTT: Invalid duration specified\.$/,
       "a duration that does not parse to an integer should throw");
 
@@ -174,7 +174,7 @@ describe("HydrawiseController MQTT", () => {
     assert.ok(h.mqtt, "the MQTT recorder should be attached");
     const mqtt = h.mqtt;
 
-    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
+    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
     await assert.rejects(() => mqtt.invokeSet("controller/set", "start 1"), /^Error: MQTT: No duration given and the zone has no scheduled run\.$/,
       "a start with no duration has nothing to run for on a zone with no scheduled run");
 
@@ -191,7 +191,7 @@ describe("HydrawiseController MQTT", () => {
     assert.ok(h.mqtt, "the MQTT recorder should be attached");
     const mqtt = h.mqtt;
 
-    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
+    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
     await assert.rejects(() => mqtt.invokeSet("controller/set", "start 99 300"), /Invalid zone specified/, "a command for an unknown zone should throw");
   });
 
@@ -205,7 +205,7 @@ describe("HydrawiseController MQTT", () => {
     assert.ok(h.mqtt, "the MQTT recorder should be attached");
     const mqtt = h.mqtt;
 
-    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
+    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
     await assert.rejects(() => mqtt.invokeSet("controller/set", "toggle 1"), /Invalid command/, "an unknown command should throw");
   });
 
@@ -219,9 +219,9 @@ describe("HydrawiseController MQTT", () => {
     assert.ok(h.mqtt, "the MQTT recorder should be attached");
     const mqtt = h.mqtt;
 
-    await waitFor(() => (mqtt.published.length >= 1) ? true : undefined);
+    await waitUntil(() => mqtt.published.length >= 1, { description: "the first MQTT publish" });
 
-    const record = firstOf(mqtt.published, "MQTT publish");
+    const record = expectAt(mqtt.published, 0, "MQTT publish");
 
     assert.ok(record.topic.endsWith("controller"), "the publish topic should be the controller topic");
     assert.ok(String(record.payload).includes("Alpha"), "the published payload should carry the zone status");
@@ -229,30 +229,30 @@ describe("HydrawiseController MQTT", () => {
 
   test("a publish rejection is guarded into the log rather than an unhandled rejection", async (t) => {
 
-    const cleanup = assertNoUnhandledRejections();
-    const h = buildController({ mqtt: true, program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([runningZone()]),
-      kind: "response" }), signalAborted: false });
+    await assertNoUnhandledRejections(async () => {
 
-    t.after(() => h.abort());
+      const h = buildController({ mqtt: true, program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([runningZone()]),
+        kind: "response" }), signalAborted: false });
 
-    assert.ok(h.mqtt, "the MQTT recorder should be attached");
-    const mqtt = h.mqtt;
+      t.after(() => h.abort());
 
-    // Arm the publish rejection before the first poll's publish fires; the client's guarded publish must route it to the log.
-    mqtt.publishRejection = new Error("broker gone");
+      assert.ok(h.mqtt, "the MQTT recorder should be attached");
+      const mqtt = h.mqtt;
 
-    /* The failure line names the topic it could not reach, and that topic opens with this controller's serial. A household running several controllers reads
-     * which one lost its broker from exactly that, so the assertion covers the named topic rather than the generic opening alone.
-     */
-    const failureLine = "Unable to publish to the MQTT topic " + h.controllerConfig.serial_number + "/controller";
+      // Arm the publish rejection before the first poll's publish fires; the client's guarded publish must route it to the log.
+      mqtt.publishRejection = new Error("broker gone");
 
-    await waitFor(() => loggedAt(h.lines(), "error", failureLine) ? true : undefined);
+      /* The failure line names the topic it could not reach, and that topic opens with this controller's serial. A household running several controllers reads
+       * which one lost its broker from exactly that, so the assertion covers the named topic rather than the generic opening alone.
+       */
+      const failureLine = "Unable to publish to the MQTT topic " + h.controllerConfig.serial_number + "/controller";
 
-    assert.ok(loggedAt(h.lines(), "error", failureLine), "a rejected publish should be reported by the client's guarded publish, naming its topic");
-    assert.equal(mqtt.published.length, 0, "and nothing should be recorded as published");
-    assert.ok(mqtt.rejectedPublishes >= 1, "while the refusal itself is counted");
+      await waitUntil(() => loggedAt(h.entries, "error", failureLine), { description: "the failure line at error level" });
 
-    cleanup();
+      assert.ok(loggedAt(h.entries, "error", failureLine), "a rejected publish should be reported by the client's guarded publish, naming its topic");
+      assert.equal(mqtt.published.length, 0, "and nothing should be recorded as published");
+      assert.ok(mqtt.rejectedPublishes >= 1, "while the refusal itself is counted");
+    });
   });
 });
 
@@ -310,7 +310,7 @@ describe("HydrawiseController MQTT with account facts", () => {
 
     t.after(() => h.abort());
 
-    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
+    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
 
     assert.deepEqual(await payloadOf(h), [ { name: "Alpha", relay: 1, run: 0, time: HYDRAWISE_UNSCHEDULED_SENTINEL, timestr: "" },
       { name: "Beta", relay: 2, run: 0, time: HYDRAWISE_UNSCHEDULED_SENTINEL, timestr: "" } ], "no additive key reaches a key-based install");
@@ -323,7 +323,7 @@ describe("HydrawiseController MQTT with account facts", () => {
 
     t.after(() => h.abort());
 
-    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
+    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
 
     h.controller.applyFacts({ facts: oneSuspended(), fetchedAt: Math.floor(Date.now() / 1000) });
 
@@ -333,13 +333,13 @@ describe("HydrawiseController MQTT with account facts", () => {
      * check against the whole payload could not tell a correctly attributed instant from one landed on the wrong zone.
      */
     assert.equal(parsed[0]?.state, "suspended", "the suspended zone reports its classified state");
-    assert.equal(parsed[0]?.suspendedUntil, SUSPENDED_UNTIL, "and carries its own suspension instant");
+    assert.equal(parsed[0].suspendedUntil, SUSPENDED_UNTIL, "and carries its own suspension instant");
     assert.equal(parsed[1]?.state, "unscheduled", "its sibling reports its own state");
-    assert.ok(!("suspendedUntil" in (parsed[1] ?? {})), "and carries no suspension instant at all");
+    assert.ok(!("suspendedUntil" in parsed[1]), "and carries no suspension instant at all");
 
     // The zone's base wire fields are untouched beneath the additions, which is what makes this sharpening additive rather than a reshaping.
-    assert.equal(parsed[0]?.name, "Alpha", "the wire name is unchanged");
-    assert.equal(parsed[0]?.time, HYDRAWISE_UNSCHEDULED_SENTINEL, "and so is the wire time");
+    assert.equal(parsed[0].name, "Alpha", "the wire name is unchanged");
+    assert.equal(parsed[0].time, HYDRAWISE_UNSCHEDULED_SENTINEL, "and so is the wire time");
   });
 
   test("a credentialed install whose snapshot has aged out publishes the key-based payload byte for byte", async (t) => {
@@ -352,7 +352,7 @@ describe("HydrawiseController MQTT with account facts", () => {
 
     t.after(() => h.abort());
 
-    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001") ? true : undefined);
+    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
 
     h.controller.applyFacts({ facts: oneSuspended(), fetchedAt: Math.floor(Date.now() / 1000) - (HYDRAWISE_V2_FACTS_TTL + 1) });
 

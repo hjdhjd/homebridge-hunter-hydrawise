@@ -19,50 +19,16 @@ import type { HomebridgePluginLogging, Nullable, RateBudget } from "homebridge-p
 import type { HydrawiseAccessory, HydrawiseControllerConfig, HydrawiseControllerHardware, HydrawiseControllerIdentity, HydrawiseControllerV2Facts,
   HydrawiseV2MutationResult, HydrawiseZoneSuspensionResult, HydrawiseZoneV2Facts } from "../types.ts";
 import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
+import { TestMqttClient, capturingLog, present, waitUntil } from "homebridge-plugin-utils/testing";
 import { featureOptionCategories, featureOptions } from "../options.ts";
-import type { CapturedLogLine } from "../testing.helpers.ts";
 import type { Dispatcher } from "undici";
 import { HYDRAWISE_API_BASE_URL } from "../settings.ts";
 import { HydrawiseController } from "../controller.ts";
 import type { HydrawiseOptions } from "../options.ts";
 import { HydrawisePlatform } from "../platform.ts";
-import { TestMqttClient } from "homebridge-plugin-utils/testing";
-import { capturingLog } from "../testing.helpers.ts";
-import { setTimeout as delay } from "node:timers/promises";
+import type { TestLogEntry } from "homebridge-plugin-utils/testing";
 import { syntheticController } from "../api.fixtures.ts";
-import util from "node:util";
 import { zoneAccessoryId } from "../types.ts";
-
-/**
- * Scan captured log lines for one at the given level whose fully-formatted text contains the substring. The plugin logs printf-style (a format string plus
- * separate args) through the prefixedLog wrapper, so a raw message-field match would miss any value carried in the args; formatting each line through util.format
- * reproduces the operator-visible text - the controller name prefix, the interpolated values, and all - before the substring check.
- *
- * @param lines     - The captured log lines from a harness result's lines() accessor.
- * @param level     - The log level to match.
- * @param substring - The text to find in the formatted line.
- *
- * @returns True when at least one line at the level formats to a string containing the substring.
- */
-export function loggedAt(lines: CapturedLogLine[], level: CapturedLogLine["level"], substring: string): boolean {
-
-  return lines.some(line => (line.level === level) && util.format(line.message, ...line.args).includes(substring));
-}
-
-/**
- * Count the captured log lines at the given level whose fully-formatted text contains the substring. Used where a test asserts a line appeared a specific number
- * of times - for example that a repeated discovery pass logged its success line twice.
- *
- * @param lines     - The captured log lines from a harness result's lines() accessor.
- * @param level     - The log level to match.
- * @param substring - The text to find in the formatted line.
- *
- * @returns The number of matching lines.
- */
-export function countLogged(lines: CapturedLogLine[], level: CapturedLogLine["level"], substring: string): number {
-
-  return lines.filter(line => (line.level === level) && util.format(line.message, ...line.args).includes(substring)).length;
-}
 
 /* The library's recording MqttClient double, re-exported so every suite reaches it through this one harness module, exactly as it reaches every other double
  * here. It mirrors the real client's observable behavior - the suffix the client appends to a get or set registration, the republish a get answers with, the
@@ -80,7 +46,7 @@ export interface RecordedRetrieveCall {
 }
 
 /* A single programmed response for the retrieve recorder. "response" resolves body.json() to the given body; "null" returns null (the recoverable-error shape
- * the callers treat as a failed poll or command); "malformed" returns a response whose body.json() rejects (the malformed-body shape bug 10 pins).
+ * the callers treat as a failed poll or command); "malformed" returns a response whose body.json() rejects (the malformed-body shape behind bug 10).
  */
 export type ProgrammedResponse =
   { body: unknown; kind: "response"; statusCode?: number } |
@@ -199,7 +165,7 @@ export interface MakeTestPlatformOptions {
   signalAborted?: boolean;
 
   /* A REAL account-credentialed client for the suspension surface to delegate to, built by the test from the platform double's own log so every layer's lines land
-   * in one capture buffer. That shared buffer is the point: a pin about how many voices narrate one failure can only be written where all of them are recorded.
+   * in one capture buffer. That shared buffer is the point: an assertion about how many voices narrate one failure can only be written where all of them are recorded.
    *
    * It is a factory rather than a client because the log does not exist until this double is built, and answering the question this option exists for means the
    * client must write into that same log rather than one of its own.
@@ -207,7 +173,7 @@ export interface MakeTestPlatformOptions {
   suspensionClient?: (log: HomebridgePluginLogging) => Pick<TestV2Client, "setZoneSuspension">;
 
   // The answer the per-zone suspension surface gives when no client is supplied above, or a function of the one-based command number so a test can answer
-  // differently command by command. Defaults to accepting every command, which is what a test pinning anything other than a refusal wants.
+  // differently command by command. Defaults to accepting every command, which is what a test asserting anything other than a refusal wants.
   suspensionResult?: HydrawiseZoneSuspensionResult | ((command: number) => HydrawiseZoneSuspensionResult);
   userOptions?: string[];
 }
@@ -217,8 +183,10 @@ export interface MakeTestPlatformOptions {
 export interface MakeTestPlatformResult {
 
   abort: (reason?: string) => void;
+
+  // Every line the platform double logged, read live: the array grows as the code under test logs, so a read always sees everything logged so far.
+  entries: readonly TestLogEntry[];
   flushes: TestAccessory[][];
-  lines: () => CapturedLogLine[];
   mqtt: Nullable<TestMqttClient>;
   platform: TestPlatform;
 
@@ -242,7 +210,7 @@ export interface MakeTestPlatformResult {
  */
 export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTestPlatformResult {
 
-  const { lines, logger } = capturingLog();
+  const log = capturingLog();
   const signalController = new AbortController();
 
   if(options.signalAborted ?? true) {
@@ -250,7 +218,7 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
     signalController.abort("pre-aborted");
   }
 
-  const mqtt = options.mqtt ? new TestMqttClient({ log: logger }) : null;
+  const mqtt = options.mqtt ? new TestMqttClient({ log }) : null;
 
   /* The REAL timer registry, not a double. A double stands in for an I/O surface - the recording MQTT client for a network client, the retrieve recorder for the
    * wire - while a pure in-memory, signal-scoped mechanism runs its production self here, exactly as the FeatureOptions engine and the platform's rate budgets do.
@@ -268,14 +236,14 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
    * the real method reaches the account-credentialed client, which no controller test may ever touch. The programmed answer is what drives the controller's own
    * success, revert, and refusal paths.
    */
-  const suspensionClient = options.suspensionClient?.(logger);
+  const suspensionClient = options.suspensionClient?.(log);
 
   const setZoneSuspension: HydrawisePlatform["setZoneSuspension"] = async (request) => {
 
     suspensions.push(request);
 
     // With a real client supplied, this stands in only for the platform's mapping - which passes the client's answer through untouched - so the command runs the
-    // whole production path beneath it. The platform's own outcome mapping is pinned in its own suite.
+    // whole production path beneath it. The platform's own outcome mapping is asserted in its own suite.
     if(suspensionClient) {
 
       return suspensionClient.setZoneSuspension(request);
@@ -288,7 +256,7 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
 
   /* A THIN EXECUTOR standing in for the platform's zone-accessory reconcile, not a second copy of its policy. It records the call, keeps one accessory per
    * requested zone (reusing a stored one, whether the stub made it or a test seeded it), and drops the entries the request does not name. The grace window,
-   * the context writes, and the promotion-failure containment are the platform's contract and are pinned in its own suite, so nothing of them is reimplemented
+   * the context writes, and the promotion-failure containment are the platform's contract and are asserted in its own suite, so nothing of them is reimplemented
    * here: the stub honors exactly what each call asks for.
    *
    * It NEVER calls updatePlatformAccessories. The roster suite asserts exact flush counts across multi-poll runs, so a stub that flushed would break that net
@@ -341,7 +309,7 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
     featureOptions: featureOpts,
     hap: testHap,
     hasV2Client: options.hasV2Client ?? false,
-    log: logger,
+    log,
     mqtt,
     reconcileZoneAccessories,
     retrieve: retrieve.retrieve,
@@ -350,7 +318,7 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
     timers
   };
 
-  /* The teardown lever: the platform signal first, then the MQTT double, which is the pairing production wires - the client's lifetime rides the platform's own
+  /* The teardown lever: the platform signal first, then the MQTT double, which is the pairing production wires - the client's lifetime is bound to the platform's own
    * shutdown signal, so the two fall together. A test that reaches past this lever and aborts signalController directly leaves the double running, on the same
    * terms as every other handle this harness returns.
    */
@@ -360,7 +328,7 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
     mqtt?.abort();
   };
 
-  return { abort, flushes, lines, mqtt, platform, reconciles, retrieve, signalController, suspensions, zoneAccessories };
+  return { abort, entries: log.entries, flushes, mqtt, platform, reconciles, retrieve, signalController, suspensions, zoneAccessories };
 }
 
 // Options for buildController: the controller-config overrides, an optional program hook, and everything makeTestPlatform accepts.
@@ -550,7 +518,7 @@ export function dispatcherOf(platform: HydrawisePlatform): { destroyed: boolean 
 }
 
 /**
- * Read the platform's two rate budgets through their private fields, so a wiring test can assert on the capacities they were constructed with and on the slots a
+ * Read the platform's key-based rate budgets through their private fields, so a wiring test can assert on the capacities they were constructed with and on the slots a
  * sequence of retrieve() calls consumed. The privacy this reaches past is compile-time only, which is this codebase's posture for every private member, so the
  * cast is confined here exactly as dispatcherOf confines its own: no production code outside the platform can name these budgets without deliberately repeating
  * the same cast.
@@ -664,7 +632,7 @@ export async function refreshV2FactsOnce(platform: HydrawisePlatform): Promise<v
 
 /**
  * Build a recording double of the account-credentialed client, answering a programmed facts result and counting how many times it was asked. The count is what the
- * single-start and cadence pins read: a second refresh loop, or a discovery re-entry that started one, shows up here as extra calls.
+ * single-start and cadence assertions read: a second refresh loop, or a discovery re-entry that started one, shows up here as extra calls.
  *
  * The programmed result may be a FUNCTION of the call number, which is what lets a test answer differently tick by tick - a failed first fetch followed by a
  * successful retry, say - without reaching for a mutable variable in the test body.
@@ -686,13 +654,13 @@ export function makeTestV2Client(facts: Nullable<Map<number, HydrawiseController
       return (typeof facts === "function") ? facts(fetches) : facts;
     },
 
-    // The facts double answers every command, because a test that programs facts is pinning distribution rather than commands; a test pinning commands installs a
+    // The facts double answers every command, because a test that programs facts is asserting distribution rather than commands; a test asserting commands installs a
     // real client over a MockAgent instead.
     setZoneSuspension: async (): Promise<HydrawiseV2MutationResult> => ({ status: "done" }) }, fetches: (): number => fetches };
 }
 
 /**
- * Compose one controller's account-credentialed facts, defaulting every field to the "nothing to say" answer so a test states only what it is actually pinning.
+ * Compose one controller's account-credentialed facts, defaulting every field to the "nothing to say" answer so a test states only what it is actually asserting.
  *
  * @param overrides - The facts to state: the hardware, the name, the availability, and the per-zone entries keyed by relay id.
  *
@@ -730,7 +698,8 @@ export interface BuildPlatformOptions {
 // The handles buildPlatform returns: the constructed production platform plus the API double's capture buffers and the log capture.
 export interface BuildPlatformResult extends TestApiResult {
 
-  lines: () => CapturedLogLine[];
+  // Every line the platform logged, read live, on the same terms as the controller harness reads its own.
+  entries: readonly TestLogEntry[];
   platform: HydrawisePlatform;
 }
 
@@ -741,7 +710,7 @@ export interface BuildPlatformResult extends TestApiResult {
  */
 export function buildPlatform(options: BuildPlatformOptions = {}): BuildPlatformResult {
 
-  const { lines, logger } = capturingLog();
+  const log = capturingLog();
   const apiResult = makeTestApi();
 
   // The topic and the debug flag pass through exactly as the caller supplied them, with no default of their own, because a synthesized legacy value would
@@ -757,10 +726,10 @@ export function buildPlatform(options: BuildPlatformOptions = {}): BuildPlatform
   };
 
   // The construction-boundary casts (log, api) bridge the doubles to the production constructor's parameter types.
-  const platform = new HydrawisePlatform(logger as unknown as ConstructorParameters<typeof HydrawisePlatform>[0],
+  const platform = new HydrawisePlatform(log as unknown as ConstructorParameters<typeof HydrawisePlatform>[0],
     config as unknown as ConstructorParameters<typeof HydrawisePlatform>[1], apiResult.api as ConstructorParameters<typeof HydrawisePlatform>[2]);
 
-  return { lines, platform, ...apiResult };
+  return { entries: log.entries, platform, ...apiResult };
 }
 
 // The Hydrawise API origin every retrieve() request targets. The MockAgent intercepts against this origin, derived from the same base URL production assembles its
@@ -815,7 +784,7 @@ export function programJsonReply(agent: MockAgent, endpoint: string, body: objec
 
 /**
  * Program a persisted JSON reply for a Hydrawise endpoint that also counts the requests it serves. undici invokes the body callback once per matched request, so
- * the returned reader measures WIRE calls rather than logical retrieve() calls. That is the distinction a rate-budget pin rests on: a draw that was dispatched
+ * the returned reader measures WIRE calls rather than logical retrieve() calls. That is the distinction a rate-budget assertion rests on: a draw that was dispatched
  * instead of awaited lets its caller fall straight through to the request, which shows up here as a request the ceiling should have withheld.
  *
  * @param agent    - The MockAgent returned by installMockDispatcher.
@@ -840,7 +809,7 @@ export function programCountedReply(agent: MockAgent, endpoint: string, body: ob
 }
 
 /**
- * Program a reply that carries a body but a non-JSON status code path, used to drive retrieve()'s status classification. Matched by endpoint substring, one-shot
+ * Program a reply that carries a body but a non-JSON status code path, which drives retrieve()'s status classification. Matched by endpoint substring, one-shot
  * unless persisted by the caller's scenario.
  *
  * @param agent      - The MockAgent returned by installMockDispatcher.
@@ -854,38 +823,35 @@ export function programStatusReply(agent: MockAgent, endpoint: string, statusCod
 }
 
 /**
- * Poll a synchronous predicate until it returns a non-undefined value, yielding through a real short timer between attempts so work waiting on a real event-loop
- * turn - a MockAgent round trip, a fast polling-loop cadence - can complete. Unlike expectAt (which drains only the microtask queue), this advances real time,
- * which is what a MockAgent-driven or live-loop assertion needs. Bounded by a millisecond budget so a never-satisfied predicate fails rather than hanging.
+ * Wait for a read to answer a value, and hand that value back. This is the value-consuming form of the library's waitUntil, on its cadence and its deadline: a
+ * wait whose result is not used calls waitUntil directly, and a wait that goes on to use what it waited for calls this.
  *
- * @param predicate - Function returning the awaited value, or undefined when not yet available.
- * @param options   - Optional timeout (default 5000ms) and poll interval (default 5ms).
+ * @param read    - Answers the awaited value, or undefined while it is not yet available.
+ * @param options - waitUntil's own options: what the wait is for, and optionally its poll interval and deadline.
  *
- * @returns The first non-undefined value the predicate returns.
+ * @returns The value the read answered when the wait was satisfied.
  *
- * @throws If the predicate never returns a value within the timeout budget.
+ * @throws If the read answers nothing but undefined within the deadline.
  */
-export async function waitFor<T>(predicate: () => T | undefined, options: { intervalMs?: number; timeoutMs?: number } = {}): Promise<T> {
+export async function waitFor<T extends object>(read: () => T | undefined, options: Parameters<typeof waitUntil>[1]): Promise<T> {
 
-  const intervalMs = options.intervalMs ?? 5;
-  const timeoutMs = options.timeoutMs ?? 5000;
-  const deadline = Date.now() + timeoutMs;
+  let value: T | undefined;
 
-  for(;;) {
+  // The predicate keeps the value it read, so the value handed back is the one that satisfied the wait rather than a second read taken a turn later.
+  await waitUntil(() => (value = read()) !== undefined, options);
 
-    const value = predicate();
+  return present(value, options.description);
+}
 
-    if(value !== undefined) {
+/* Wait until the controller has completed the given number of status polls. The wait bounds on the call AFTER the counted ones, which guarantees the last counted
+ * poll ran its whole projection before the caller reads a count or a flush, and its deadline grows with the count, one second per poll plus one, because every
+ * poll counted costs a wire call and a projection on the suite's fast cadence and a fixed deadline would hold only for the first few.
+ *
+ * @param h     - The built controller whose retrieve recorder counts the polls.
+ * @param count - The number of polls that must have completed.
+ */
+export async function pollsCompleted(h: BuildControllerResult, count: number): Promise<void> {
 
-      return value;
-    }
-
-    if(Date.now() >= deadline) {
-
-      throw new Error("waitFor: predicate did not yield a value within " + timeoutMs.toString() + "ms.");
-    }
-
-    // eslint-disable-next-line no-await-in-loop
-    await delay(intervalMs);
-  }
+  await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length > count,
+    { description: "status poll " + String(count + 1) + " to begin", timeoutMs: (count + 1) * 1000 });
 }

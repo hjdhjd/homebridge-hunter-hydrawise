@@ -1,11 +1,11 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
  * platform.budgets.test.ts: The rate ceilings retrieve() enforces, exercised against a REAL platform whose undici traffic runs through a MockAgent
- * installed as the global dispatcher after construction. Pins the capacities the platform constructs its budgets at, which budget each endpoint draws against,
- * and - the pin the whole mechanism rests on - that both draws are AWAITED, by saturating a ceiling and proving the blocked call put nothing on the wire before
+ * installed as the global dispatcher after construction. Asserts the capacities the platform constructs its budgets at, which budget each endpoint draws against,
+ * and - the assertion the whole mechanism rests on - that both draws are AWAITED, by saturating a ceiling and proving the blocked call put nothing on the wire before
  * shutdown resolved it to the quiet null every caller of retrieve() expects.
  *
- * Draw ORDER (the command ceiling before the account ceiling) is deliberately not pinned here. The budgets are independent objects, so no order between them
+ * Draw ORDER (the command ceiling before the account ceiling) is deliberately not asserted here. The budgets are independent objects, so no order between them
  * is observable from outside without a production test hook this suite refuses to add; the order is a structural property of two adjacent awaits and is verified
  * by reading the diff, while what these tests verify is that each ceiling is independently enforced by an awaited draw.
  */
@@ -35,7 +35,7 @@ const CALLS_WELL_UNDER_CEILING = 3;
 
 describe("HydrawisePlatform rate budgets", () => {
 
-  test("constructs both budgets at the documented capacities", (t) => {
+  test("constructs each budget at its documented capacity", (t) => {
 
     const { emit, platform } = buildPlatform();
 
@@ -60,7 +60,7 @@ describe("HydrawisePlatform rate budgets", () => {
 
     for(let call = 0; call < CALLS_WELL_UNDER_CEILING; call++) {
 
-      // The calls run one after another rather than in parallel, because what is being pinned is how many slots a SEQUENCE of admitted calls consumes.
+      // The calls run one after another rather than in parallel, because what is being asserted is how many slots a SEQUENCE of admitted calls consumes.
       // eslint-disable-next-line no-await-in-loop
       const response = await platform.retrieve("statusschedule.php");
 
@@ -75,7 +75,7 @@ describe("HydrawisePlatform rate budgets", () => {
     assert.equal(budgets.command.available, HYDRAWISE_COMMAND_BUDGET_CALLS, "an endpoint that is not a zone command leaves the command budget untouched");
   });
 
-  test("a zone command draws both ceilings", async (t) => {
+  test("a zone command draws the account ceiling and the command ceiling", async (t) => {
 
     const { emit, platform } = buildPlatform();
 
@@ -96,7 +96,7 @@ describe("HydrawisePlatform rate budgets", () => {
 
   test("a call blocked at the saturated account ceiling puts nothing on the wire and resolves to null on shutdown", async () => {
 
-    const { emit, lines, platform } = buildPlatform();
+    const { emit, entries, platform } = buildPlatform();
 
     await using dispatcher = installMockDispatcher();
 
@@ -127,13 +127,13 @@ describe("HydrawisePlatform rate budgets", () => {
 
     assert.equal(await blocked, null, "a call blocked at the ceiling resolves to null once shutdown aborts its wait");
     assert.equal(served(), HYDRAWISE_API_BUDGET_CALLS, "the blocked call put no request on the wire");
-    assert.equal(lines().filter(line => line.level === "error").length, 0, "a shutdown reached while waiting for a slot is orderly teardown, so nothing is logged " +
+    assert.equal(entries.filter(line => line.level === "error").length, 0, "a shutdown reached while waiting for a slot is orderly teardown, so nothing is logged " +
       "at error level");
   });
 
   test("a command blocked at the saturated command ceiling puts nothing on the wire and resolves to null on shutdown", async () => {
 
-    const { emit, lines, platform } = buildPlatform();
+    const { emit, entries, platform } = buildPlatform();
 
     await using dispatcher = installMockDispatcher();
 
@@ -168,7 +168,7 @@ describe("HydrawisePlatform rate budgets", () => {
 
     assert.equal(await blocked, null, "a command blocked at the ceiling resolves to null once shutdown aborts its wait");
     assert.equal(served(), HYDRAWISE_COMMAND_BUDGET_CALLS, "the blocked command put no request on the wire");
-    assert.equal(lines().filter(line => line.level === "error").length, 0, "a shutdown reached while waiting for a slot is orderly teardown, so nothing is logged " +
+    assert.equal(entries.filter(line => line.level === "error").length, 0, "a shutdown reached while waiting for a slot is orderly teardown, so nothing is logged " +
       "at error level");
   });
 });

@@ -1,6 +1,7 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * settings.test.ts: The plugin constants. Small honest pins so a change to a rate-limit-sensitive timing value or a platform identity is a deliberate, visible edit.
+ * settings.test.ts: The plugin constants. Small honest assertions so a change to a rate-limit-sensitive timing value or a platform identity is a deliberate,
+ * visible edit.
  */
 import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_BUDGET_CALLS, HYDRAWISE_API_BUDGET_WINDOW, HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL,
   HYDRAWISE_API_TIMEOUT, HYDRAWISE_COMMAND_BUDGET_CALLS, HYDRAWISE_COMMAND_BUDGET_WINDOW, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_MQTT_TOPIC,
@@ -11,7 +12,7 @@ import assert from "node:assert/strict";
 
 describe("settings", () => {
 
-  test("pins the API timing constants", () => {
+  test("locks in the API timing constants", () => {
 
     assert.equal(HYDRAWISE_API_TIMEOUT, 7, "the per-request timeout is 7 seconds");
     assert.equal(HYDRAWISE_API_RETRY_INTERVAL, 60, "the retry interval is 60 seconds");
@@ -20,9 +21,9 @@ describe("settings", () => {
     assert.equal(HYDRAWISE_SUSPEND_DURATION, 31556926, "the suspend-all offset is one year in seconds");
   });
 
-  test("pins the documented Hydrawise rate ceilings and the command endpoint", () => {
+  test("locks in the documented Hydrawise rate ceilings and the command endpoint", () => {
 
-    // Each assertion below says whether it pins a call count or a window duration in seconds, so a swapped pair would otherwise read as a plausible ceiling.
+    // Each assertion below says whether it asserts a call count or a window duration in seconds, so a swapped pair would otherwise read as a plausible ceiling.
     assert.equal(HYDRAWISE_API_BUDGET_CALLS, 30, "the account-wide ceiling admits 30 calls");
     assert.equal(HYDRAWISE_API_BUDGET_WINDOW, 300, "the account-wide ceiling is measured over 300 seconds");
     assert.equal(HYDRAWISE_COMMAND_BUDGET_CALLS, 3, "the zone-command ceiling admits 3 calls");
@@ -44,14 +45,14 @@ describe("settings", () => {
 
   test("the command ceiling is stated as its own count and window, independent of the read ceiling", () => {
 
-    /* The command ceiling is pinned apart from the read ceiling because their separation IS the policy: commands are event-shaped user actions where the reads are
+    /* The command ceiling is asserted apart from the read ceiling because their separation IS the policy: commands are event-shaped user actions where the reads are
      * a recurring cadence, so neither number is derivable from the other and a change to either is a deliberate edit. The relationship worth asserting alongside
      * them is the one the split was made for - a command ceiling narrower than the read ceiling would put a user's own action on a tighter leash than the
      * background traffic it was separated from.
      */
     assert.equal(HYDRAWISE_V2_MUTATION_BUDGET_CALLS, 10, "the command ceiling admits 10 commands");
     assert.equal(HYDRAWISE_V2_MUTATION_BUDGET_WINDOW, 3600, "the command ceiling is measured over 3600 seconds");
-    assert.ok(HYDRAWISE_V2_MUTATION_BUDGET_CALLS > HYDRAWISE_V2_BUDGET_CALLS,
+    assert.ok((HYDRAWISE_V2_MUTATION_BUDGET_CALLS - HYDRAWISE_V2_BUDGET_CALLS) > 0,
       "and it is the more generous, which is what gives a burst of commands its headroom");
   });
 
@@ -61,7 +62,7 @@ describe("settings", () => {
     assert.equal(HYDRAWISE_V2_FACTS_TTL, HYDRAWISE_V2_REFRESH_INTERVAL * 2, "a facts snapshot outlives exactly one missed refresh");
   });
 
-  test("pins the MQTT and platform identity constants", () => {
+  test("locks in the MQTT and platform identity constants", () => {
 
     assert.equal(HYDRAWISE_MQTT_TOPIC, "hydrawise", "the default MQTT topic prefix is hydrawise");
     assert.equal(PLATFORM_NAME, "Hydrawise", "the platform name is Hydrawise");

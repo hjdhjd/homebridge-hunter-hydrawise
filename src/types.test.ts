@@ -1,14 +1,14 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
  * types.test.ts: The reserved-name constants and the fixture-versus-interface conformance check. The interfaces are compile-time contracts; this file
- * pins the reserved-name constant and its subtype compose/recognize pair, and verifies the synthetic fixtures carry the required wire fields with
+ * asserts the reserved-name constant and its subtype compose/recognize pair, and verifies the synthetic fixtures carry the required wire fields with
  * wire-accurate types.
  */
 import { HydrawiseReservedNames, isSuspendZoneSubtype, suspendZoneSubtype } from "./types.ts";
 import { UNSCHEDULED_SENTINEL, normalZoneMatrix, sentinelZoneMatrix, syntheticController, syntheticCustomerDetails } from "./api.fixtures.ts";
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { firstOf } from "./testing.helpers.ts";
+import { expectAt } from "homebridge-plugin-utils/testing";
 
 describe("hydrawise reserved names", () => {
 
@@ -19,7 +19,7 @@ describe("hydrawise reserved names", () => {
 
   test("composes and recognizes a zone's own suspension switch subtype", () => {
 
-    /* The two readings of one prefix, pinned together. Composition and recognition have to agree by construction, because the sweep that removes these switches
+    /* The two readings of one prefix, asserted together. Composition and recognition have to agree by construction, because the sweep that removes these switches
      * decides what to keep by composing and what to consider by recognizing - and a disagreement there either strands a switch or destroys one.
      */
     assert.equal(suspendZoneSubtype(700001), "Suspend.700001", "a zone's switch subtype is the reserved prefix and its relay id");
@@ -47,7 +47,7 @@ describe("fixture conformance", () => {
 
     assert.equal(typeof syntheticCustomerDetails.customer_id, "number", "customer_id is a number");
     assert.equal(syntheticCustomerDetails.controllers.length, 1, "one synthetic controller is present");
-    assert.equal(firstOf(syntheticCustomerDetails.controllers, "controller").serial_number, syntheticController.serial_number,
+    assert.equal(expectAt(syntheticCustomerDetails.controllers, 0, "controller").serial_number, syntheticController.serial_number,
       "the controller list carries the synthetic controller");
   });
 
@@ -55,7 +55,7 @@ describe("fixture conformance", () => {
 
     assert.equal(normalZoneMatrix.length, 19, "the normal matrix carries 19 zones");
 
-    const zone = firstOf(normalZoneMatrix, "zone");
+    const zone = expectAt(normalZoneMatrix, 0, "zone");
 
     assert.equal(typeof zone.name, "string", "name is a string");
     assert.equal(typeof zone.relay, "number", "relay is a number");

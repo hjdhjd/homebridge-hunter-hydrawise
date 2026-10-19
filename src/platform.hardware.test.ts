@@ -23,6 +23,7 @@ import { describe, test } from "node:test";
 import { fastPolling, makeCustomerDetails, normalSchedule } from "./api.helpers.ts";
 import assert from "node:assert/strict";
 import { syntheticController } from "./api.fixtures.ts";
+import { waitUntil } from "homebridge-plugin-utils/testing";
 import { zoneAccessoryId } from "./types.ts";
 
 const DID_FINISH_LAUNCHING = "didFinishLaunching";
@@ -97,13 +98,13 @@ describe("HydrawisePlatform hardware enrichment gate", () => {
 
   test("configures a client, and its own rate budget, when both credentials are set", (t) => {
 
-    const { emit, lines, platform } = buildPlatform({ options: CREDENTIAL_OPTIONS });
+    const { emit, entries, platform } = buildPlatform({ options: CREDENTIAL_OPTIONS });
 
     t.after(() => emit(SHUTDOWN));
 
     assert.equal(platform.hasV2Client, true, "a complete login builds the client");
     assert.equal(v2BudgetOf(platform).capacity, HYDRAWISE_V2_BUDGET_CALLS, "the account-credentialed budget carries its own ceiling");
-    assert.ok(lines().some(line => (line.level === "info") && line.message.includes("Enhanced features are enabled")),
+    assert.ok(entries.some(line => (line.level === "info") && line.message.includes("Enhanced features are enabled")),
       "turning on an off-by-default capability is reported at startup");
   });
 });
@@ -129,11 +130,13 @@ describe("HydrawisePlatform hardware distribution", () => {
     emit(DID_FINISH_LAUNCHING);
 
     // The refresh loop's first tick runs on its own schedule, so each wait is on the characteristic actually landing rather than on discovery returning.
-    const first = await waitFor(() => registered.find(accessory => accessory.UUID === syntheticController.controller_id.toString()));
-    const second = await waitFor(() => registered.find(accessory => accessory.UUID === SECOND_CONTROLLER.controller_id.toString()));
+    const first = await waitFor(() => registered.find(accessory => accessory.UUID === syntheticController.controller_id.toString()),
+      { description: "the first controller's accessory to register" });
+    const second = await waitFor(() => registered.find(accessory => accessory.UUID === SECOND_CONTROLLER.controller_id.toString()),
+      { description: "the second controller's accessory to register" });
 
-    await waitFor(() => (informationValue(first, Characteristic.Model) === FIRST_HARDWARE.model) ? true : undefined);
-    await waitFor(() => (informationValue(second, Characteristic.Model) === SECOND_HARDWARE.model) ? true : undefined);
+    await waitUntil(() => informationValue(first, Characteristic.Model) === FIRST_HARDWARE.model, { description: "the first controller's model to apply" });
+    await waitUntil(() => informationValue(second, Characteristic.Model) === SECOND_HARDWARE.model, { description: "the second controller's model to apply" });
 
     assert.equal(informationValue(first, Characteristic.FirmwareRevision), FIRST_HARDWARE.firmware, "the first controller shows its own firmware");
     assert.equal(informationValue(second, Characteristic.FirmwareRevision), SECOND_HARDWARE.firmware, "the second controller shows its own firmware");
@@ -148,7 +151,7 @@ describe("HydrawisePlatform hardware distribution", () => {
 
     /* Several surfaces persist a controller's identity, each written by a different cadence: the controller's own context (the poll), the denormalized
      * account roster every accessory carries (the refresh tick), and a standalone zone accessory's owner stamp (the poll's reconcile). They answer one
-     * question, so a name that reached only some of them would leave the webUI listing one controller under two names depending on which entry it happened
+     * question, so a name that reached only some of them would leave the webUI listing one controller under different names depending on which entry it happened
      * to read.
      */
     const { emit, platform, registered } = buildPlatform({ options: [ ...CREDENTIAL_OPTIONS, "Enable.Device.Standalone." + STANDALONE_RELAY_ID.toString() ] });
@@ -164,12 +167,15 @@ describe("HydrawisePlatform hardware distribution", () => {
     emit(DID_FINISH_LAUNCHING);
 
     const zoneUuid = zoneAccessoryId(syntheticController.controller_id, STANDALONE_RELAY_ID);
-    const controllerAccessory = await waitFor(() => registered.find(accessory => accessory.UUID === syntheticController.controller_id.toString()));
-    const zoneAccessory = await waitFor(() => registered.find(accessory => accessory.UUID === zoneUuid));
+    const controllerAccessory = await waitFor(() => registered.find(accessory => accessory.UUID === syntheticController.controller_id.toString()),
+      { description: "the first controller's accessory to register" });
+    const zoneAccessory = await waitFor(() => registered.find(accessory => accessory.UUID === zoneUuid), { description: "the zone accessory to register" });
 
     // Each surface is waited on where it is written, so a slower cadence cannot make a faster one's assertion read a value that had not landed yet.
-    await waitFor(() => (identityName(controllerAccessory, "controller") === ACCOUNT_CONTROLLER_NAME) ? true : undefined);
-    await waitFor(() => (identityName(zoneAccessory, "ownerController") === ACCOUNT_CONTROLLER_NAME) ? true : undefined);
+    await waitUntil(() => identityName(controllerAccessory, "controller") === ACCOUNT_CONTROLLER_NAME,
+      { description: "the controller identity to carry the account name" });
+    await waitUntil(() => identityName(zoneAccessory, "ownerController") === ACCOUNT_CONTROLLER_NAME,
+      { description: "the zone's owner identity to carry the account name" });
 
     assert.equal(identityName(controllerAccessory, "controller"), ACCOUNT_CONTROLLER_NAME, "the controller persists the account's name as its own identity");
     assert.deepEqual(rosterNames(controllerAccessory), [ACCOUNT_CONTROLLER_NAME], "the account roster carries it for this controller");
@@ -191,9 +197,9 @@ describe("HydrawisePlatform hardware distribution", () => {
 
     emit(DID_FINISH_LAUNCHING);
 
-    const accessory = await waitFor(() => registered[0]);
+    const accessory = await waitFor(() => registered[0], { description: "the first accessory registration" });
 
-    await waitFor(() => (fetches() >= 1) ? true : undefined);
+    await waitUntil(() => fetches() >= 1, { description: "the first account fetch" });
 
     /* A failed enrichment is not a failed startup. The accessory keeps exactly the information a user without credentials would see, which is the display the whole
      * credential gate falls back to, and it persists nothing it did not learn.
@@ -205,7 +211,7 @@ describe("HydrawisePlatform hardware distribution", () => {
 
   test("a second discovery pass starts no second refresh loop", async (t) => {
 
-    const { emit, lines, platform } = buildPlatform({ options: CREDENTIAL_OPTIONS });
+    const { emit, entries, platform } = buildPlatform({ options: CREDENTIAL_OPTIONS });
 
     t.after(() => emit(SHUTDOWN));
     await using dispatcher = installMockDispatcher();
@@ -217,16 +223,16 @@ describe("HydrawisePlatform hardware distribution", () => {
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitFor(() => (fetches() >= 1) ? true : undefined);
+    await waitUntil(() => fetches() >= 1, { description: "the first account fetch" });
 
     /* Re-entering discovery is a real cadence - the launch event can fire again, and the supervisor can re-enter the loop - and each re-entry would start a whole
      * second refresh loop running forever beside the first, doubling this account's spend against a ceiling measured in single digits. The count is EXACT rather
      * than a lower bound: the loop's own next tick is a quarter hour away and cannot reach this assertion, so any second fetch here is a second loop.
      */
-    const connections = lines().filter(line => line.message.includes("Successfully connected")).length;
+    const connections = entries.filter(line => line.message.includes("Successfully connected")).length;
 
     emit(DID_FINISH_LAUNCHING);
-    await waitFor(() => (lines().filter(line => line.message.includes("Successfully connected")).length > connections) ? true : undefined);
+    await waitUntil(() => entries.filter(line => line.message.includes("Successfully connected")).length > connections, { description: "another connection line" });
 
     assert.equal(fetches(), 1, "a re-entered discovery pass should start no second loop and spend no second fetch");
   });
@@ -248,12 +254,12 @@ describe("HydrawisePlatform hardware distribution", () => {
 
     emit(DID_FINISH_LAUNCHING);
 
-    const accessory = await waitFor(() => registered[0]);
+    const accessory = await waitFor(() => registered[0], { description: "the first accessory registration" });
 
-    await waitFor(() => (fetches() >= 1) ? true : undefined);
+    await waitUntil(() => fetches() >= 1, { description: "the first account fetch" });
     assert.equal(informationValue(accessory, Characteristic.Model), "Hydrawise", "the failed first tick enriched nothing and left the placeholder standing");
 
-    /* The property this pins is the METHOD BOUNDARY. A failed fetch returns from the tick, not from the loop, so the refresh survives its first transient
+    /* The property this asserts is the METHOD BOUNDARY. A failed fetch returns from the tick, not from the loop, so the refresh survives its first transient
      * failure; the same early return written inline in the loop body would leave the loop function entirely and end the refresh for the life of the plugin. The
      * tick is driven directly because the loop's own next one is a quarter hour away.
      */
@@ -265,7 +271,7 @@ describe("HydrawisePlatform hardware distribution", () => {
 
   test("a shutdown ends the refresh loop without reporting a fault", async () => {
 
-    const { emit, lines, platform } = buildPlatform({ options: CREDENTIAL_OPTIONS });
+    const { emit, entries, platform } = buildPlatform({ options: CREDENTIAL_OPTIONS });
 
     await using dispatcher = installMockDispatcher();
 
@@ -276,24 +282,24 @@ describe("HydrawisePlatform hardware distribution", () => {
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitFor(() => (fetches() >= 1) ? true : undefined);
+    await waitUntil(() => fetches() >= 1, { description: "the first account fetch" });
 
     const spent = fetches();
 
     emit(SHUTDOWN);
 
-    // The loop rides the platform's shutdown signal, so the abort ends the sleep it is sitting in and unwinds it. A teardown is orderly rather than a fault, so
+    // The loop is bound to the platform's shutdown signal, so the abort ends the sleep it is sitting in and unwinds it. A teardown is orderly rather than a fault, so
     // the supervisor swallows it silently - a reported fault here would tell every user their plugin broke every time Homebridge stopped.
-    await waitFor(() => true);
+    await waitUntil(() => true, { description: "the shutdown to reach the loop" });
 
     assert.equal(fetches(), spent, "no further tick runs after shutdown");
-    assert.ok(!lines().some(line => (line.level === "error") && line.message.includes("stopped unexpectedly")),
+    assert.ok(!entries.some(line => (line.level === "error") && line.message.includes("stopped unexpectedly")),
       "a shutdown unwinds the loop quietly rather than reporting a fault");
   });
 
   test("no loop starts, no call is spent, and nothing is logged without credentials", async (t) => {
 
-    const { emit, lines, registered } = buildPlatform();
+    const { emit, entries, registered } = buildPlatform();
 
     t.after(() => emit(SHUTDOWN));
     await using dispatcher = installMockDispatcher();
@@ -303,7 +309,7 @@ describe("HydrawisePlatform hardware distribution", () => {
 
     emit(DID_FINISH_LAUNCHING);
 
-    const accessory = await waitFor(() => registered[0]);
+    const accessory = await waitFor(() => registered[0], { description: "the first accessory registration" });
 
     /* The parity case stated as an assertion: an install with no credentials shows exactly what it always has. The MockAgent has net connect disabled and
      * intercepts only the two key-based endpoints, so a request escaping the credential gate would fail this test loudly rather than reaching the network.
@@ -314,8 +320,8 @@ describe("HydrawisePlatform hardware distribution", () => {
       "the firmware is the unknown marker Homebridge itself uses");
 
     // Silence is part of the contract, not incidental: a user who configured nothing but an API key should see no trace of a capability they never turned on.
-    assert.ok(!lines().some(line => line.message.includes("Enhanced features")), "no enhanced-features line appears at all");
-    assert.ok(!lines().some(line => line.message.includes("enhanced features refresh")), "and no refresh loop reports itself");
+    assert.ok(!entries.some(line => line.message.includes("Enhanced features")), "no enhanced-features line appears at all");
+    assert.ok(!entries.some(line => line.message.includes("enhanced features refresh")), "and no refresh loop reports itself");
   });
 });
 
@@ -323,7 +329,7 @@ describe("HydrawisePlatform connection reporting", () => {
 
   test("the account tier reports itself connected ONCE, on the first successful refresh", async (t) => {
 
-    const { emit, lines, platform } = buildPlatform({ options: CREDENTIAL_OPTIONS });
+    const { emit, entries, platform } = buildPlatform({ options: CREDENTIAL_OPTIONS });
 
     t.after(() => emit(SHUTDOWN));
 
@@ -336,14 +342,14 @@ describe("HydrawisePlatform connection reporting", () => {
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitFor(() => (fetches() >= 1) ? true : undefined);
+    await waitUntil(() => fetches() >= 1, { description: "the first account fetch" });
 
-    const connected = (): number => lines().filter(line => line.message.includes("connected to the Hydrawise account API")).length;
+    const connected = (): number => entries.filter(line => line.message.includes("connected to the Hydrawise account API")).length;
 
-    await waitFor(() => (connected() >= 1) ? true : undefined);
+    await waitUntil(() => connected() >= 1, { description: "the first account connection" });
 
     // The two tiers are delineated: the key-based line names the API key, and the account line names the enhanced features it unlocks.
-    assert.ok(lines().some(line => line.message.includes("Successfully connected to the Hydrawise API using your API key.")),
+    assert.ok(entries.some(line => line.message.includes("Successfully connected to the Hydrawise API using your API key.")),
       "the key-based tier names how it connected");
     assert.equal(connected(), 1, "the account tier reports itself connected exactly once");
 
@@ -358,7 +364,7 @@ describe("HydrawisePlatform connection reporting", () => {
 
   test("a failed first refresh reports no connection, and a later success reports one", async (t) => {
 
-    const { emit, lines, platform } = buildPlatform({ options: CREDENTIAL_OPTIONS });
+    const { emit, entries, platform } = buildPlatform({ options: CREDENTIAL_OPTIONS });
 
     t.after(() => emit(SHUTDOWN));
 
@@ -373,9 +379,9 @@ describe("HydrawisePlatform connection reporting", () => {
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitFor(() => (fetches() >= 1) ? true : undefined);
+    await waitUntil(() => fetches() >= 1, { description: "the first account fetch" });
 
-    const connected = (): number => lines().filter(line => line.message.includes("connected to the Hydrawise account API")).length;
+    const connected = (): number => entries.filter(line => line.message.includes("connected to the Hydrawise account API")).length;
 
     assert.equal(connected(), 0, "a failed tick claims no connection - the client already reported the failure in its own words");
 
@@ -386,7 +392,7 @@ describe("HydrawisePlatform connection reporting", () => {
 
   test("an install with no credentials reports only the key-based tier", async (t) => {
 
-    const { emit, lines, registered } = buildPlatform();
+    const { emit, entries, registered } = buildPlatform();
 
     t.after(() => emit(SHUTDOWN));
 
@@ -396,9 +402,9 @@ describe("HydrawisePlatform connection reporting", () => {
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitFor(() => registered[0]);
+    await waitUntil(() => registered[0] !== undefined, { description: "the first accessory registration" });
 
-    assert.ok(lines().some(line => line.message.includes("Successfully connected to the Hydrawise API using your API key.")), "the key-based line still reports");
-    assert.equal(lines().filter(line => line.message.includes("account API")).length, 0, "and nothing claims an account connection that was never made");
+    assert.ok(entries.some(line => line.message.includes("Successfully connected to the Hydrawise API using your API key.")), "the key-based line still reports");
+    assert.equal(entries.filter(line => line.message.includes("account API")).length, 0, "and nothing claims an account connection that was never made");
   });
 });

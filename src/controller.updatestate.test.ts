@@ -8,12 +8,13 @@
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
 import { Characteristic, Service } from "./testing/hap.helpers.ts";
-import { buildController, waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone, normalSchedule } from "./api.helpers.ts";
 import { HYDRAWISE_UNSCHEDULED_SENTINEL } from "./types.ts";
 import assert from "node:assert/strict";
+import { buildController } from "./testing/platform.helpers.ts";
 import { rainSensors } from "./api.fixtures.ts";
+import { waitUntil } from "homebridge-plugin-utils/testing";
 
 describe("HydrawiseController updateState (single poll)", () => {
 
@@ -25,7 +26,7 @@ describe("HydrawiseController updateState (single poll)", () => {
     t.after(() => h.abort());
 
     // The last zone's valve appears only after the per-zone loop has processed every zone, so waiting on it confirms the whole first pass ran.
-    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700019") ? true : undefined);
+    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700019") !== undefined, { description: "the valve for zone 700019 to appear" });
 
     const valves = h.accessory.services.filter(service => service.UUID === "Valve");
 
@@ -46,7 +47,7 @@ describe("HydrawiseController updateState (single poll)", () => {
 
     t.after(() => h.abort());
 
-    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700019") ? true : undefined);
+    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700019") !== undefined, { description: "the valve for zone 700019 to appear" });
 
     const running = h.accessory.getServiceById(Service.Valve, "700001");
 
@@ -63,7 +64,7 @@ describe("HydrawiseController updateState (single poll)", () => {
 
     t.after(() => h.abort());
 
-    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700019") ? true : undefined);
+    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700019") !== undefined, { description: "the valve for zone 700019 to appear" });
 
     // Relay 3 sits exactly on the 3600-second active-zone boundary, which is inclusive.
     const boundary = h.accessory.getServiceById(Service.Valve, "700003");
@@ -80,7 +81,7 @@ describe("HydrawiseController updateState (single poll)", () => {
 
     t.after(() => h.abort());
 
-    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700019") ? true : undefined);
+    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700019") !== undefined, { description: "the valve for zone 700019 to appear" });
 
     // Relay 4 sits one second past the 3600-second window, so it falls outside the active band.
     const justOver = h.accessory.getServiceById(Service.Valve, "700004");
@@ -96,7 +97,7 @@ describe("HydrawiseController updateState (single poll)", () => {
 
     t.after(() => h.abort());
 
-    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700019") ? true : undefined);
+    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700019") !== undefined, { description: "the valve for zone 700019 to appear" });
 
     const irrigation = h.accessory.getService(Service.IrrigationSystem);
 
@@ -124,8 +125,8 @@ describe("HydrawiseController updateState (single poll)", () => {
     t.after(() => h.abort());
 
     // The disabled zone never gets a valve, so the second enabled zone's valve plus a completed poll is what marks the pass as fully through.
-    await waitFor(() => h.accessory.getServiceById(Service.Valve, "700002") ? true : undefined);
-    await waitFor(() => (h.retrieve.callsTo("statusschedule.php").length >= 2) ? true : undefined);
+    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700002") !== undefined, { description: "the valve for zone 700002 to appear" });
+    await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 2, { description: "the second status poll" });
 
     const irrigation = h.accessory.getService(Service.IrrigationSystem);
 

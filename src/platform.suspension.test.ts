@@ -18,13 +18,13 @@ import { HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_GRAPH_ENDPOINT, HYDRAWISE_V2_MU
   HYDRAWISE_V2_TOKEN_ENDPOINT } from "./settings.ts";
 import { buildPlatform, installV2Client, v2BudgetOf, v2MutationBudgetOf } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
-import type { CapturedLogLine } from "./testing.helpers.ts";
 import type { HydrawisePlatform } from "./platform.ts";
 import { HydrawiseV2Client } from "./v2.ts";
 import { MockAgent } from "undici";
 import type { RateBudget } from "homebridge-plugin-utils";
+import type { TestLogEntry } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
-import { capturingLog } from "./testing.helpers.ts";
+import { capturingLog } from "homebridge-plugin-utils/testing";
 
 const SHUTDOWN = "shutdown";
 
@@ -59,28 +59,28 @@ const SUSPEND_UNTIL = 1903928399;
  * @param platform - The HydrawisePlatform whose client field this installs the double onto.
  * @param program  - Callback that programs the agent's replies, calling record() for each request the fixture serves so the returned served() reader counts them.
  *
- * @returns Readers for the requests the agent served and the lines the client wrote, which is what an absence pin reads.
+ * @returns The lines the client wrote, read live, and a reader for the requests the agent served, which together are what an absence assertion reads.
  */
 function installRealClient(platform: HydrawisePlatform,
-  program: (agent: MockAgent, record: () => void) => void): { lines: () => CapturedLogLine[]; served: () => number } {
+  program: (agent: MockAgent, record: () => void) => void): { entries: readonly TestLogEntry[]; served: () => number } {
 
   /* undici's MockAgent implements close but inherits the base dispatcher's unimplemented destroy, and the platform's teardown calls destroy because that is what
    * fails a wedged pool's in-flight requests fast; mapping one onto the other is the double's business, not production's.
    */
   const agent = Object.assign(new MockAgent(), { destroy: async (): Promise<void> => { await agent.close(); } });
-  const { lines, logger } = capturingLog();
+  const log = capturingLog();
   let served = 0;
 
   agent.disableNetConnect();
   program(agent, (): void => { served++; });
 
-  installV2Client(platform, new HydrawiseV2Client({ budget: v2BudgetOf(platform), dispatcherFactory: (): MockAgent => agent, log: logger,
+  installV2Client(platform, new HydrawiseV2Client({ budget: v2BudgetOf(platform), dispatcherFactory: (): MockAgent => agent, log,
     mutationBudget: v2MutationBudgetOf(platform), password: "test-password", signal: platform.signal, username: "test-user" }));
 
-  return { lines, served: (): number => served };
+  return { entries: log.entries, served: (): number => served };
 }
 
-// The client's own sentence about a command its admission window closed on. A test that means to pin the platform's free refusal asserts this line's ABSENCE, which
+// The client's own sentence about a command its admission window closed on. A test that means to assert the platform's free refusal asserts this line's ABSENCE, which
 // is what says the command never reached the client at all.
 const NOT_ADMITTED = "The zone suspension command was not admitted";
 
@@ -115,7 +115,7 @@ describe("HydrawisePlatform zone suspension surface", () => {
     t.after(() => emit(SHUTDOWN));
 
     /* The honest answer for a caller that has no client to command through. It is structurally unreachable from a live switch - those exist only where a client
-     * does, and that is fixed at construction - which is exactly why it is pinned HERE, at the surface that can actually produce it, rather than through a handler
+     * does, and that is fixed at construction - which is exactly why it is asserted HERE, at the surface that can actually produce it, rather than through a handler
      * that could never reach it.
      */
     assert.equal(platform.hasV2Client, false, "an install carrying only an API key builds no client at all");
@@ -149,7 +149,7 @@ describe("HydrawisePlatform zone suspension surface", () => {
 
     t.after(() => emit(SHUTDOWN));
 
-    const { lines, served } = installRealClient(platform, (agent, record) => {
+    const { entries, served } = installRealClient(platform, (agent, record) => {
 
       programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
       programReply(agent, record, GRAPH_PATH, { data: { suspendZone: { status: "OK" } } });
@@ -167,7 +167,7 @@ describe("HydrawisePlatform zone suspension surface", () => {
      * entered. A clock reading could only have suggested as much.
      */
     assert.equal(served(), 0, "the refusal touched no connection and spent no call");
-    assert.deepEqual(lines().filter(line => line.message.includes(NOT_ADMITTED)), [], "and the client never saw it at all, so its admission phase said nothing");
+    assert.deepEqual(entries.filter(line => line.message.includes(NOT_ADMITTED)), [], "and the client never saw it at all, so its admission phase said nothing");
     assert.equal(v2BudgetOf(platform).available, HYDRAWISE_V2_BUDGET_CALLS, "with the read ceiling left whole for the scheduled reads");
   });
 
@@ -177,7 +177,7 @@ describe("HydrawisePlatform zone suspension surface", () => {
 
     t.after(() => emit(SHUTDOWN));
 
-    const { lines, served } = installRealClient(platform, (agent, record) => {
+    const { entries, served } = installRealClient(platform, (agent, record) => {
 
       programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
       programReply(agent, record, GRAPH_PATH, { data: { suspendZone: { status: "OK" } } });
@@ -202,7 +202,7 @@ describe("HydrawisePlatform zone suspension surface", () => {
     assert.deepEqual(commands, [ { status: "done" }, { status: "rejected" } ], "the winner completes and the loser is turned away rather than queued");
     assert.ok(elapsed < (HYDRAWISE_V2_MUTATION_BUDGET_WINDOW * 1000), "and the loser resolved on the admission window rather than the budget's hour");
     assert.equal(served(), 2, "exactly the winner's grant and its mutation reached the wire");
-    assert.equal(lines().filter(line => line.message.includes(NOT_ADMITTED)).length, 1, "with the client's admission phase speaking once, for the loser alone");
+    assert.equal(entries.filter(line => line.message.includes(NOT_ADMITTED)).length, 1, "with the client's admission phase speaking once, for the loser alone");
   });
 
   test("the surface draws the command ceiling for its admission and the read ceiling for the grant", async (t) => {

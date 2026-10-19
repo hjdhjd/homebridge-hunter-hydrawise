@@ -1,16 +1,17 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * platform.helpers.test.ts: Self-test for the platform harness. Pins the programmable retrieve recorder's record-and-program semantics, the MQTT recorder's
+ * platform.helpers.test.ts: Self-test for the platform harness. Asserts the programmable retrieve recorder's record-and-program semantics, the MQTT recorder's
  * capture and invoke knobs, the MockAgent installer's snapshot-and-restore discipline, the API double's capture-and-invoke event contract, and the platform
  * double's mutable debug channel and signal lifecycle - pre-aborted by default, abortable when requested.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { RetrieveRecorder, installMockDispatcher, loggedAt, makeTestApi, makeTestPlatform } from "./platform.helpers.ts";
+import { RetrieveRecorder, installMockDispatcher, makeTestApi, makeTestPlatform } from "./platform.helpers.ts";
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { getGlobalDispatcher } from "undici";
+import { loggedAt } from "homebridge-plugin-utils/testing";
 
 // The subset of the API double's surface this self-test drives directly. The harness returns the api as an opaque value for the platform constructor cast; here
 // we describe just the methods we exercise.
@@ -109,14 +110,14 @@ describe("makeTestPlatform", () => {
 
   test("exposes a mutable debug channel the capture observes", () => {
 
-    const { lines, platform } = makeTestPlatform();
+    const { entries, platform } = makeTestPlatform();
 
     // The capture's debug channel is a plain writable slot, so a test can interpose its own function on it and still have the capture record what comes through.
     // The cast bridges the readonly HomebridgePluginLogging.debug declaration the double is typed against.
     (platform.log as { debug: (message: string) => void }).debug = (message: string): void => platform.log.error(message);
     platform.log.debug("routed debug line");
 
-    assert.ok(loggedAt(lines(), "error", "routed debug line"), "a reassigned debug channel should still land in the capture");
+    assert.ok(loggedAt(entries, "error", "routed debug line"), "a reassigned debug channel should still land in the capture");
   });
 
   test("defaults the platform signal to pre-aborted", () => {

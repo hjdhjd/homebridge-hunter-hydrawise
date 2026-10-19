@@ -1,6 +1,6 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * api.helpers.test.ts: Self-test for the API response factories. Pins the factory defaults, the override merge, the scenario composers' distinguishing
+ * api.helpers.test.ts: Self-test for the API response factories. Asserts the factory defaults, the override merge, the scenario composers' distinguishing
  * shapes, the fast-cadence stamp, and the fresh-clone-per-call isolation that keeps production's reassign-and-trim from leaking across tests.
  */
 
@@ -10,7 +10,7 @@ import { UNSCHEDULED_SENTINEL, allRelayIds } from "./api.fixtures.ts";
 import { allSuspended, fastPolling, makeCustomerDetails, makeStatusSchedule, makeZone, normalSchedule, rainStopped } from "./api.helpers.ts";
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { firstOf } from "./testing.helpers.ts";
+import { expectAt } from "homebridge-plugin-utils/testing";
 
 describe("makeZone", () => {
 
@@ -72,9 +72,9 @@ describe("makeStatusSchedule", () => {
     const a = makeStatusSchedule();
     const b = makeStatusSchedule();
 
-    firstOf(a.relays, "relay").name = "mutated";
+    expectAt(a.relays, 0, "relay").name = "mutated";
 
-    assert.notEqual(firstOf(b.relays, "relay").name, "mutated", "mutating one schedule's relays must not affect another");
+    assert.notEqual(expectAt(b.relays, 0, "relay").name, "mutated", "mutating one schedule's relays must not affect another");
   });
 });
 
@@ -84,7 +84,7 @@ describe("scenario composers", () => {
 
     const schedule = normalSchedule();
 
-    assert.equal(firstOf(schedule.relays, "relay").time, 1, "the normal schedule's first zone is running");
+    assert.equal(expectAt(schedule.relays, 0, "relay").time, 1, "the normal schedule's first zone is running");
   });
 
   test("rainStopped stamps every zone with the sentinel and references them from the sensor", () => {
@@ -92,7 +92,7 @@ describe("scenario composers", () => {
     const schedule = rainStopped();
 
     assert.ok(schedule.relays.every(zone => zone.time === UNSCHEDULED_SENTINEL), "every rain-stopped zone carries the unscheduled sentinel");
-    assert.deepEqual(firstOf(schedule.sensors, "sensor").relays.map(relay => relay.id), [...allRelayIds], "the rain sensor references every zone relay");
+    assert.deepEqual(expectAt(schedule.sensors, 0, "sensor").relays.map(relay => relay.id), [...allRelayIds], "the rain sensor references every zone relay");
   });
 
   test("allSuspended stamps the sentinel but the sensor references no zone", () => {
@@ -100,7 +100,7 @@ describe("scenario composers", () => {
     const schedule = allSuspended();
 
     assert.ok(schedule.relays.every(zone => zone.time === UNSCHEDULED_SENTINEL), "every suspended zone carries the unscheduled sentinel");
-    assert.equal(firstOf(schedule.sensors, "sensor").relays.length, 0, "the bare sensor references no zone, distinguishing suspend from a rain stop");
+    assert.equal(expectAt(schedule.sensors, 0, "sensor").relays.length, 0, "the bare sensor references no zone, distinguishing suspend from a rain stop");
   });
 
   test("fastPolling accelerates the cadence on a fresh clone", () => {

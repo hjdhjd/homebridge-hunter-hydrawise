@@ -5,10 +5,10 @@
  * fields, the optional suspend switch and its feature-log line, and the MQTT subscriptions.
  */
 import { Characteristic, Service } from "./testing/hap.helpers.ts";
-import { buildController, loggedAt } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
+import { expectAt, loggedAt } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
-import { firstOf } from "./testing.helpers.ts";
+import { buildController } from "./testing/platform.helpers.ts";
 
 describe("HydrawiseController construction", () => {
 
@@ -54,7 +54,7 @@ describe("HydrawiseController construction", () => {
 
   test("adds the suspend switch and logs the deviation when the feature is enabled", () => {
 
-    const { accessory, controllerConfig, lines } = buildController({ userOptions: ["Enable.Device.Suspend.All." + controllerConfigSerial()] });
+    const { accessory, controllerConfig, entries } = buildController({ userOptions: ["Enable.Device.Suspend.All." + controllerConfigSerial()] });
     const suspend = accessory.getServiceById(Service.Switch, "All");
 
     assert.ok(suspend, "a suspend switch should exist when Device.Suspend.All is enabled");
@@ -62,7 +62,7 @@ describe("HydrawiseController construction", () => {
     // Before the first poll the status carries an empty relay list, so isAllSuspended is vacuously true (an empty some() is false, negated to true) and the
     // switch rests on. This is the construction-time reading; the first poll replaces it with the reported zone state.
     assert.equal(suspend.getCharacteristic(Characteristic.On).value, true, "the suspend switch rests on over the empty pre-poll status");
-    assert.ok(loggedAt(lines(), "info", "Suspend all zones switch enabled."), "enabling the non-default suspend feature should log the deviation");
+    assert.ok(loggedAt(entries, "info", "Suspend all zones switch enabled."), "enabling the non-default suspend feature should log the deviation");
 
     // The serial the enabling option targets is the controller's own serial, confirming the option resolved at controller scope.
     assert.equal(controllerConfig.serial_number, controllerConfigSerial(), "the enabling option should target the controller serial");
@@ -79,8 +79,8 @@ describe("HydrawiseController construction", () => {
 
     assert.equal(gets.length, 1, "one controller get subscription should be registered");
     assert.equal(sets.length, 1, "one controller set subscription should be registered");
-    assert.ok(firstOf(gets, "MQTT get subscription").topic.endsWith("controller/get"), "the get topic should be the controller topic");
-    assert.ok(firstOf(sets, "MQTT set subscription").topic.endsWith("controller/set"), "the set topic should be the controller topic");
+    assert.ok(expectAt(gets, 0, "MQTT get subscription").topic.endsWith("controller/get"), "the get topic should be the controller topic");
+    assert.ok(expectAt(sets, 0, "MQTT set subscription").topic.endsWith("controller/set"), "the set topic should be the controller topic");
   });
 
   test("registers no MQTT subscriptions when MQTT is not configured", () => {

@@ -1,7 +1,7 @@
 /* Copyright(C) 2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
  * testing.helpers.test.ts: Tests for the cross-cutting testing-helpers barrel. The barrel is the canonical import path for tests outside `src/testing/`,
- * and this test file is the sole mechanism that enforces that convention, since no linter rule backs it. These tests pin the barrel's runtime export
+ * and this test file is the sole mechanism that enforces that convention, since no linter rule backs it. These tests lock in the barrel's runtime export
  * surface so a forgotten re-export, a renamed submodule symbol, or an unintended addition surfaces
  * immediately at unit-tier rather than as a confusing import error in some downstream test file.
  *
@@ -9,7 +9,7 @@
  *
  *   1. Every documented symbol IS re-exported (catches missing re-exports - a submodule export the barrel forgot to forward).
  *   2. No undocumented runtime exports exist (catches accidental additions - a submodule export that flowed through without being documented).
- *   3. Cardinality matches (catches same-size swap - one removed, one added would pass the first two tests by accident).
+ *   3. Cardinality matches (catches same-size swap - one removed, one added would pass the first and second checks by accident).
  *
  * When the barrel grows or shrinks, update the EXPECTED_*_EXPORTS lists below to match.
  */
@@ -17,20 +17,13 @@ import * as barrel from "./testing.helpers.ts";
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 
-/* The complete list of function runtime symbols the barrel is documented to re-export. Type-only re-exports (CapturedLogLine, TestLogger) are erased at runtime
- * and therefore not part of this surface. Value-typed runtime exports (constants like TMPDIR_PREFIX) are listed separately in EXPECTED_VALUE_EXPORTS so the
- * function-typeof check stays clean.
+/* The complete list of function runtime symbols the barrel is documented to re-export. A type-only re-export is erased at runtime and therefore not part of this
+ * surface. Value-typed runtime exports (constants like TMPDIR_PREFIX) are listed separately in EXPECTED_VALUE_EXPORTS so the function-typeof check stays clean.
  */
 const EXPECTED_FUNCTION_EXPORTS = [
 
-  "assertNoUnhandledRejections",
   "assertSameShape",
-  "capturingLog",
   "declareKeysOf",
-  "expectAt",
-  "firstOf",
-  "nthOf",
-  "silentLog",
   "withTempDir"
 ] as const;
 
@@ -85,8 +78,8 @@ describe("testing.helpers barrel", () => {
 
   test("documented and actual runtime export sets match exactly in cardinality", () => {
 
-    // Symmetric pin: the previous tests catch missing or extra exports individually; this one asserts the cardinality matches so a same-size swap (one removed,
-    // one added) cannot pass both above tests by accident.
+    // Symmetric assertion: the previous tests catch missing or extra exports individually; this one asserts the cardinality matches so a same-size swap (one
+    // removed, one added) cannot pass the missing-export and extra-export tests by accident.
     const actual = new Set(Object.keys(barrel));
     const expected = EXPECTED_FUNCTION_EXPORTS.length + Object.keys(EXPECTED_VALUE_EXPORTS).length;
 

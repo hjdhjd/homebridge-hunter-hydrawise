@@ -24,9 +24,10 @@ import type { HydrawiseAccessoryContext, HydrawiseZoneConfig, HydrawiseZoneSched
 import { RateBudget, getServiceName } from "homebridge-plugin-utils";
 import type { TestAccessory, TestService } from "./testing/hap.helpers.ts";
 import { UNSCHEDULED_SENTINEL, bareSensors } from "./api.fixtures.ts";
-import { buildController, countLogged, loggedAt, makeV2Facts, makeZoneV2Facts, waitFor } from "./testing/platform.helpers.ts";
+import { buildController, makeV2Facts, makeZoneV2Facts, pollsCompleted, waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
+import { logCount, loggedAt, waitUntil } from "homebridge-plugin-utils/testing";
 import type { BuildControllerResult } from "./testing/platform.helpers.ts";
 import { HydrawiseV2Client } from "./v2.ts";
 import { MockAgent } from "undici";
@@ -165,12 +166,6 @@ function applyFacts(h: BuildControllerResult, suspended: Record<number, boolean>
   h.controller.applyFacts({ facts: makeV2Facts({ zones }), fetchedAt });
 }
 
-// Wait until the controller has completed enough polls that the projection it produced is certainly in hand.
-async function pollsCompleted(h: BuildControllerResult, count: number): Promise<void> {
-
-  await waitFor(() => (h.retrieve.callsTo("statusschedule.php").length > count) ? true : undefined);
-}
-
 /* The configured name of one of the double's services. The library helper takes HAP's own Service type, so the double-to-production bridge lives here once rather
  * than at each read site - the same posture the harness takes for its own construction-boundary casts.
  */
@@ -209,7 +204,7 @@ describe("HydrawiseController per-zone suspension switches", () => {
 
     t.after(() => h.abort());
 
-    const service = await waitFor(() => suspendSwitch(h.accessory));
+    const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
 
     assert.equal(serviceName(service), "Alpha Suspend", "the switch takes the zone's effective name and the suspend suffix");
     assert.ok(h.accessory.getServiceById(Service.Valve, ALPHA_VALVE_SUBTYPE), "and it sits beside the valve rather than replacing it");
@@ -217,7 +212,7 @@ describe("HydrawiseController per-zone suspension switches", () => {
     // ON means the zone is suspended, so an unsuspended zone reads off. The assertion that this one cannot make - a switch established on an ALREADY suspended zone,
     // where HAP's own default would be the wrong answer rather than accidentally the right one - is driven separately below.
     assert.equal(readsSuspended(h.accessory), false, "a zone under no suspension reads as unsuspended");
-    assert.ok(loggedAt(h.lines(), "info", "Per-zone suspension switches enabled."), "the enabled feature is reported once at the startup grain");
+    assert.ok(loggedAt(h.entries, "info", "Per-zone suspension switches enabled."), "the enabled feature is reported once at the startup grain");
   });
 
   test("a switch established on an already-suspended zone starts ON", async (t) => {
@@ -236,11 +231,11 @@ describe("HydrawiseController per-zone suspension switches", () => {
 
     t.after(() => h.abort());
 
-    await waitFor(() => suspendSwitch(h.accessory));
+    await waitUntil(() => suspendSwitch(h.accessory) !== undefined, { description: "Alpha's suspension switch to appear" });
 
     applyFacts(h, { [ALPHA_RELAY_ID]: false, [BETA_RELAY_ID]: true }, now());
 
-    const beta = await waitFor(() => suspendSwitch(h.accessory, BETA_SWITCH_SUBTYPE));
+    const beta = await waitFor(() => suspendSwitch(h.accessory, BETA_SWITCH_SUBTYPE), { description: "Beta's suspension switch to appear" });
 
     assert.equal(beta.getCharacteristic(Characteristic.On).value, true, "a zone the account reports suspended shows its switch on the moment it is established");
     assert.equal(readsSuspended(h.accessory), false, "while its unsuspended sibling reads the other way");
@@ -253,12 +248,12 @@ describe("HydrawiseController per-zone suspension switches", () => {
 
     t.after(() => h.abort());
 
-    await waitFor(() => h.accessory.getServiceById(Service.Valve, ALPHA_VALVE_SUBTYPE));
+    await waitUntil(() => h.accessory.getServiceById(Service.Valve, ALPHA_VALVE_SUBTYPE) !== undefined, { description: "Alpha's valve to appear" });
     await pollsCompleted(h, 2);
 
     assert.equal(suspendSwitch(h.accessory), undefined, "the default-off option publishes no switch at all");
     assert.equal(h.suspensions.length, 0, "and nothing can command a suspension");
-    assert.ok(!loggedAt(h.lines(), "info", "Per-zone suspension switches"), "a default left alone says nothing at startup");
+    assert.ok(!loggedAt(h.entries, "info", "Per-zone suspension switches"), "a default left alone says nothing at startup");
   });
 
   test("creates none on an install without account credentials, however the option is set", async (t) => {
@@ -271,11 +266,11 @@ describe("HydrawiseController per-zone suspension switches", () => {
 
     t.after(() => h.abort());
 
-    await waitFor(() => h.accessory.getServiceById(Service.Valve, ALPHA_VALVE_SUBTYPE));
+    await waitUntil(() => h.accessory.getServiceById(Service.Valve, ALPHA_VALVE_SUBTYPE) !== undefined, { description: "Alpha's valve to appear" });
     await pollsCompleted(h, 2);
 
     assert.equal(suspendSwitch(h.accessory), undefined, "an install with only an API key publishes no per-zone switch");
-    assert.ok(!loggedAt(h.lines(), "info", "Per-zone suspension switches"), "and never mentions a feature it cannot offer");
+    assert.ok(!loggedAt(h.entries, "info", "Per-zone suspension switches"), "and never mentions a feature it cannot offer");
   });
 
   test("the switch follows the zone's suspension across refresh ticks", async (t) => {
@@ -286,7 +281,7 @@ describe("HydrawiseController per-zone suspension switches", () => {
 
     t.after(() => h.abort());
 
-    await waitFor(() => suspendSwitch(h.accessory));
+    await waitUntil(() => suspendSwitch(h.accessory) !== undefined, { description: "Alpha's suspension switch to appear" });
 
     /* A suspension is a fact only the account API reports, so it arrives on the REFRESH cadence rather than on a poll. The switch has to move with it, which is
      * what the shared projection tail is for: a switch refreshed only by the walk would sit wrong for up to a full poll after a suspension landed.
@@ -311,7 +306,8 @@ describe("HydrawiseController per-zone suspension switches", () => {
     t.after(() => h.abort());
 
     // A rename must reach the companion, not just the valve. Naming the switch once at creation would leave it wearing a stale name for the life of the accessory.
-    await waitFor(() => (serviceName(suspendSwitch(h.accessory)) === "Alpha North Suspend") ? true : undefined);
+    await waitUntil(() => serviceName(suspendSwitch(h.accessory)) === "Alpha North Suspend",
+      { description: "Alpha's suspension switch to take the renamed zone's name" });
     assert.equal(serviceName(h.accessory.getServiceById(Service.Valve, ALPHA_VALVE_SUBTYPE)), "Alpha North", "the valve moved with it");
   });
 });
@@ -326,7 +322,7 @@ describe("HydrawiseController per-zone suspension commands", () => {
 
     t.after(() => h.abort());
 
-    const service = await waitFor(() => suspendSwitch(h.accessory));
+    const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
     const before = now();
 
     await service.getCharacteristic(Characteristic.On).triggerSet(true);
@@ -337,7 +333,7 @@ describe("HydrawiseController per-zone suspension commands", () => {
     assert.equal(h.suspensions[0]?.zoneId, ALPHA_RELAY_ID, "and it names the zone the switch belongs to");
 
     // The horizon is the account-wide suspend's own constant, bracketed by whole-second reads either side of the tap. One convention, one constant, both grains.
-    const until = h.suspensions[0]?.until ?? 0;
+    const until = h.suspensions[0].until ?? 0;
 
     assert.ok((until >= (before + HYDRAWISE_SUSPEND_DURATION)) && (until <= (after + HYDRAWISE_SUSPEND_DURATION)),
       "the suspension runs to the same one-year horizon the account-wide suspend uses");
@@ -352,7 +348,7 @@ describe("HydrawiseController per-zone suspension commands", () => {
 
     t.after(() => h.abort());
 
-    const service = await waitFor(() => suspendSwitch(h.accessory));
+    const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
 
     applyFacts(h, { [ALPHA_RELAY_ID]: true }, now());
 
@@ -370,7 +366,7 @@ describe("HydrawiseController per-zone suspension commands", () => {
 
     t.after(() => h.abort());
 
-    const service = await waitFor(() => suspendSwitch(h.accessory));
+    const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
 
     for(const value of [ true, false, true, false ]) {
 
@@ -392,19 +388,19 @@ describe("HydrawiseController per-zone suspension commands", () => {
 
     t.after(() => h.abort());
 
-    const service = await waitFor(() => suspendSwitch(h.accessory));
+    const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
 
     await service.getCharacteristic(Characteristic.On).triggerSet(true);
-    await waitFor(() => (readsSuspended(h.accessory) === false) ? true : undefined);
+    await waitUntil(() => readsSuspended(h.accessory) === false, { description: "Alpha's suspension switch to read not suspended" });
 
     assert.equal(readsSuspended(h.accessory), false, "a command the account refused puts the switch back where it was");
-    assert.ok(loggedAt(h.lines(), "error", "Alpha [Zone 1]: Unable to suspend this zone. " + REFUSAL_SUMMARY),
+    assert.ok(loggedAt(h.entries, "error", "Alpha [Zone 1]: Unable to suspend this zone. " + REFUSAL_SUMMARY),
       "and the one sentence names the zone and what the account said");
 
     /* The one-voice assertion. The layers below this one carry their outcome in a value rather than in a line, so a user reads exactly one sentence about a command they
      * made - the one written by the layer that knows which zone they touched.
      */
-    assert.equal(h.lines().filter(line => line.level === "error").length, 1, "a refused command produces exactly one error line");
+    assert.equal(h.entries.filter(line => line.level === "error").length, 1, "a refused command produces exactly one error line");
   });
 
   test("a command the ceiling would not admit reverts with the pacing sentence rather than the account's", async (t) => {
@@ -415,18 +411,18 @@ describe("HydrawiseController per-zone suspension commands", () => {
 
     t.after(() => h.abort());
 
-    const service = await waitFor(() => suspendSwitch(h.accessory));
+    const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
 
     await service.getCharacteristic(Characteristic.On).triggerSet(true);
-    await waitFor(() => (readsSuspended(h.accessory) === false) ? true : undefined);
+    await waitUntil(() => readsSuspended(h.accessory) === false, { description: "Alpha's suspension switch to read not suspended" });
 
     /* Reject-with-feedback, made legible. These two refusals ask the user for different things - wait a moment, against look at your account - so they must not
      * share a sentence, and a user who sees the pacing one knows their command was never sent.
      */
-    assert.ok(loggedAt(h.lines(), "error", "Alpha [Zone 1]: Unable to suspend this zone. The Hydrawise account API is pacing requests"),
+    assert.ok(loggedAt(h.entries, "error", "Alpha [Zone 1]: Unable to suspend this zone. The Hydrawise account API is pacing requests"),
       "a paced refusal says so, and asks for a moment rather than blaming the account");
-    assert.ok(!loggedAt(h.lines(), "error", REFUSAL_SUMMARY), "and it carries no summary, because no command reached the account to produce one");
-    assert.equal(h.lines().filter(line => line.level === "error").length, 1, "a rejected command likewise produces exactly one error line");
+    assert.ok(!loggedAt(h.entries, "error", REFUSAL_SUMMARY), "and it carries no summary, because no command reached the account to produce one");
+    assert.equal(h.entries.filter(line => line.level === "error").length, 1, "a rejected command likewise produces exactly one error line");
   });
 
   test("a transport failure is narrated ONCE across every layer that saw it", async (t) => {
@@ -461,18 +457,18 @@ describe("HydrawiseController per-zone suspension commands", () => {
       t.after(() => { h.abort(); signal.abort("test-teardown"); });
 
       // eslint-disable-next-line no-await-in-loop
-      const service = await waitFor(() => suspendSwitch(h.accessory));
+      const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
 
       // eslint-disable-next-line no-await-in-loop
       await service.getCharacteristic(Characteristic.On).triggerSet(true);
 
       // eslint-disable-next-line no-await-in-loop
-      await waitFor(() => (readsSuspended(h.accessory) === false) ? true : undefined);
+      await waitUntil(() => readsSuspended(h.accessory) === false, { description: "Alpha's suspension switch to read not suspended" });
 
-      const errors = h.lines().filter(line => line.level === "error");
+      const errors = h.entries.filter(line => line.level === "error");
 
       assert.equal(errors.length, 1, shape.label + " produces exactly one error line across the client and the controller");
-      assert.ok(loggedAt(h.lines(), "error", "Alpha [Zone 1]: Unable to suspend this zone. " + shape.expected),
+      assert.ok(loggedAt(h.entries, "error", "Alpha [Zone 1]: Unable to suspend this zone. " + shape.expected),
         "and that line names the zone the user touched and the reason the command did not take");
       assert.equal(readsSuspended(h.accessory), false, "with the switch put back where it was");
     }
@@ -490,12 +486,12 @@ describe("HydrawiseController per-zone suspension commands", () => {
 
     t.after(() => h.abort());
 
-    const service = await waitFor(() => suspendSwitch(h.accessory));
+    const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
 
     await service.getCharacteristic(Characteristic.On).triggerSet(true);
-    await waitFor(() => (readsSuspended(h.accessory) === false) ? true : undefined);
+    await waitUntil(() => readsSuspended(h.accessory) === false, { description: "Alpha's suspension switch to read not suspended" });
 
-    assert.ok(loggedAt(h.lines(), "error", "Alpha [Zone 1]: Unable to suspend this zone. Enhanced features are not configured."),
+    assert.ok(loggedAt(h.entries, "error", "Alpha [Zone 1]: Unable to suspend this zone. Enhanced features are not configured."),
       "the sentence names the configuration the command needed rather than blaming the account");
   });
 
@@ -507,14 +503,14 @@ describe("HydrawiseController per-zone suspension commands", () => {
 
     t.after(() => h.abort());
 
-    const service = await waitFor(() => suspendSwitch(h.accessory));
+    const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
 
     h.abort();
 
     await service.getCharacteristic(Characteristic.On).triggerSet(true);
 
     // Orderly teardown is not a refusal. A shutdown that narrated one would put an error in the log of every restart a user performs.
-    assert.equal(h.lines().filter(line => line.level === "error").length, 0, "a shutdown reaching a command in flight reports nothing");
+    assert.equal(h.entries.filter(line => line.level === "error").length, 0, "a shutdown reaching a command in flight reports nothing");
   });
 });
 
@@ -528,7 +524,7 @@ describe("HydrawiseController per-zone suspension command guard", () => {
 
     t.after(() => h.abort());
 
-    const service = await waitFor(() => suspendSwitch(h.accessory));
+    const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
 
     await service.getCharacteristic(Characteristic.On).triggerSet(true);
 
@@ -563,7 +559,7 @@ describe("HydrawiseController per-zone suspension command guard", () => {
 
     t.after(() => h.abort());
 
-    const service = await waitFor(() => suspendSwitch(h.accessory));
+    const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
 
     // Start from a suspended zone, so the classification and the command disagree and only the command's DIRECTION can produce the right answer.
     applyFacts(h, { [ALPHA_RELAY_ID]: true }, now());
@@ -587,10 +583,10 @@ describe("HydrawiseController per-zone suspension command guard", () => {
 
     t.after(() => h.abort());
 
-    const service = await waitFor(() => suspendSwitch(h.accessory));
+    const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
 
     await service.getCharacteristic(Characteristic.On).triggerSet(true);
-    await waitFor(() => (readsSuspended(h.accessory) === false) ? true : undefined);
+    await waitUntil(() => readsSuspended(h.accessory) === false, { description: "Alpha's suspension switch to read not suspended" });
 
     /* The snapshot below is OLDER than the tap, so a guard entry stamped by the failed command would stand and render the zone suspended. Nothing was commanded in
      * the end, so nothing may claim to have been: the account's own answer is the only thing left to show.
@@ -608,7 +604,7 @@ describe("HydrawiseController per-zone suspension command guard", () => {
 
     t.after(() => h.abort());
 
-    const service = await waitFor(() => suspendSwitch(h.accessory));
+    const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
 
     await service.getCharacteristic(Characteristic.On).triggerSet(true);
 
@@ -634,7 +630,7 @@ describe("HydrawiseController per-zone suspension command guard", () => {
 
     t.after(() => h.abort());
 
-    const all = await waitFor(() => suspendSwitch(h.accessory, SUSPEND_ALL_SUBTYPE));
+    const all = await waitFor(() => suspendSwitch(h.accessory, SUSPEND_ALL_SUBTYPE), { description: "the suspend-all switch to appear" });
 
     assert.equal(suspendSwitch(h.accessory, BETA_SWITCH_SUBTYPE), undefined, "the disabled zone has no switch of its own to be stamped through");
 
@@ -648,7 +644,7 @@ describe("HydrawiseController per-zone suspension command guard", () => {
     // Bring the disabled zone back into the projection. Its switch is established now, and what it shows is whether the account-wide command reached it at all.
     h.platform.featureOptions.configuredOptions = [ SUSPEND_ZONE_ON, SUSPEND_ALL_ON ];
 
-    const beta = await waitFor(() => suspendSwitch(h.accessory, BETA_SWITCH_SUBTYPE));
+    const beta = await waitFor(() => suspendSwitch(h.accessory, BETA_SWITCH_SUBTYPE), { description: "Beta's suspension switch to appear" });
 
     assert.equal(beta.getCharacteristic(Characteristic.On).value, true, "and so does the zone the wire reported while a feature option had it turned off");
   });
@@ -665,9 +661,9 @@ describe("HydrawiseController per-zone suspension command guard", () => {
 
     // The account-wide switch is established at construction while a zone's own switch waits on the first poll, so both are awaited before the account-wide command
     // is driven - the zone switch is what this assertion reads its answer off.
-    const all = await waitFor(() => suspendSwitch(h.accessory, SUSPEND_ALL_SUBTYPE));
+    const all = await waitFor(() => suspendSwitch(h.accessory, SUSPEND_ALL_SUBTYPE), { description: "the suspend-all switch to appear" });
 
-    await waitFor(() => suspendSwitch(h.accessory));
+    await waitUntil(() => suspendSwitch(h.accessory) !== undefined, { description: "Alpha's suspension switch to appear" });
 
     applyFacts(h, { [ALPHA_RELAY_ID]: true }, now());
     assert.equal(readsSuspended(h.accessory), true, "the zone starts out suspended");
@@ -697,9 +693,9 @@ describe("HydrawiseController suspension commands composed into the projection",
 
     t.after(() => h.abort());
 
-    const service = await waitFor(() => suspendSwitch(h.accessory));
+    const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
 
-    await waitFor(() => (entryOf(h)?.state === "scheduled") ? true : undefined);
+    await waitUntil(() => entryOf(h)?.state === "scheduled", { description: "Alpha to classify as scheduled" });
 
     /* A refresh lands BEFORE the command, which is the ordinary state of an install that has these switches at all - they exist only where the credentials do,
      * and the refresh cadence brings facts every quarter hour. It matters to the MQTT half specifically: the payload's classified fields are gated on having a
@@ -714,14 +710,14 @@ describe("HydrawiseController suspension commands composed into the projection",
     const entry = entryOf(h);
 
     assert.equal(entry?.state, "suspended", "the persisted projection reads the zone as suspended without waiting for a refresh");
-    assert.equal((entry?.state === "suspended") ? entry.until : undefined, Math.floor(Date.now() / 1000) + HYDRAWISE_SUSPEND_DURATION,
+    assert.equal(entry.until, Math.floor(Date.now() / 1000) + HYDRAWISE_SUSPEND_DURATION,
       "and carries the instant the command actually asked for");
 
     const payload = JSON.parse(String(h.mqtt?.published.at(-1)?.payload ?? "[]")) as { state?: string; suspendedUntil?: number }[];
 
     assert.equal(h.mqtt?.published.length, publishesBefore + 1, "the command's own handler publishes exactly once");
     assert.equal(payload[0]?.state, "suspended", "and the payload it published carries the composed state");
-    assert.equal(countLogged(h.lines(), "info", "Suspended until"), 1, "the transition narrates once, in the command's own handler");
+    assert.equal(logCount(h.entries, "info", "Suspended until"), 1, "the transition narrates once, in the command's own handler");
   });
 
   test("a suspend of a RUNNING zone holds the switch on while the projection honestly reads running", async (t) => {
@@ -740,9 +736,9 @@ describe("HydrawiseController suspension commands composed into the projection",
 
     t.after(() => h.abort());
 
-    const service = await waitFor(() => suspendSwitch(h.accessory));
+    const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
 
-    await waitFor(() => (entryOf(h)?.state === "running") ? true : undefined);
+    await waitUntil(() => entryOf(h)?.state === "running", { description: "Alpha to classify as running" });
 
     service.clearWrites();
 
@@ -756,7 +752,7 @@ describe("HydrawiseController suspension commands composed into the projection",
     assert.equal(entryOf(h)?.state, "running", "while the projection keeps reporting the water that is demonstrably flowing");
 
     // The next poll finds the run finished, and the standing command classifies the zone it was issued against.
-    await waitFor(() => (entryOf(h)?.state === "suspended") ? true : undefined);
+    await waitUntil(() => entryOf(h)?.state === "suspended", { description: "Alpha to classify as suspended" });
 
     assert.equal(entryOf(h)?.state, "suspended", "the poll that ends the run closes the window");
   });
@@ -772,7 +768,7 @@ describe("HydrawiseController suspension commands composed into the projection",
 
     t.after(() => h.abort());
 
-    const service = await waitFor(() => suspendSwitch(h.accessory));
+    const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
 
     await service.getCharacteristic(Characteristic.On).triggerSet(true);
 
@@ -797,9 +793,9 @@ describe("HydrawiseController suspension commands composed into the projection",
 
     t.after(() => h.abort());
 
-    const all = await waitFor(() => suspendSwitch(h.accessory, SUSPEND_ALL_SUBTYPE));
+    const all = await waitFor(() => suspendSwitch(h.accessory, SUSPEND_ALL_SUBTYPE), { description: "the suspend-all switch to appear" });
 
-    await waitFor(() => (entryOf(h)?.state === "scheduled") ? true : undefined);
+    await waitUntil(() => entryOf(h)?.state === "scheduled", { description: "Alpha to classify as scheduled" });
 
     await all.getCharacteristic(Characteristic.On).triggerSet(true);
 
@@ -830,7 +826,7 @@ describe("HydrawiseController suspension commands composed into the projection",
 
     t.after(() => h.abort());
 
-    const service = await waitFor(() => suspendSwitch(h.accessory));
+    const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
 
     await service.getCharacteristic(Characteristic.On).triggerSet(true);
 
@@ -859,9 +855,9 @@ describe("HydrawiseController suspension commands composed into the projection",
 
     t.after(() => h.abort());
 
-    const service = await waitFor(() => suspendSwitch(h.accessory));
+    const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
 
-    await waitFor(() => (entryOf(h)?.state === "scheduled") ? true : undefined);
+    await waitUntil(() => entryOf(h)?.state === "scheduled", { description: "Alpha to classify as scheduled" });
 
     // A refresh lands first, for the same reason the assertion above states, and every count below is taken after it settles.
     applyFacts(h, { [ALPHA_RELAY_ID]: false }, now());
@@ -873,14 +869,14 @@ describe("HydrawiseController suspension commands composed into the projection",
 
     assert.equal(h.flushes.length, flushesBefore + 1, "the command writes the accessory cache exactly once");
     assert.equal(h.mqtt?.published.length, publishesBefore + 1, "publishes exactly once");
-    assert.equal(countLogged(h.lines(), "info", "Suspended until"), 1, "and narrates exactly once");
+    assert.equal(logCount(h.entries, "info", "Suspended until"), 1, "and narrates exactly once");
 
     // The same command again, against a classification that already reads suspended. Nothing moved, so nothing is written, published, or said.
     await service.getCharacteristic(Characteristic.On).triggerSet(true);
 
     assert.equal(h.flushes.length, flushesBefore + 1, "a command that moves no classification writes nothing");
-    assert.equal(h.mqtt?.published.length, publishesBefore + 1, "publishes nothing");
-    assert.equal(countLogged(h.lines(), "info", "Suspended until"), 1, "and narrates nothing a second time");
+    assert.equal(h.mqtt.published.length, publishesBefore + 1, "publishes nothing");
+    assert.equal(logCount(h.entries, "info", "Suspended until"), 1, "and narrates nothing a second time");
   });
 
   test("a suspend-all issued before the first poll classifies nothing and stamps its own answer", async (t) => {
@@ -895,7 +891,7 @@ describe("HydrawiseController suspension commands composed into the projection",
 
     t.after(() => h.abort());
 
-    const all = await waitFor(() => suspendSwitch(h.accessory, SUSPEND_ALL_SUBTYPE));
+    const all = await waitFor(() => suspendSwitch(h.accessory, SUSPEND_ALL_SUBTYPE), { description: "the suspend-all switch to appear" });
 
     await all.getCharacteristic(Characteristic.On).triggerSet(true);
 
@@ -919,7 +915,7 @@ describe("HydrawiseController suspension commands composed into the projection",
 
     t.after(() => h.abort());
 
-    await waitFor(() => suspendSwitch(h.accessory));
+    await waitUntil(() => suspendSwitch(h.accessory) !== undefined, { description: "Alpha's suspension switch to appear" });
 
     assert.equal(entryOf(h)?.state, "suspended", "the restored suspension carries through the first poll, which has no facts and no command of its own");
 
@@ -939,9 +935,9 @@ describe("HydrawiseController per-zone suspension hosting and sweeps", () => {
 
     t.after(() => h.abort());
 
-    const zoneAccessory = await waitFor(() => h.zoneAccessories.get(ALPHA_RELAY_ID));
+    const zoneAccessory = await waitFor(() => h.zoneAccessories.get(ALPHA_RELAY_ID), { description: "the zone's own accessory to appear" });
 
-    await waitFor(() => suspendSwitch(zoneAccessory));
+    await waitUntil(() => suspendSwitch(zoneAccessory) !== undefined, { description: "Alpha's suspension switch on the zone's own accessory to appear" });
 
     assert.equal(suspendSwitch(h.accessory), undefined, "the switch follows its zone's valve rather than staying behind on the controller");
 
@@ -963,14 +959,14 @@ describe("HydrawiseController per-zone suspension hosting and sweeps", () => {
 
     t.after(() => h.abort());
 
-    await waitFor(() => suspendSwitch(h.accessory));
+    await waitUntil(() => suspendSwitch(h.accessory) !== undefined, { description: "Alpha's suspension switch to appear" });
     assert.ok(suspendSwitch(h.accessory, SUSPEND_ALL_SUBTYPE), "both switches start out published");
 
     // Turn the per-zone switches off, leaving the account-wide one enabled. The two share the Switch service type, so a sweep matching on that type alone would
     // take both - and the user would silently lose a switch they never touched.
     h.platform.featureOptions.configuredOptions = [SUSPEND_ALL_ON];
 
-    await waitFor(() => (suspendSwitch(h.accessory) === undefined) ? true : undefined);
+    await waitUntil(() => suspendSwitch(h.accessory) === undefined, { description: "Alpha's suspension switch to be removed" });
 
     assert.ok(suspendSwitch(h.accessory, SUSPEND_ALL_SUBTYPE), "the account-wide switch is untouched by the per-zone sweep");
   });
@@ -985,19 +981,19 @@ describe("HydrawiseController per-zone suspension hosting and sweeps", () => {
 
     t.after(() => h.abort());
 
-    const service = await waitFor(() => suspendSwitch(h.accessory));
+    const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
 
     await service.getCharacteristic(Characteristic.On).triggerSet(true);
 
     // The zone falls off the wire, which takes its switch with it - the sweep answers to the walk, not to what was published last time.
-    await waitFor(() => (suspendSwitch(h.accessory) === undefined) ? true : undefined);
+    await waitUntil(() => suspendSwitch(h.accessory) === undefined, { description: "Alpha's suspension switch to be removed" });
 
     /* And its standing command goes too. Bringing the zone back with a snapshot that PREDATES that command is what makes the difference visible: a command left
      * behind would still be standing and would render the returning zone suspended, against an account that says it is not.
      */
     h.retrieve.programDefault("statusschedule.php", { body: schedule([ alphaZone(), betaZone() ]), kind: "response" });
 
-    const restored = await waitFor(() => suspendSwitch(h.accessory));
+    const restored = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
 
     applyFacts(h, { [ALPHA_RELAY_ID]: false, [BETA_RELAY_ID]: false }, now() - 5);
 
@@ -1017,6 +1013,6 @@ describe("HydrawiseController per-zone suspension hosting and sweeps", () => {
     await pollsCompleted(h, 2);
 
     assert.equal(h.accessory.services.filter(service => (service.UUID === Service.Switch.UUID)).length, 0, "no switch of any kind is published");
-    assert.equal(countLogged(h.lines(), "error", "Unable to"), 0, "and nothing failed trying");
+    assert.equal(logCount(h.entries, "error", "Unable to"), 0, "and nothing failed trying");
   });
 });

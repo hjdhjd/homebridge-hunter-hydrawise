@@ -1,20 +1,21 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
  * controller.roster.test.ts: The accessory-context identity rosters HydrawiseController persists - the self identity and denormalized account roster seeded
- * at construction (with a prior zone roster preserved or shape-degraded across the wipe), and the zone roster written and flushed on change from each poll. These pins
- * fix the zero-cloud-call source the webUI reads back: the full reported zone set (feature-disabled zones included), identity fields only, flushed exactly once per
- * change and never on an unchanged poll.
+ * at construction (with a prior zone roster preserved or shape-degraded across the wipe), and the zone roster written and flushed on change from each poll. These
+ * assertions fix the zero-cloud-call source the webUI reads back: the full reported zone set (feature-disabled zones included), identity fields only, flushed exactly
+ * once per change and never on an unchanged poll.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
 import type { HydrawiseAccessoryContext, HydrawiseControllerIdentity, HydrawiseZoneConfig, HydrawiseZoneIdentity, StatusScheduleResponse } from "./types.ts";
-import { assertSameShape, firstOf } from "./testing.helpers.ts";
 import { bareSensors, normalZoneMatrix } from "./api.fixtures.ts";
-import { buildController, waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
+import { expectAt, waitUntil } from "homebridge-plugin-utils/testing";
 import { fastPolling, makeStatusSchedule, makeZone, normalSchedule } from "./api.helpers.ts";
 import assert from "node:assert/strict";
+import { assertSameShape } from "./testing.helpers.ts";
+import { buildController } from "./testing/platform.helpers.ts";
 
 // The synthetic controller identity the default fixture carries, and a disabled sibling, so the denormalized account roster the platform passes in carries more than
 // one controller.
@@ -84,16 +85,16 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
 
     t.after(() => h.abort());
 
-    await waitFor(() => (h.flushes.length >= 1) ? true : undefined);
+    await waitUntil(() => h.flushes.length >= 1, { description: "the first accessory flush" });
 
     const zones = contextOf(h.accessory).zones;
 
     // The persisted roster carries every reported zone in relay order, the feature-disabled 700002 included, and each entry carries only its identity fields - a
     // deepEqual against the projection also proves no volatile wire field (run, time, timestr) leaked into the persisted context.
     assert.deepEqual(zones, zoneRoster(normalZoneMatrix), "the persisted roster is the full reported zone set projected to identity fields, ordered by relay");
-    assert.equal(zones?.length, normalZoneMatrix.length, "the persisted roster length equals the full reported relay count");
-    assert.ok(zones?.some(zone => zone.relayId === 700002), "a feature-disabled zone still appears in the persisted roster");
-    assert.deepEqual(Object.keys(firstOf(zones ?? [], "zone")).toSorted(), [ "name", "relay", "relayId" ], "each entry carries exactly the three identity fields");
+    assert.equal(zones.length, normalZoneMatrix.length, "the persisted roster length equals the full reported relay count");
+    assert.ok(zones.some(zone => zone.relayId === 700002), "a feature-disabled zone still appears in the persisted roster");
+    assert.deepEqual(Object.keys(expectAt(zones, 0, "zone")).toSorted(), [ "name", "relay", "relayId" ], "each entry carries exactly the three identity fields");
   });
 
   test("an unchanged second poll does not re-flush", async (t) => {
@@ -105,7 +106,7 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
 
     // Poll 1 seeds the roster from the empty seed and flushes once; every later poll reports the identical set. Bounding on the third call guarantees poll 2 fully
     // ran its field-wise comparison before we read, so a single flush proves the unchanged poll took the no-change return.
-    await waitFor(() => (h.retrieve.callsTo("statusschedule.php").length >= 3) ? true : undefined);
+    await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 3, { description: "the third status poll" });
     h.abort();
 
     assert.equal(h.flushes.length, 1, "only the first poll flushes; an unchanged poll does not re-flush");
@@ -125,11 +126,11 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
 
     t.after(() => h.abort());
 
-    await waitFor(() => (h.retrieve.callsTo("statusschedule.php").length >= 3) ? true : undefined);
+    await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 3, { description: "the third status poll" });
     h.abort();
 
     assert.equal(h.flushes.length, 2, "the matching first poll flushes the schedule seed alone; the rename then flushes exactly once");
-    assert.equal(firstOf(contextOf(h.accessory).zones ?? [], "zone").name, "Beta", "the persisted roster adopted the renamed zone");
+    assert.equal(expectAt(contextOf(h.accessory).zones ?? [], 0, "zone").name, "Beta", "the persisted roster adopted the renamed zone");
   });
 
   test("the schedule seed and a zone disappearance each flush exactly once", async (t) => {
@@ -146,7 +147,7 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
 
     t.after(() => h.abort());
 
-    await waitFor(() => (h.retrieve.callsTo("statusschedule.php").length >= 3) ? true : undefined);
+    await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 3, { description: "the third status poll" });
     h.abort();
 
     assert.equal(h.flushes.length, 2, "the matching first poll flushes the schedule seed alone; the vanished zone then flushes exactly once");
@@ -160,7 +161,7 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
 
     t.after(() => h.abort());
 
-    await waitFor(() => (h.flushes.length >= 1) ? true : undefined);
+    await waitUntil(() => h.flushes.length >= 1, { description: "the first accessory flush" });
 
     const context = contextOf(h.accessory);
     const referenceController: HydrawiseControllerIdentity = { controllerId: 0, name: "", serialNumber: "" };

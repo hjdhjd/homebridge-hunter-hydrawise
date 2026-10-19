@@ -14,12 +14,13 @@
 import { Characteristic, Service, TestAccessory } from "./testing/hap.helpers.ts";
 import { HAP_DEFAULT_MODEL, HOMEBRIDGE_UNKNOWN_FIRMWARE, HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
 import type { HydrawiseControllerHardware, StatusScheduleResponse } from "./types.ts";
-import { buildController, makeV2Facts, waitFor } from "./testing/platform.helpers.ts";
+import { buildController, makeV2Facts } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
 import type { CharacteristicType } from "./testing/hap.helpers.ts";
 import assert from "node:assert/strict";
 import { bareSensors } from "./api.fixtures.ts";
+import { waitUntil } from "homebridge-plugin-utils/testing";
 
 const CONTROLLER_SERIAL = "SN0A1B2C3D4";
 const STANDALONE_RELAY_ID = 700001;
@@ -274,7 +275,8 @@ describe("HydrawiseController standalone zone hardware", () => {
 
     h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: now() });
 
-    await waitFor(() => h.zoneAccessories.get(STANDALONE_RELAY_ID)?.getServiceById(Service.Valve, STANDALONE_SUBTYPE) ? true : undefined);
+    await waitUntil(() => h.zoneAccessories.get(STANDALONE_RELAY_ID)?.getServiceById(Service.Valve, STANDALONE_SUBTYPE) !== undefined,
+      { description: "the standalone zone's valve on its own accessory to appear" });
 
     const zoneAccessory = h.zoneAccessories.get(STANDALONE_RELAY_ID);
 
@@ -311,7 +313,8 @@ describe("HydrawiseController standalone zone hardware", () => {
     information?.updateCharacteristic(Characteristic.Model, "Some Stale Model");
     h.zoneAccessories.set(STANDALONE_RELAY_ID, restored);
 
-    await waitFor(() => restored.getServiceById(Service.Valve, STANDALONE_SUBTYPE) ? true : undefined);
+    await waitUntil(() => restored.getServiceById(Service.Valve, STANDALONE_SUBTYPE) !== undefined,
+      { description: "the standalone zone's valve on the restored accessory to appear" });
 
     assert.equal(informationValue(restored, Characteristic.FirmwareRevision), HOMEBRIDGE_UNKNOWN_FIRMWARE, "the stale zone firmware is reset");
     assert.equal(informationValue(restored, Characteristic.Model), PLACEHOLDER_MODEL, "and the stale zone model with it");
@@ -371,7 +374,7 @@ describe("HydrawiseController controller availability", () => {
      */
     const h = buildController({ seedContext: (seed) => {
 
-      seed.getService(Service.IrrigationSystem)?.updateCharacteristic(Characteristic.StatusFault, Characteristic.StatusFault.GENERAL_FAULT);
+      seed.addService(Service.IrrigationSystem).updateCharacteristic(Characteristic.StatusFault, Characteristic.StatusFault.GENERAL_FAULT);
     } });
 
     assert.equal(hasFault(h), false, "a stale fault reading is removed rather than left standing");
@@ -427,19 +430,19 @@ describe("HydrawiseController controller availability", () => {
 
     h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: now() });
 
-    assert.equal(h.lines().filter(line => line.message.includes("controller is")).length, 0, "a first reading of OFFLINE narrates nothing");
+    assert.equal(h.entries.filter(line => line.message.includes("controller is")).length, 0, "a first reading of OFFLINE narrates nothing");
 
     h.controller.applyFacts({ facts: makeV2Facts({ online: true }), fetchedAt: now() });
 
-    const back = h.lines().filter(line => (line.level === "info") && line.message.includes("back online"));
+    const back = h.entries.filter(line => (line.level === "info") && line.message.includes("back online"));
 
     assert.equal(back.length, 1, "the flip back is narrated exactly once");
 
     // A repeat of the same reading is not a transition, so it says nothing further.
     h.controller.applyFacts({ facts: makeV2Facts({ online: true }), fetchedAt: now() });
-    assert.equal(h.lines().filter(line => line.message.includes("back online")).length, 1, "an unchanged reading narrates nothing further");
+    assert.equal(h.entries.filter(line => line.message.includes("back online")).length, 1, "an unchanged reading narrates nothing further");
 
     h.controller.applyFacts({ facts: makeV2Facts({ online: null }), fetchedAt: now() });
-    assert.equal(h.lines().filter(line => line.message.includes("controller is")).length, 1, "and neither does a refresh that could not tell");
+    assert.equal(h.entries.filter(line => line.message.includes("controller is")).length, 1, "and neither does a refresh that could not tell");
   });
 });

@@ -16,15 +16,14 @@ import { HYDRAWISE_TRANSPORT_FAULT_SENTENCES, HYDRAWISE_V2_BUDGET_CALLS, HYDRAWI
   HYDRAWISE_V2_GRAPH_ENDPOINT, HYDRAWISE_V2_MUTATION_ADMISSION_TIMEOUT, HYDRAWISE_V2_MUTATION_BUDGET_CALLS, HYDRAWISE_V2_MUTATION_BUDGET_WINDOW,
   HYDRAWISE_V2_TOKEN_ENDPOINT } from "./settings.ts";
 import { MockAgent, errors } from "undici";
+import { capturingLog, errnoError, formatLogEntry } from "homebridge-plugin-utils/testing";
 import { describe, test } from "node:test";
-import type { CapturedLogLine } from "./testing.helpers.ts";
 import type { HydrawiseTransportFault } from "./settings.ts";
 import { HydrawiseV2Client } from "./v2.ts";
 import { RateBudget } from "homebridge-plugin-utils";
+import type { TestLogEntry } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
-import { capturingLog } from "./testing.helpers.ts";
 import { setTimeout as delay } from "node:timers/promises";
-import util from "node:util";
 
 // The origin every v2 request targets, derived from the endpoint constant exactly as the client derives its own pool origin.
 const V2_ORIGIN = new URL(HYDRAWISE_V2_GRAPH_ENDPOINT).origin;
@@ -119,7 +118,7 @@ interface V2Harness {
   budget: RateBudget;
   calls: RecordedCall[];
   client: HydrawiseV2Client;
-  lines: () => CapturedLogLine[];
+  entries: readonly TestLogEntry[];
   mutationBudget: RateBudget;
 }
 
@@ -134,7 +133,7 @@ interface V2Harness {
 function makeV2Harness(program: (agent: MockAgent, record: (path: string) => void) => void,
   options: { capacity?: number; mutationCapacity?: number; signal?: AbortSignal } = {}): V2Harness {
 
-  const { lines, logger } = capturingLog();
+  const log = capturingLog();
   const signal = options.signal ?? new AbortController().signal;
   const budget = new RateBudget({ capacity: options.capacity ?? HYDRAWISE_V2_BUDGET_CALLS, signal, window: HYDRAWISE_V2_BUDGET_WINDOW * 1000 });
   const mutationBudget = new RateBudget({ capacity: options.mutationCapacity ?? HYDRAWISE_V2_MUTATION_BUDGET_CALLS, signal,
@@ -149,10 +148,10 @@ function makeV2Harness(program: (agent: MockAgent, record: (path: string) => voi
     calls.push({ budgetAvailableAtDispatch: budget.available, mutationAvailableAtDispatch: mutationBudget.available, path });
   });
 
-  const client = new HydrawiseV2Client({ budget, dispatcherFactory: (): MockAgent => agent, log: logger, mutationBudget, password: "test-password", signal,
+  const client = new HydrawiseV2Client({ budget, dispatcherFactory: (): MockAgent => agent, log, mutationBudget, password: "test-password", signal,
     username: "test-user" });
 
-  return { budget, calls, client, lines, mutationBudget };
+  return { budget, calls, client, entries: log.entries, mutationBudget };
 }
 
 // Spend every slot of ONE ceiling, leaving the other exactly as it was. Saturating one bucket and watching the traffic that draws the other carry on is the whole
@@ -204,17 +203,11 @@ function programGraph(agent: MockAgent, record: (path: string) => void, body: ob
   }).persist();
 }
 
-// The operator-visible text of one captured line. The plugin logs printf-style, so a sentence and the detail it carries can sit in different arguments and only the
-// formatted line is what a user actually reads - which is what an assertion about the reported wording has to run against.
-function formatted(line: CapturedLogLine): string {
+// The error lines a capture holds, rendered the way a user reads them. The plugin logs printf-style, so a sentence and the detail it carries can sit in different
+// arguments and only the rendered line is what a user actually reads - which is what an assertion about the reported wording has to run against.
+function errorLines(entries: readonly TestLogEntry[]): string[] {
 
-  return util.format(line.message, ...line.args);
-}
-
-// The error lines a harness captured, already formatted.
-function errorLines(lines: CapturedLogLine[]): string[] {
-
-  return lines.filter(line => line.level === "error").map(line => formatted(line));
+  return entries.filter(line => line.level === "error").map(formatLogEntry);
 }
 
 describe("HydrawiseV2Client tokens", () => {
@@ -460,17 +453,17 @@ describe("HydrawiseV2Client account facts", () => {
     // The model is held to the DESCRIPTION, which is the full name a user recognizes. The capture carries the shorter name field beside it, so a mapping that
     // reached for that instead would answer "38 Zones" here.
     assert.deepEqual(entry?.hardware, { firmware: "4.76", model: "HCC 38 Zones" }, "the captured controller composes its captured model and firmware");
-    assert.equal(entry?.online, true, "the captured controller reports itself reachable");
+    assert.equal(entry.online, true, "the captured controller reports itself reachable");
 
     /* The per-zone facts land on their OWN ids, which is the correlation claim. The suspended zone carries its captured instant and the quiet one carries null,
      * so a composer that keyed zones positionally, or that joined on the display number instead of the id, would swap these two.
      */
-    assert.equal(entry?.zones.get(SUSPENDED_ZONE_ID)?.suspendedUntil, SUSPENDED_UNTIL, "the suspended zone carries its own suspension instant");
-    assert.equal(entry?.zones.get(QUIET_ZONE_ID)?.suspendedUntil, null, "a zone answering a null suspension is not suspended");
+    assert.equal(entry.zones.get(SUSPENDED_ZONE_ID)?.suspendedUntil, SUSPENDED_UNTIL, "the suspended zone carries its own suspension instant");
+    assert.equal(entry.zones.get(QUIET_ZONE_ID)?.suspendedUntil, null, "a zone answering a null suspension is not suspended");
 
     // The covered zone is the one the sensor names, and the sensor reads tripped, so exactly that zone is sensor-stopped while its uncovered sibling is not.
-    assert.equal(entry?.zones.get(QUIET_ZONE_ID)?.sensorStopped, true, "the zone the tripped sensor covers reads as stopped");
-    assert.equal(entry?.zones.get(SUSPENDED_ZONE_ID)?.sensorStopped, false, "a zone no tripped sensor covers reads as not stopped, rather than as unknown");
+    assert.equal(entry.zones.get(QUIET_ZONE_ID)?.sensorStopped, true, "the zone the tripped sensor covers reads as stopped");
+    assert.equal(entry.zones.get(SUSPENDED_ZONE_ID)?.sensorStopped, false, "a zone no tripped sensor covers reads as not stopped, rather than as unknown");
   });
 
   test("carries each zone's full name, and composes null for any answer that is not one", async () => {
@@ -486,7 +479,7 @@ describe("HydrawiseV2Client account facts", () => {
     // The account's own name for each zone, landing on that zone's own entry. The key-based wire truncates these at roughly fifteen characters, which is the whole
     // reason the enrichment reaches for them.
     assert.equal(entry?.zones.get(QUIET_ZONE_ID)?.name, "Parkway North", "a zone carries the name the account reports for it");
-    assert.equal(entry?.zones.get(SUSPENDED_ZONE_ID)?.name, "Sideyard Vegetable Garden", "including one longer than the key-based API can express");
+    assert.equal(entry.zones.get(SUSPENDED_ZONE_ID)?.name, "Sideyard Vegetable Garden", "including one longer than the key-based API can express");
   });
 
   test("carries the controller's own name, trimmed, and composes null for any answer that is not one", async () => {
@@ -685,8 +678,8 @@ describe("HydrawiseV2Client account facts", () => {
      * empty firmware in HomeKit, so it composes nothing at all - but the suspension and availability facts on the same controller are unaffected.
      */
     assert.equal(entry?.hardware, null, "a partial hardware block composes nothing rather than half a shape");
-    assert.equal(entry?.online, true, "the controller's other facts are untouched by its incomplete hardware");
-    assert.equal(entry?.zones.get(SUSPENDED_ZONE_ID)?.suspendedUntil, SUSPENDED_UNTIL, "and so are its zones");
+    assert.equal(entry.online, true, "the controller's other facts are untouched by its incomplete hardware");
+    assert.equal(entry.zones.get(SUSPENDED_ZONE_ID)?.suspendedUntil, SUSPENDED_UNTIL, "and so are its zones");
   });
 
   test("a controller with no model description composes no hardware", async () => {
@@ -729,7 +722,7 @@ describe("HydrawiseV2Client account facts", () => {
     const entry = (await harness.client.fetchAccountFacts())?.get(1058515);
 
     assert.equal(entry?.zones.size, 2, "the zone with no id contributes no entry");
-    assert.equal(entry?.zones.get(SUSPENDED_ZONE_ID)?.suspendedUntil, SUSPENDED_UNTIL, "its correlatable siblings compose exactly as they would have");
+    assert.equal(entry.zones.get(SUSPENDED_ZONE_ID)?.suspendedUntil, SUSPENDED_UNTIL, "its correlatable siblings compose exactly as they would have");
   });
 
   test("a query draws the rate budget BEFORE it reaches the wire, on top of the grant's own draw", async () => {
@@ -769,7 +762,7 @@ describe("HydrawiseV2Client failure classification", () => {
 
     // The reported line is read as the operator sees it, whole. The read's own sentence and the account's message reach the log as separate printf arguments, so
     // an assertion against either argument alone would check half the sentence and pass while the other half went missing.
-    assert.deepEqual(errorLines(harness.lines()), ["Unable to retrieve enhanced controller details: Internal server error."],
+    assert.deepEqual(errorLines(harness.entries), ["Unable to retrieve enhanced controller details: Internal server error."],
       "the reported failure names the read that failed and what the API said was wrong");
   });
 
@@ -785,7 +778,7 @@ describe("HydrawiseV2Client failure classification", () => {
 
     // The status branch's own sentence, asserted whole for the same reason the errors branch above is: the read states what it was doing and the transport states
     // what it got, and the two reach the log as separate arguments of one line.
-    assert.deepEqual(errorLines(harness.lines()), ["Unable to retrieve enhanced controller details. The Hydrawise API answered with status 429."],
+    assert.deepEqual(errorLines(harness.entries), ["Unable to retrieve enhanced controller details. The Hydrawise API answered with status 429."],
       "the throttled read is reported under the read's own sentence");
   });
 
@@ -817,7 +810,7 @@ describe("HydrawiseV2Client failure classification", () => {
 
     // Read as the operator sees it, whole. The read composes its own sentence with the reason the transport handed back, so what is asserted is the line rather
     // than whichever argument a given composition happens to put it in.
-    const reported = errorLines(harness.lines());
+    const reported = errorLines(harness.entries);
 
     assert.equal(reported.length, 1, "it is reported exactly once");
     assert.ok(reported[0]?.startsWith("Unable to retrieve enhanced controller details: "), "under the read's own sentence");
@@ -846,7 +839,7 @@ describe("HydrawiseV2Client failure classification", () => {
      * bare, so a shutdown arriving while a scheduled read was still queued would otherwise surface as an unhandled rejection at teardown.
      */
     assert.equal(await read, null, "a read torn down while queued answers null like every other recoverable failure");
-    assert.deepEqual(errorLines(harness.lines()), [], "and a shutdown is not an error");
+    assert.deepEqual(errorLines(harness.entries), [], "and a shutdown is not an error");
     assert.deepEqual(harness.calls, [], "nothing reached the wire");
   });
 
@@ -871,7 +864,7 @@ describe("HydrawiseV2Client failure classification", () => {
     const result = await harness.client.fetchAccountFacts();
 
     assert.equal(result, null, "a shutdown reached mid-request answers null");
-    assert.equal(harness.lines().filter(line => line.level === "error").length, 0, "a shutdown is not an error and reports nothing");
+    assert.equal(harness.entries.filter(line => line.level === "error").length, 0, "a shutdown is not an error and reports nothing");
   });
 });
 
@@ -946,7 +939,7 @@ describe("HydrawiseV2Client zone suspension", () => {
 
       // A refusal reported inside a clean 200 is the command's own business to report, so the client says nothing at all about it - the one sentence the user reads
       // belongs to the controller, which knows which zone was touched.
-      assert.deepEqual(errorLines(harness.lines()), [], "an in-band answer is never narrated by the client");
+      assert.deepEqual(errorLines(harness.entries), [], "an in-band answer is never narrated by the client");
     }
   });
 
@@ -963,7 +956,7 @@ describe("HydrawiseV2Client zone suspension", () => {
      */
     assert.deepEqual(await harness.client.setZoneSuspension({ until: PROBE_SUSPEND_UNTIL, zoneId: QUIET_ZONE_ID }),
       { reason: "The Hydrawise API answered with status 502.", status: "failed" }, "the transport's reason travels back in the result");
-    assert.deepEqual(errorLines(harness.lines()), [], "and the client says nothing about a command's failure, whatever caused it");
+    assert.deepEqual(errorLines(harness.entries), [], "and the client says nothing about a command's failure, whatever caused it");
   });
 
   test("a GraphQL errors array likewise carries the account's words back rather than logging them", async () => {
@@ -976,7 +969,7 @@ describe("HydrawiseV2Client zone suspension", () => {
 
     assert.deepEqual(await harness.client.setZoneSuspension({ until: null, zoneId: QUIET_ZONE_ID }), { reason: "Cannot query field.", status: "failed" },
       "a body-level errors array is a failed command whose reason is what the API said");
-    assert.deepEqual(errorLines(harness.lines()), [], "reported by nobody at this layer");
+    assert.deepEqual(errorLines(harness.entries), [], "reported by nobody at this layer");
   });
 
   test("a command that times out re-arms the pool, and still leaves the reporting to its caller", async () => {
@@ -987,7 +980,7 @@ describe("HydrawiseV2Client zone suspension", () => {
     const first = destroyable(new MockAgent());
     const second = new MockAgent();
     const built = [ first, second ];
-    const { lines, logger } = capturingLog();
+    const log = capturingLog();
     const signal = new AbortController().signal;
 
     first.disableNetConnect();
@@ -998,7 +991,7 @@ describe("HydrawiseV2Client zone suspension", () => {
       .replyWithError(new DOMException("The operation was aborted due to timeout", "TimeoutError")).persist();
 
     const client = new HydrawiseV2Client({ budget: new RateBudget({ capacity: HYDRAWISE_V2_BUDGET_CALLS, signal, window: HYDRAWISE_V2_BUDGET_WINDOW * 1000 }),
-      dispatcherFactory: (): MockAgent => built.shift() ?? second, log: logger,
+      dispatcherFactory: (): MockAgent => built.shift() ?? second, log,
       mutationBudget: new RateBudget({ capacity: HYDRAWISE_V2_MUTATION_BUDGET_CALLS, signal, window: HYDRAWISE_V2_MUTATION_BUDGET_WINDOW * 1000 }),
       password: "test-password", signal, username: "test-user" });
 
@@ -1006,7 +999,7 @@ describe("HydrawiseV2Client zone suspension", () => {
       { reason: "The Hydrawise API took too long to respond, which can usually be safely ignored.", status: "failed" },
       "the timeout's reason travels back for the controller to say");
     assert.equal(client.dispatcher, second, "and the wedged pool was replaced all the same");
-    assert.deepEqual(errorLines(lines()), [], "with nothing said here about the command that provoked it");
+    assert.deepEqual(errorLines(log.entries), [], "with nothing said here about the command that provoked it");
   });
 
   test("a saturated command ceiling rejects the command having spent NOTHING on it", async (t) => {
@@ -1070,7 +1063,7 @@ describe("HydrawiseV2Client zone suspension", () => {
     // The faces of the misclassification this structure exists to make unrepresentable. An admission abort that reached the failure classification would
     // re-arm the pool, would report itself as a request that took too long, and - by way of the grant it aborted - would reset the token state.
     assert.equal(harness.client.dispatcher, pool, "an admission abort never re-arms the connection pool");
-    assert.deepEqual(errorLines(harness.lines()), [], "and never narrates itself as a request timeout, or as anything else");
+    assert.deepEqual(errorLines(harness.entries), [], "and never narrates itself as a request timeout, or as anything else");
 
     // Let the grant land and confirm it was neither abandoned nor reset: the very next caller finds a usable token and spends no second grant.
     released();
@@ -1137,7 +1130,7 @@ describe("HydrawiseV2Client zone suspension", () => {
     assert.equal(harness.budget.available, HYDRAWISE_V2_BUDGET_CALLS - 1, "and the grant spent one slot of the read ceiling and no more");
     assert.deepEqual(harness.calls.map(call => call.path), [ TOKEN_PATH, GRAPH_PATH ], "the grant dispatches before the mutation it authenticates");
     assert.equal(harness.calls[1]?.budgetAvailableAtDispatch, HYDRAWISE_V2_BUDGET_CALLS - 1, "with the mutation dispatching against the grant's spent read slot");
-    assert.equal(harness.calls[1]?.mutationAvailableAtDispatch, HYDRAWISE_V2_MUTATION_BUDGET_CALLS - 1, "and against its own already-spent admission slot");
+    assert.equal(harness.calls[1].mutationAvailableAtDispatch, HYDRAWISE_V2_MUTATION_BUDGET_CALLS - 1, "and against its own already-spent admission slot");
   });
 
   test("a command admitted on a roomy command ceiling still gives up when the drained READ ceiling cannot pay for its token renewal", async (t) => {
@@ -1219,7 +1212,7 @@ describe("HydrawiseV2Client zone suspension", () => {
     controller.abort("shutdown");
 
     assert.deepEqual(await command, { status: "rejected" }, "a command torn down mid-admission is rejected");
-    assert.deepEqual(harness.lines().filter(line => line.level !== "debug"), [], "and a shutdown narrates nothing, at any level a user reads");
+    assert.deepEqual(harness.entries.filter(line => line.level !== "debug"), [], "and a shutdown narrates nothing, at any level a user reads");
   });
 
   test("a command holding a warm token completes with the READ ceiling fully saturated", async (t) => {
@@ -1313,7 +1306,7 @@ describe("HydrawiseV2Client dispatcher", () => {
     const first = destroyable(new MockAgent());
     const second = new MockAgent();
     const built = [ first, second ];
-    const { lines, logger } = capturingLog();
+    const log = capturingLog();
     const signal = new AbortController().signal;
 
     first.disableNetConnect();
@@ -1325,7 +1318,7 @@ describe("HydrawiseV2Client dispatcher", () => {
       .replyWithError(new DOMException("The operation was aborted due to timeout", "TimeoutError")).persist();
 
     const client = new HydrawiseV2Client({ budget: new RateBudget({ capacity: HYDRAWISE_V2_BUDGET_CALLS, signal, window: HYDRAWISE_V2_BUDGET_WINDOW * 1000 }),
-      dispatcherFactory: (): MockAgent => built.shift() ?? second, log: logger,
+      dispatcherFactory: (): MockAgent => built.shift() ?? second, log,
       mutationBudget: new RateBudget({ capacity: HYDRAWISE_V2_MUTATION_BUDGET_CALLS, signal, window: HYDRAWISE_V2_MUTATION_BUDGET_WINDOW * 1000 }),
       password: "test-password", signal, username: "test-user" });
 
@@ -1337,7 +1330,7 @@ describe("HydrawiseV2Client dispatcher", () => {
      * was already abandoned while leaving the live one open.
      */
     assert.equal(client.dispatcher, second, "the timeout re-armed the pool, and the getter answers the live one");
-    assert.ok(lines().some(line => (line.level === "error") && line.message.includes("too long to respond")), "the timeout is reported to the user");
+    assert.ok(log.entries.some(line => (line.level === "error") && line.message.includes("too long to respond")), "the timeout is reported to the user");
   });
 
   test("a response deadline re-arms the connection pool exactly as the request deadline does", async () => {
@@ -1345,7 +1338,7 @@ describe("HydrawiseV2Client dispatcher", () => {
     const first = destroyable(new MockAgent());
     const second = new MockAgent();
     const built = [ first, second ];
-    const { lines, logger } = capturingLog();
+    const log = capturingLog();
     const signal = new AbortController().signal;
 
     first.disableNetConnect();
@@ -1356,14 +1349,14 @@ describe("HydrawiseV2Client dispatcher", () => {
     first.get(V2_ORIGIN).intercept({ method: "POST", path: TOKEN_PATH }).replyWithError(new errors.HeadersTimeoutError()).persist();
 
     const client = new HydrawiseV2Client({ budget: new RateBudget({ capacity: HYDRAWISE_V2_BUDGET_CALLS, signal, window: HYDRAWISE_V2_BUDGET_WINDOW * 1000 }),
-      dispatcherFactory: (): MockAgent => built.shift() ?? second, log: logger,
+      dispatcherFactory: (): MockAgent => built.shift() ?? second, log,
       mutationBudget: new RateBudget({ capacity: HYDRAWISE_V2_MUTATION_BUDGET_CALLS, signal, window: HYDRAWISE_V2_MUTATION_BUDGET_WINDOW * 1000 }),
       password: "test-password", signal, username: "test-user" });
 
     assert.equal(client.dispatcher, first, "the client starts on the dispatcher its factory built");
     assert.equal(await client.ensureToken(), null, "a grant that outran the response deadline answers null");
     assert.equal(client.dispatcher, second, "the deadline re-armed the pool, and the getter answers the live one");
-    assert.ok(lines().some(line => (line.level === "error") && line.message.includes("too long to respond")), "and the deadline is reported to the user");
+    assert.ok(log.entries.some(line => (line.level === "error") && line.message.includes("too long to respond")), "and the deadline is reported to the user");
   });
 
   test("every coded transport fault is reported as the sentence the plugin keeps for its kind", async () => {
@@ -1392,22 +1385,22 @@ describe("HydrawiseV2Client dispatcher", () => {
       const first = destroyable(new MockAgent());
       const second = new MockAgent();
       const built = [ first, second ];
-      const { lines, logger } = capturingLog();
+      const log = capturingLog();
       const signal = new AbortController().signal;
 
       first.disableNetConnect();
       second.disableNetConnect();
       first.get(V2_ORIGIN).intercept({ method: "POST", path: TOKEN_PATH })
-        .replyWithError(Object.assign(new Error("a transport fault"), { code: row.code })).persist();
+        .replyWithError(errnoError("a transport fault", row.code)).persist();
 
       const client = new HydrawiseV2Client({ budget: new RateBudget({ capacity: HYDRAWISE_V2_BUDGET_CALLS, signal, window: HYDRAWISE_V2_BUDGET_WINDOW * 1000 }),
-        dispatcherFactory: (): MockAgent => built.shift() ?? second, log: logger,
+        dispatcherFactory: (): MockAgent => built.shift() ?? second, log,
         mutationBudget: new RateBudget({ capacity: HYDRAWISE_V2_MUTATION_BUDGET_CALLS, signal, window: HYDRAWISE_V2_MUTATION_BUDGET_WINDOW * 1000 }),
         password: "test-password", signal, username: "test-user" });
 
       // eslint-disable-next-line no-await-in-loop
       assert.equal(await client.ensureToken(), null, "a coded transport fault answers the same null every failed grant does");
-      assert.deepEqual(errorLines(lines()),
+      assert.deepEqual(errorLines(log.entries),
         ["Unable to sign in to your Hydrawise account for enhanced features. " + HYDRAWISE_TRANSPORT_FAULT_SENTENCES[row.kind]],
         "and it reads as the sign-in sentence joined to the fault's own by a period");
       assert.equal(client.dispatcher, first, "while a fault that is not a deadline leaves the pool alone");
@@ -1423,11 +1416,11 @@ describe("HydrawiseV2Client dispatcher", () => {
 
       programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
       agent.get(V2_ORIGIN).intercept({ method: "POST", path: GRAPH_PATH })
-        .replyWithError(Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }));
+        .replyWithError(errnoError("connect ECONNREFUSED", "ECONNREFUSED"));
     });
 
     assert.deepEqual(await harness.client.setZoneSuspension({ until: PROBE_SUSPEND_UNTIL, zoneId: QUIET_ZONE_ID }),
       { reason: HYDRAWISE_TRANSPORT_FAULT_SENTENCES.refused, status: "failed" }, "the fault's own sentence travels back for the controller to say");
-    assert.deepEqual(errorLines(harness.lines()), [], "with nothing said here about the command that provoked it");
+    assert.deepEqual(errorLines(harness.entries), [], "with nothing said here about the command that provoked it");
   });
 });

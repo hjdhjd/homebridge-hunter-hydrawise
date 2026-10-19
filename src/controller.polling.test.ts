@@ -1,6 +1,6 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * controller.polling.test.ts: The structure of the polling loop, as distinct from what any single poll projects. Pins the terminal fault - a poll body
+ * controller.polling.test.ts: The structure of the polling loop, as distinct from what any single poll projects. Asserts the terminal fault - a poll body
  * that survives the shape guard but breaks the pass kills the loop once, reports once, and polls no more - the first-run handler attachment for a valve that came
  * back from the accessory cache rather than being created by this pass, and the ordering between the loop's wire half and its projection half.
  */
@@ -9,8 +9,8 @@
 /* eslint-disable camelcase */
 import { Characteristic, Service } from "./testing/hap.helpers.ts";
 import type { HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
-import { assertNoUnhandledRejections, firstOf } from "./testing.helpers.ts";
-import { buildController, countLogged, waitFor } from "./testing/platform.helpers.ts";
+import { assertNoUnhandledRejections, expectAt, logCount, waitUntil } from "homebridge-plugin-utils/testing";
+import { buildController, waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
 import type { TestAccessory } from "./testing/hap.helpers.ts";
@@ -43,7 +43,7 @@ function scheduledZone(): HydrawiseZoneConfig {
 }
 
 /* A poll body that PASSES the shape guard and then breaks the loop's WIRE half. The guard is deliberately shallow - relays and sensors are arrays, nextpoll is a
- * number - so a relay entry carrying no name at all rides straight through it and fails at the name trim, the first thing the wire half does with the entry it
+ * number - so a relay entry carrying no name at all passes straight through it and fails at the name trim, the first thing the wire half does with the entry it
  * fetched. The cast is what lets the fixture express a body the wire could plausibly return but the wire types cannot describe.
  */
 function wireCrashingSchedule(): StatusScheduleResponse {
@@ -75,59 +75,55 @@ describe("HydrawiseController polling loop structure", () => {
 
   test("a poll body that breaks the wire half kills the loop once, reports once, and polls no more", async (t) => {
 
-    const cleanup = assertNoUnhandledRejections();
-    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: wireCrashingSchedule(), kind: "response" }),
-      signalAborted: false });
+    await assertNoUnhandledRejections(async () => {
 
-    t.after(() => {
+      const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: wireCrashingSchedule(), kind: "response" }),
+        signalAborted: false });
 
-      h.abort();
-      cleanup();
+      t.after(() => h.abort());
+
+      /* This fixture throws inside the loop's wire half, at the name trim. Its sibling below throws inside the projection half instead, and the two assert the
+       * same observables: the halves sit under one envelope, so a fault from either has to arrive at the same reporter and end the same loop. Covering only one
+       * side would leave a regression that swallowed the other side's throw free to pass.
+       */
+      await waitUntil(() => logCount(h.entries, "error", "stopped unexpectedly") >= 1, { description: "an error line containing \"stopped unexpectedly\"" });
+
+      const pollsAtFault = h.retrieve.callsTo("statusschedule.php").length;
+
+      // Give a loop that survived its fault every chance to poll again. The cadence is roughly 250ms, so this span covers several intervals; a loop that is genuinely
+      // dead makes no further call in it.
+      await delay(SEVERAL_CADENCES_MS);
+
+      assert.equal(logCount(h.entries, "error", "stopped unexpectedly"), 1, "a terminal fault is reported exactly once, not once per poll");
+      assert.equal(h.retrieve.callsTo("statusschedule.php").length, pollsAtFault, "the loop is dead until the plugin restarts, so no further poll is issued");
+      assert.equal(pollsAtFault, 1, "the fault fires on the first poll, so exactly one poll preceded it");
     });
-
-    /* This fixture throws inside the loop's wire half, at the name trim. Its sibling below throws inside the projection half instead, and the two assert the
-     * same observables: the halves sit under one envelope, so a fault from either has to arrive at the same reporter and end the same loop. Covering only one
-     * side would leave a regression that swallowed the other side's throw free to pass.
-     */
-    await waitFor(() => (countLogged(h.lines(), "error", "stopped unexpectedly") >= 1) ? true : undefined);
-
-    const pollsAtFault = h.retrieve.callsTo("statusschedule.php").length;
-
-    // Give a loop that survived its fault every chance to poll again. The cadence is roughly 250ms, so this span covers several intervals; a loop that is genuinely
-    // dead makes no further call in it.
-    await delay(SEVERAL_CADENCES_MS);
-
-    assert.equal(countLogged(h.lines(), "error", "stopped unexpectedly"), 1, "a terminal fault is reported exactly once, not once per poll");
-    assert.equal(h.retrieve.callsTo("statusschedule.php").length, pollsAtFault, "the loop is dead until the plugin restarts, so no further poll is issued");
-    assert.equal(pollsAtFault, 1, "the fault fires on the first poll, so exactly one poll preceded it");
   });
 
   test("a poll body that breaks the projection half kills the loop once, reports once, and polls no more", async (t) => {
 
-    const cleanup = assertNoUnhandledRejections();
-    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: applierCrashingSchedule(), kind: "response" }),
-      signalAborted: false });
+    await assertNoUnhandledRejections(async () => {
 
-    t.after(() => {
+      const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: applierCrashingSchedule(), kind: "response" }),
+        signalAborted: false });
 
-      h.abort();
-      cleanup();
+      t.after(() => h.abort());
+
+      /* The sibling of the assertion above, aimed at the other half. This fixture survives everything the wire half does to it and throws in the projection's own body,
+       * which is what makes the pair distinguishing: an envelope that covered only the wire half - a projection call wrapped in a swallowing catch, say - would
+       * satisfy the assertion above while this one hung with no report at all.
+       */
+      await waitUntil(() => logCount(h.entries, "error", "stopped unexpectedly") >= 1, { description: "an error line containing \"stopped unexpectedly\"" });
+
+      const pollsAtFault = h.retrieve.callsTo("statusschedule.php").length;
+
+      // The same span the sibling allows, for the same reason: a loop that outlived its fault gets several cadences to prove it by polling again.
+      await delay(SEVERAL_CADENCES_MS);
+
+      assert.equal(logCount(h.entries, "error", "stopped unexpectedly"), 1, "a projection fault is reported exactly once, not once per poll");
+      assert.equal(h.retrieve.callsTo("statusschedule.php").length, pollsAtFault, "the loop is dead until the plugin restarts, so no further poll is issued");
+      assert.equal(pollsAtFault, 1, "the fault fires on the first poll, so exactly one poll preceded it");
     });
-
-    /* The sibling of the pin above, aimed at the other half. This fixture survives everything the wire half does to it and throws in the projection's own body,
-     * which is what makes the pair distinguishing: an envelope that covered only the wire half - a projection call wrapped in a swallowing catch, say - would
-     * satisfy the pin above while this one hung with no report at all.
-     */
-    await waitFor(() => (countLogged(h.lines(), "error", "stopped unexpectedly") >= 1) ? true : undefined);
-
-    const pollsAtFault = h.retrieve.callsTo("statusschedule.php").length;
-
-    // The same span the sibling allows, for the same reason: a loop that outlived its fault gets several cadences to prove it by polling again.
-    await delay(SEVERAL_CADENCES_MS);
-
-    assert.equal(countLogged(h.lines(), "error", "stopped unexpectedly"), 1, "a projection fault is reported exactly once, not once per poll");
-    assert.equal(h.retrieve.callsTo("statusschedule.php").length, pollsAtFault, "the loop is dead until the plugin restarts, so no further poll is issued");
-    assert.equal(pollsAtFault, 1, "the fault fires on the first poll, so exactly one poll preceded it");
   });
 
   test("a valve restored from the accessory cache still gets its set handler attached on the first poll", async (t) => {
@@ -144,17 +140,17 @@ describe("HydrawiseController polling loop structure", () => {
      * new-valve arm never runs; what attaches the handler is the first-run flag alone, and that flag is read from the pre-fetch sentinel in the loop's wire half
      * and carried across to the projection. A break in that channel leaves this valve with no handler, and a HomeKit set on it would silently do nothing.
      */
-    const valve = await waitFor(() => h.accessory.getServiceById(Service.Valve, ZONE_SUBTYPE));
+    const valve = await waitFor(() => h.accessory.getServiceById(Service.Valve, ZONE_SUBTYPE), { description: "the zone valve to appear" });
 
     // Waiting for the valve is not enough on its own: the seeded service exists before the first poll ever runs. Waiting for the zone's status line proves the pass
     // that attaches the handler has actually been through.
-    await waitFor(() => (countLogged(h.lines(), "info", "Next run will be") >= 1) ? true : undefined);
+    await waitUntil(() => logCount(h.entries, "info", "Next run will be") >= 1, { description: "an info line containing \"Next run will be\"" });
     await valve.getCharacteristic(Characteristic.Active).triggerSet(Characteristic.Active.ACTIVE);
 
-    const command = firstOf(h.retrieve.callsTo("setzone.php"), "setzone call");
+    const command = expectAt(h.retrieve.callsTo("setzone.php"), 0, "setzone call");
 
     assert.equal(command.params?.["action"], "run", "the set handler attached to the restored valve dispatches the run command");
-    assert.equal(command.params?.["relay_id"], ZONE_SUBTYPE, "the dispatched command targets the restored valve's own zone");
+    assert.equal(command.params["relay_id"], ZONE_SUBTYPE, "the dispatched command targets the restored valve's own zone");
   });
 
   test("the wire half never runs a poll ahead of the projection", async (t) => {
@@ -174,12 +170,12 @@ describe("HydrawiseController polling loop structure", () => {
      * ran ahead of the projection, buffering completed polls for a decoupled consumer, would open that lead to two or more, which is what these samples catch.
      * Both counts come from recorders the harness already keeps; nothing here is instrumented for the occasion.
      */
-    await waitFor(() => {
+    await waitUntil(() => {
 
       samples.push({ fetches: h.retrieve.callsTo("statusschedule.php").length, published: mqtt.published.length });
 
-      return (mqtt.published.length >= POLLS_OBSERVED) ? true : undefined;
-    }, { intervalMs: 1 });
+      return mqtt.published.length >= POLLS_OBSERVED;
+    }, { description: "the MQTT publish of every observed poll", pollMs: 1 });
 
     const worst = samples.reduce((lead, sample) => Math.max(lead, sample.fetches - sample.published), 0);
 

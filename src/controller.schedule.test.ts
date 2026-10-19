@@ -13,13 +13,12 @@ import { HYDRAWISE_RAIN_SENSOR_TYPE, HYDRAWISE_UNSCHEDULED_SENTINEL, isScheduleS
 import type { HydrawiseAccessoryContext, HydrawiseScheduleStatus, HydrawiseZoneConfig, HydrawiseZoneIdentity, HydrawiseZoneScheduleState,
   StatusScheduleResponse } from "./types.ts";
 import { bareSensors, normalZoneMatrix, rainSensors, sentinelZoneMatrix, syntheticController } from "./api.fixtures.ts";
-import { buildController, buildPlatform, makeV2Facts, makeZoneV2Facts, waitFor } from "./testing/platform.helpers.ts";
+import { buildController, buildPlatform, makeV2Facts, makeZoneV2Facts, pollsCompleted } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
+import { expectAt, waitUntil } from "homebridge-plugin-utils/testing";
 import { fastPolling, makeStatusSchedule, makeZone, normalSchedule, rainStopped } from "./api.helpers.ts";
-import type { BuildControllerResult } from "./testing/platform.helpers.ts";
 import { HYDRAWISE_ACTIVE_ZONE_INDICATOR } from "./settings.ts";
 import assert from "node:assert/strict";
-import { firstOf } from "./testing.helpers.ts";
 
 // The wire root time the bespoke scenarios stamp, and the one-poll-interval step the drift scenarios advance it by. A nominal Hydrawise poll is sixty seconds, so
 // stepping the root clock by sixty while the zones' countdowns fall by the same sixty is exactly the steady state a live controller reports.
@@ -83,13 +82,6 @@ function scheduleOf(accessory: { context: unknown }): HydrawiseScheduleStatus {
   return persisted;
 }
 
-// Wait until the controller has completed more than the given number of polls, which is what guarantees the poll before it fully ran its comparisons before a test
-// reads the flush count.
-async function pollsCompleted(h: BuildControllerResult, count: number): Promise<void> {
-
-  await waitFor(() => (h.retrieve.callsTo("statusschedule.php").length > count) ? true : undefined);
-}
-
 // The all-scheduled drift matrix: two zones whose countdowns fall by exactly one poll interval per step while their run durations hold. The scheduled arm's stored
 // absolutes are the sums of the root time and these countdowns, so every step of this matrix projects to the identical facts.
 function scheduledDrift(step: number): HydrawiseZoneConfig[] {
@@ -114,7 +106,7 @@ describe("HydrawiseController schedule classification", () => {
 
     const status = normalSchedule();
     const projection = scheduleStatus(status, HYDRAWISE_ACTIVE_ZONE_INDICATOR);
-    const running = firstOf(projection.zones, "zone");
+    const running = expectAt(projection.zones, 0, "zone");
 
     // Relay 1 is the matrix's running zone: its end instant is the root time plus the run remaining, and the arm carries no duration at all - persisting the live
     // countdown is exactly what the absolute-time shape exists to avoid, so its absence is asserted on the key set rather than merely on a value.
@@ -203,7 +195,7 @@ describe("HydrawiseController schedule classification", () => {
       const projection = scheduleStatus(makeStatusSchedule({ relays: [ sentinelZone(), sibling ],
         sensors: sensorsCovering([ ALPHA_RELAY_ID, BETA_RELAY_ID ]), time: ROOT_TIME }), HYDRAWISE_ACTIVE_ZONE_INDICATOR);
 
-      assert.equal(firstOf(projection.zones, "zone").state, "unscheduled", "a sibling still reporting " + label + " leaves its sensor's group unstopped");
+      assert.equal(expectAt(projection.zones, 0, "zone").state, "unscheduled", "a sibling still reporting " + label + " leaves its sensor's group unstopped");
     }
   });
 
@@ -314,7 +306,7 @@ describe("HydrawiseController schedule persistence (poll)", () => {
 
     t.after(() => h.abort());
 
-    await waitFor(() => (h.flushes.length >= 1) ? true : undefined);
+    await waitUntil(() => h.flushes.length >= 1, { description: "the first accessory flush" });
 
     // The projection takes no feature parameter and structurally cannot exclude a zone, so this assertion guards a future writer who threads the enabled-zone set into
     // it rather than distinguishing what the code does today.
@@ -353,7 +345,7 @@ describe("HydrawiseController schedule persistence (poll)", () => {
     await pollsCompleted(h, 2);
     h.abort();
 
-    const persisted = firstOf(scheduleOf(h.accessory).zones, "zone");
+    const persisted = expectAt(scheduleOf(h.accessory).zones, 0, "zone");
 
     assert.equal(h.flushes.length, 1, "a running zone whose remaining time fell in lockstep with the clock costs no cache write");
     assert.deepEqual(persisted, { endsAt: ROOT_TIME + 600, relayId: ALPHA_RELAY_ID, state: "running" },
@@ -380,7 +372,7 @@ describe("HydrawiseController schedule persistence (poll)", () => {
     h.abort();
 
     const persisted = scheduleOf(h.accessory);
-    const alpha = firstOf(persisted.zones, "zone");
+    const alpha = expectAt(persisted.zones, 0, "zone");
 
     assert.equal(h.flushes.length, 2, "the seed flushes once and the moved schedule flushes once");
     assert.deepEqual(alpha, { durationSeconds: 480, nextRunAt: ROOT_TIME + 68000 - POLL_STEP, relayId: ALPHA_RELAY_ID, state: "scheduled" },
@@ -391,7 +383,7 @@ describe("HydrawiseController schedule persistence (poll)", () => {
   test("one zone swapped for another at the same zone count is a change, not a match", async (t) => {
 
     const before = scheduledDrift(0);
-    const after = [ firstOf(before, "zone"), makeZone({ name: "Gamma", relay: 3, relay_id: 700003, run: 300, time: 69000, timestr: "16:08" }) ];
+    const after = [ expectAt(before, 0, "zone"), makeZone({ name: "Gamma", relay: 3, relay_id: 700003, run: 300, time: 69000, timestr: "16:08" }) ];
 
     const h = buildController({ program: (recorder) => {
 
@@ -432,7 +424,7 @@ describe("HydrawiseController schedule persistence (poll)", () => {
     // persisted value itself: a rename changes no schedule fact, and asOf therefore holds too.
     assert.equal(h.flushes.length, 1, "the matching first poll flushes nothing and the rename flushes exactly once");
     assert.deepEqual(scheduleOf(h.accessory), seeded, "a zone rename moves no schedule fact, asOf included");
-    assert.equal(firstOf(contextOf(h.accessory).zones ?? [], "zone").name, "Beta", "the persisted roster adopted the renamed zone");
+    assert.equal(expectAt(contextOf(h.accessory).zones ?? [], 0, "zone").name, "Beta", "the persisted roster adopted the renamed zone");
   });
 });
 
@@ -538,7 +530,7 @@ describe("HydrawiseController schedule exclusivity", () => {
 
     // Declared reach: the reconcile assigns a complete fresh object, so this assertion passes against the code as written and guards a future writer who reaches
     // for a field write instead.
-    assert.deepEqual(Object.keys(firstOf(registered, "accessory").context).toSorted(), [ "ownerController", "zone" ],
+    assert.deepEqual(Object.keys(expectAt(registered, 0, "accessory").context).toSorted(), [ "ownerController", "zone" ],
       "no schedule projection reaches a standalone zone accessory's context");
   });
 });
