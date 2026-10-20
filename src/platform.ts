@@ -4,9 +4,9 @@
  */
 import type { API, Characteristic, DynamicPlatformPlugin, HAP, Logging, PlatformAccessory, PlatformConfig } from "homebridge";
 import { APIEvent, FeatureOptions, MQTT_AVAILABILITY_OFFLINE, RateBudget, TimerRegistry, armDeadline, classifyTransportError, composeSignals, createApiDispatcher,
-  createMqttClient, debugGatedLog, formatErrorMessage, loopFaultReporter, mqttTopic, notResponding, retry, sanitizeName, superviseLoop,
+  createMqttClient, debugGatedLog, formatErrorMessage, loopFaultReporter, mqttTopic, notResponding, repeatDemotedLog, retry, sanitizeName, superviseLoop,
   systemClock } from "homebridge-plugin-utils";
-import type { Categories, Clock, HomebridgePluginLogging, MqttClient, Nullable } from "homebridge-plugin-utils";
+import type { Categories, Clock, HomebridgePluginLogging, MqttClient, Nullable, RepeatDemotedLog } from "homebridge-plugin-utils";
 import type { CustomerDetailsResponse, HydrawiseAccessory, HydrawiseAccessoryContext, HydrawiseControllerAccessory, HydrawiseControllerConfig,
   HydrawiseControllerIdentity, HydrawiseEndpoint, HydrawiseZoneIdentity, HydrawiseZoneSuspensionResult } from "./types.ts";
 import { HYDRAWISE_API_BASE_URL, HYDRAWISE_API_BUDGET_CALLS, HYDRAWISE_API_BUDGET_WINDOW, HYDRAWISE_API_RETRY_ATTEMPTS, HYDRAWISE_API_RETRY_INTERVAL,
@@ -24,6 +24,19 @@ import { HydrawiseV2Client } from "./v2.ts";
 import { STATUS_CODES } from "node:http";
 import { mqttTopics } from "./mqtt.ts";
 import util from "node:util";
+
+/* Why one request through retrieve() failed, the tag the platform's request log compares with the reason it remembers: every transport kind the classifier names
+ * that this plugin reports, and every status arm that refuses a response. A shutdown is not among them, because a shutdown is not news. The tags are spelled out
+ * here rather than derived from the library's kinds, so a kind the library learns to name becomes a reason only once this plugin says what it means, the same
+ * rule the exhaustive switch in the request holds.
+ */
+type HydrawiseRequestFailure = "certificate" | "connect-timeout" | "destroyed" | "dns" | "invalid-key" | "rate-limit" | "refused" | "reset" | "retries-exhausted" |
+  "timeout" | "transport" | "unexpected-status";
+
+/* What one request through retrieve() came to: the response it was answered with, a shutdown, which is no failure, or the tag of the reason it failed. The request
+ * log classifies the request from it before it releases the request's lines, and retrieve() answers its caller from it.
+ */
+type HydrawiseRequestOutcome = { response: Dispatcher.ResponseData<unknown>; status: "answered" } | { status: "aborted" } | { status: HydrawiseRequestFailure };
 
 export class HydrawisePlatform implements DynamicPlatformPlugin {
 
@@ -45,6 +58,18 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   public readonly hap: HAP;
   public readonly log: HomebridgePluginLogging;
   public readonly mqtt: Nullable<MqttClient>;
+
+  /* The request log: how every request through retrieve() reports its failure. One adapter serves the platform's whole life, so a failure is reported in full the
+   * first time, at debug for as long as the same reason holds, and in full again once the reason changes or a request succeeds in between. A reader at debug still
+   * sees every failure.
+   *
+   * The attempt is the whole request, because retrieve() is the one path every call to the key-based API takes - discovery, each controller's poll, and each
+   * command - so one adapter covers every failure class it classifies, a revoked key, a reached rate limit, a dead host and a stalled request alike, with no
+   * bookkeeping at any caller. Requests that overlap share the adapter's one remembered reason, as the library states: the last request to settle is what the next
+   * is weighed against, so a controller meeting the failure another controller's request has just reported reads it at debug, and a request failing for a
+   * different reason is reported in full.
+   */
+  private readonly requestFailures: RepeatDemotedLog<HydrawiseRequestFailure>;
   private readonly shutdownController: AbortController;
   public readonly signal: AbortSignal;
   public readonly timers: TimerRegistry;
@@ -106,6 +131,10 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
      * logger Homebridge handed us untouched, and that object stays Homebridge's own.
      */
     this.log = debugGatedLog(log, (): boolean => this.config.debug === true);
+
+    // The request log is built over the gated logger, so a repeat demoted to debug meets the user's debug setting exactly as every other debug line does.
+    this.requestFailures = repeatDemotedLog<HydrawiseRequestFailure>(this.log);
+
     this.mqtt = null;
 
     // Scope an AbortController to the platform's lifetime. We assign it and its signal at the top of the constructor, before the missing-API-key early return below,
@@ -898,20 +927,35 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   // Communicate HTTP requests with the Hydrawise API.
   public async retrieve(endpoint: HydrawiseEndpoint, params?: Record<string, string>): Promise<Nullable<Dispatcher.ResponseData<unknown>>> {
 
+    // Run the request as one attempt of the request log, which weighs a failure's reason against the last one's before it releases the request's lines, and answer
+    // the caller from what the request came to: the response, or null for a failure or a shutdown.
+    const outcome = await this.requestFailures.attempt(async (log): Promise<HydrawiseRequestOutcome> => this.attemptRequest({ endpoint, log, params }),
+      (result): HydrawiseRequestFailure | undefined => (((result.status === "aborted") || (result.status === "answered")) ? undefined : result.status));
+
+    return (outcome.status === "answered") ? outcome.response : null;
+  }
+
+  /* One request to the Hydrawise API, as the request log runs it. Every line it writes goes through the logger the attempt hands in, and it answers what the
+   * request came to, which the log classifies before it releases the request's lines.
+   */
+  private async attemptRequest({ endpoint, log, params }: { endpoint: HydrawiseEndpoint; log: HomebridgePluginLogging;
+    params?: Record<string, string>; }): Promise<HydrawiseRequestOutcome> {
+
     let response: Dispatcher.ResponseData<unknown>;
 
-    // The request URL, assembled inside the try below once the budgets have admitted this call. It is declared out here because the timeout branch of the catch
-    // reports it, and a variable assigned only inside a try cannot be read from its own catch. The empty starting value is never what reaches that log: the only
-    // steps preceding the assignment are the budget waits, and the sole way any of them ends early is a shutdown rejection, which the catch answers above the
-    // timeout branch.
-    let url = "";
+    // The request URL as the timeout branch reports it, with the API key redacted, because a debug log is what a user pastes into an issue. It is assembled inside
+    // the try below once the budgets have admitted this call and declared out here because the timeout branch of the catch reports it, and a variable assigned
+    // only inside a try cannot be read from its own catch. The empty starting value is never what reaches that log: the only steps preceding the assignment are
+    // the budget waits, and the sole way any of them ends early is a shutdown rejection, which the catch answers above the timeout branch.
+    let loggedUrl = "";
 
     try {
 
       /* Pace this call against both ceilings Hydrawise publishes, at the one place every request to the API passes through. A zone command draws the stricter
        * command budget first and the account-wide budget second, so a command queued behind a saturated command window is not also holding an account slot while
        * it waits. Every wait sits inside this try, which is what makes an escaping budget rejection unrepresentable: a shutdown while a caller is queued rejects
-       * into the classification below, whose aborted-signal branch returns the same quiet null every other teardown path returns.
+       * into the classification below, whose aborted-signal branch answers a shutdown, the outcome retrieve() returns as the same quiet null every other teardown
+       * path returns.
        *
        * Two limits on what these budgets can promise, stated plainly. They admit LOGICAL calls and sit above undici's retry interceptor, so one admitted call can
        * still put more than one request on the wire during a failure storm - the initial attempt plus whatever retries the dispatcher factory's retry policy
@@ -930,9 +974,11 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
       params["api_key"] = this.config.apiKey;
 
-      const queryParams = new URLSearchParams(params);
+      const url = HYDRAWISE_API_BASE_URL + endpoint + "?" + new URLSearchParams(params).toString();
+      const redacted = new URLSearchParams(params);
 
-      url = HYDRAWISE_API_BASE_URL + endpoint + "?" + queryParams.toString();
+      redacted.set("api_key", "redacted");
+      loggedUrl = HYDRAWISE_API_BASE_URL + endpoint + "?" + redacted.toString();
 
       /* Compose a per-request timeout with the platform's shutdown signal, so a slow request aborts on the timeout and an in-flight request aborts on shutdown, all
        * through one signal handed to undici. The timeout is armed only now, after the budgets have admitted the call, so a wait for a rate-limit slot never eats
@@ -954,9 +1000,9 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
         await response.body.dump();
 
-        this.log.error("Invalid API key. Please check your Hydrawise API key.");
+        log.error("Invalid API key. Please check your Hydrawise API key.");
 
-        return null;
+        return { status: "invalid-key" };
       }
 
       // API rate limit exceeded. The pool does not retry this status, so the limit is reported the moment Hydrawise says so.
@@ -964,9 +1010,9 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
         await response.body.dump();
 
-        this.log.error("Hydrawise API rate limit has been exceeded.");
+        log.error("Hydrawise API rate limit has been exceeded.");
 
-        return null;
+        return { status: "rate-limit" };
       }
 
       // Any other response outside the 2xx success range is an error, reported with its status code and reason phrase. A server error never arrives here: the pool
@@ -975,12 +1021,12 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
         await response.body.dump();
 
-        this.log.error("The Hydrawise API answered a request with an unexpected status of %s %s.", response.statusCode, STATUS_CODES[response.statusCode] ?? "");
+        log.error("The Hydrawise API answered a request with an unexpected status of %s %s.", response.statusCode, STATUS_CODES[response.statusCode] ?? "");
 
-        return null;
+        return { status: "unexpected-status" };
       }
 
-      return response;
+      return { response, status: "answered" };
     } catch(error) {
 
       const failure = classifyTransportError(error, this.signal);
@@ -995,17 +1041,17 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
         // re-arm the pool after shutdown.
         case "aborted":
 
-          return null;
+          return { status: "aborted" };
 
         // A deadline elapsed: our own per-request timeout, or a response that stalled after it began. With a single HTTP/2 connection a wedged session carries every
         // request on it, so we reset the network stack rather than wait on the wedge.
         case "timeout":
 
-          this.log.error("The Hydrawise API is taking too long to respond to a request. This error can usually be safely ignored.");
-          this.log.debug("Original request was: %s", url);
+          log.error("The Hydrawise API is taking too long to respond to a request. This error can usually be safely ignored.");
+          log.debug("Original request was: %s", loggedUrl);
           this.initNetworking();
 
-          return null;
+          return { status: "timeout" };
 
         // A concrete transport fault - a network failure, or a certificate the platform refused to trust - named by the sentence the plugin keeps for it.
         case "certificate":
@@ -1016,16 +1062,16 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
         case "reset":
         case "retries-exhausted":
 
-          this.log.error(HYDRAWISE_TRANSPORT_FAULT_SENTENCES[failure.kind]);
+          log.error(HYDRAWISE_TRANSPORT_FAULT_SENTENCES[failure.kind]);
 
-          return null;
+          return { status: failure.kind };
 
         // A genuine failure carrying no marker anyone can read. The full dump is the only useful thing to say about it, and it carries whatever code the chain held.
         case "transport":
 
-          this.log.error(util.inspect(error, { colors: true, depth: null, sorted: true }));
+          log.error(util.inspect(error, { colors: true, depth: null, sorted: true }));
 
-          return null;
+          return { status: "transport" };
       }
     }
   }

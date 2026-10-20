@@ -2,7 +2,8 @@
  *
  * platform.retrieve.test.ts: The HydrawisePlatform.retrieve() HTTP path, exercised against a REAL platform whose undici traffic is driven through a
  * MockAgent installed as the global dispatcher after construction. Covers the happy 200, the invalid-key and rate-limit status branches, the bug-1 status gate,
- * the shutdown-abort short circuit, the connection-error taxonomy, and the bounded timeout branch.
+ * the shutdown-abort short circuit, the connection-error taxonomy, the bounded timeout branch, and the report of a failure that repeats: once at error, each
+ * repeat at debug, and in full again after a success or a change of reason.
  *
  * The Pool's TLS posture is not observable through this MockAgent swap: the swap stands in for the global dispatcher, so the real Pool's connect options never run
  * and it exposes no reflectable view of them. The connection's certificate validation therefore has no executable assertion here, in either direction.
@@ -12,7 +13,7 @@
 /* eslint-disable camelcase */
 import { HYDRAWISE_ORIGIN, buildPlatform, dispatcherOf, installMockDispatcher, programJsonReply, programStatusReply } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
-import { errnoError, loggedAt } from "homebridge-plugin-utils/testing";
+import { errnoError, logCount, loggedAt } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
 import { errors } from "undici";
 
@@ -292,7 +293,8 @@ describe("HydrawisePlatform retrieve", () => {
 
   test("returns null and re-arms networking on the request timeout branch", { timeout: 15000 }, async (t) => {
 
-    const { emit, entries, platform } = buildPlatform();
+    // Debug is on so the request line the timeout branch writes reaches the capture, through the warn channel the platform's debug gate emits on.
+    const { emit, entries, platform } = buildPlatform({ debug: true });
 
     t.after(() => emit(SHUTDOWN_EVENT));
     await using dispatcher = installMockDispatcher();
@@ -306,6 +308,9 @@ describe("HydrawisePlatform retrieve", () => {
 
     assert.equal(response, null, "a request that exceeds the timeout budget should return null");
     assert.ok(loggedAt(entries, "error", "taking too long"), "the timeout branch should log the slow-response message");
+    assert.ok(loggedAt(entries, "warn", "Original request was"), "the timeout branch names the request at debug");
+    assert.ok(loggedAt(entries, "warn", "api_key=redacted"), "with the API key redacted from the query it reports");
+    assert.ok(!loggedAt(entries, "warn", "test-api-key"), "so the key itself never reaches the log");
   });
 
   test("returns null and re-arms networking on a response deadline", async (t) => {
@@ -328,5 +333,87 @@ describe("HydrawisePlatform retrieve", () => {
     assert.ok(loggedAt(entries, "error", "taking too long"), "a response deadline should log the slow-response message");
     assert.notEqual(dispatcherOf(platform), armed, "the deadline re-arms the stack, so the platform holds a different dispatcher");
     assert.equal(armed?.destroyed, true, "and the pool it replaced was destroyed rather than left open");
+  });
+
+  test("reports a repeated failure once at error and replays the repeat at debug", async (t) => {
+
+    // Debug is on so the demoted replay reaches the capture, through the warn channel the platform's debug gate emits on.
+    const { emit, entries, platform } = buildPlatform({ debug: true });
+
+    t.after(() => emit(SHUTDOWN_EVENT));
+    await using dispatcher = installMockDispatcher();
+
+    // Each status reply answers one request, in the order it was programmed.
+    programStatusReply(dispatcher.agent, "customerdetails.php", 404);
+    programStatusReply(dispatcher.agent, "customerdetails.php", 404);
+
+    assert.equal(await platform.retrieve("customerdetails.php"), null, "the first 404 returns null");
+    assert.equal(await platform.retrieve("customerdetails.php"), null, "and so does the repeat, so no caller sees the demotion");
+    assert.equal(logCount(entries, "error", "Invalid API key"), 1, "the invalid key is reported at error once");
+    assert.equal(logCount(entries, "warn", "Invalid API key"), 1, "and its repeat is replayed at debug");
+  });
+
+  test("reports a failure in full again once a request succeeds in between", async (t) => {
+
+    // Debug is on so a replay, were one wrongly made, would reach the capture rather than be dropped by the gate.
+    const { emit, entries, platform } = buildPlatform({ debug: true });
+
+    t.after(() => emit(SHUTDOWN_EVENT));
+    await using dispatcher = installMockDispatcher();
+
+    // A status reply rather than a JSON one for the success, because the JSON form persists and would answer the last request too.
+    programStatusReply(dispatcher.agent, "customerdetails.php", 404);
+    programStatusReply(dispatcher.agent, "customerdetails.php", 200, { controller_id: 500001 });
+    programStatusReply(dispatcher.agent, "customerdetails.php", 404);
+
+    assert.equal(await platform.retrieve("customerdetails.php"), null, "the first 404 returns null");
+
+    const response = await platform.retrieve("customerdetails.php");
+
+    assert.ok(response, "the 200 between the failures returns the response");
+    await response.body.dump();
+
+    assert.equal(await platform.retrieve("customerdetails.php"), null, "the second 404 returns null");
+    assert.equal(logCount(entries, "error", "Invalid API key"), 2, "the success between them restores the full report, so each 404 reads at error");
+    assert.equal(logCount(entries, "warn", "Invalid API key"), 0, "and neither is replayed at debug");
+  });
+
+  test("reports a changed failure reason in full", async (t) => {
+
+    // Debug is on so a replay, were one wrongly made, would reach the capture rather than be dropped by the gate.
+    const { emit, entries, platform } = buildPlatform({ debug: true });
+
+    t.after(() => emit(SHUTDOWN_EVENT));
+    await using dispatcher = installMockDispatcher();
+    programStatusReply(dispatcher.agent, "customerdetails.php", 404);
+    programStatusReply(dispatcher.agent, "customerdetails.php", 429);
+
+    assert.equal(await platform.retrieve("customerdetails.php"), null, "the 404 returns null");
+    assert.equal(await platform.retrieve("customerdetails.php"), null, "and so does the 429");
+    assert.equal(logCount(entries, "error", "Invalid API key"), 1, "the invalid key is reported at error");
+    assert.equal(logCount(entries, "error", "rate limit"), 1, "and the rate limit after it, a different reason, is reported at error too");
+    assert.equal(logCount(entries, "warn", "rate limit"), 0, "rather than replayed at debug");
+  });
+
+  test("reports a repeated transport failure once at error and replays the repeat at debug", async (t) => {
+
+    // Debug is on so the demoted replay reaches the capture, through the warn channel the platform's debug gate emits on.
+    const { emit, entries, platform } = buildPlatform({ debug: true });
+
+    t.after(() => emit(SHUTDOWN_EVENT));
+    await using dispatcher = installMockDispatcher();
+
+    // A failure the catch arms classify rather than a status arm, so the demotion is proven on the transport side of the request too. Each intercept answers one
+    // request.
+    for(let attempt = 0; attempt < 2; attempt++) {
+
+      dispatcher.agent.get(HYDRAWISE_ORIGIN).intercept({ method: "GET", path: (path: string): boolean => path.includes("customerdetails.php") })
+        .replyWithError(errnoError("connect ECONNREFUSED", "ECONNREFUSED"));
+    }
+
+    assert.equal(await platform.retrieve("customerdetails.php"), null, "the first refused connection returns null");
+    assert.equal(await platform.retrieve("customerdetails.php"), null, "and so does the repeat");
+    assert.equal(logCount(entries, "error", "Connection refused"), 1, "the refused connection is reported at error once");
+    assert.equal(logCount(entries, "warn", "Connection refused"), 1, "and its repeat is replayed at debug");
   });
 });
