@@ -3,8 +3,8 @@
  * platform.configure.test.ts: Discovery and lifecycle behavior of the HydrawisePlatform, driven by firing the captured DID_FINISH_LAUNCHING handler to
  * run the private configureHydrawise against a MockAgent-backed wire. Covers the discovery happy path, the short-circuiting second pass and cached-accessory reuse,
  * orphan pruning, the bug-16 device gate in both directions, the no-API-key early return, the bug-2 debug routing, the MQTT construction arms, the discovery
- * retry failure paths, the shutdown teardown, the refusal a restored accessory answers with until its controller vouches for it, and the retained offline the
- * platform states for a restored controller this run does not build.
+ * retry failure paths, the shutdown teardown and the retained offline it states first for each built controller, the refusal a restored accessory answers with
+ * until its controller vouches for it, and the retained offline the platform states for a restored controller this run does not build.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as controller_id, so camelcase is disabled here to let the controller fixture mirror the wire verbatim.
@@ -13,11 +13,12 @@ import { Characteristic, Service } from "./testing/hap.helpers.ts";
 import { HydrawiseReservedNames, suspendZoneSubtype, zoneAccessoryId } from "./types.ts";
 import { MqttClient, onAbort } from "homebridge-plugin-utils";
 import type { TestAccessory, TestCharacteristic } from "./testing/hap.helpers.ts";
-import { buildPlatform, dispatcherOf, installMockDispatcher, isNotResponding, programJsonReply, programStatusReply, seedAccessory,
+import { TestMqttClient, buildPlatform, dispatcherOf, installMockDispatcher, isNotResponding, programJsonReply, programStatusReply, seedAccessory,
   v2DispatcherOf } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
-import { logCount, loggedAt, present, waitUntil } from "homebridge-plugin-utils/testing";
+import { logCount, loggedAt, present, settle, waitUntil } from "homebridge-plugin-utils/testing";
 import { makeCustomerDetails, normalSchedule } from "./api.helpers.ts";
+import { HYDRAWISE_SHUTDOWN_GRACE } from "./settings.ts";
 import type { MqttConnectHandler } from "homebridge-plugin-utils";
 import assert from "node:assert/strict";
 import { syntheticController } from "./api.fixtures.ts";
@@ -32,6 +33,27 @@ const SHUTDOWN = "shutdown";
 function untrimmedCustomerDetails(): ReturnType<typeof makeCustomerDetails> {
 
   return makeCustomerDetails({ controllers: [{ ...syntheticController, name: "  Test Controller  " }] });
+}
+
+// Stand the library's recording MQTT double where the platform's client goes, so a row reads what shutdown publishes and can refuse it. The platform is built with
+// no broker URL, so no client of its own is displaced, and the double's lifetime is the row's own, which its `await using` binding ends.
+function installMqttDouble(platform: Parameters<typeof seedAccessory>[0]): TestMqttClient {
+
+  const mqtt = new TestMqttClient();
+
+  (platform as unknown as { mqtt: TestMqttClient }).mqtt = mqtt;
+
+  return mqtt;
+}
+
+// The synthetic controller's availability topic tail, composed as the controller composes its own word and as shutdown composes the offline one.
+const AVAILABILITY = syntheticController.serial_number + "/availability";
+
+// Race a shutdown against two macrotask turns, the one its wire yield costs and one more, answering which came first, so a row tells a teardown that ran at once
+// from one waiting out the grace.
+async function shutdownWithinATurn(platform: Parameters<typeof seedAccessory>[0]): Promise<boolean> {
+
+  return Promise.race([ platform.shutdown().then(() => true), settle(2).then(() => false) ]);
 }
 
 describe("HydrawisePlatform configure", () => {
@@ -297,7 +319,10 @@ describe("HydrawisePlatform configure", () => {
     assert.equal(platform.signal.aborted, false, "the platform signal is live before shutdown");
     assert.equal(dispatcherOf(platform)?.destroyed, false, "the dispatcher is live before shutdown");
 
+    // This row fires Homebridge's own event rather than calling shutdown(), so it is the one that proves the registration, and it waits for the abort because
+    // the handler's word precedes the teardown.
     emit(SHUTDOWN);
+    await waitUntil(() => platform.signal.aborted, { description: "the shutdown handler's abort" });
 
     assert.equal(platform.signal.aborted, true, "the shutdown handler aborts the platform signal");
     assert.equal(dispatcherOf(platform)?.destroyed, true, "the shutdown handler destroys the platform dispatcher");
@@ -325,13 +350,13 @@ describe("HydrawisePlatform configure", () => {
       destroyedAtAbort = dispatcherOf(platform)?.destroyed;
     });
 
-    emit(SHUTDOWN);
+    await platform.shutdown();
 
     assert.equal(destroyedAtAbort, false, "the abort runs first, while the dispatcher is still live");
-    assert.equal(dispatcherOf(platform)?.destroyed, true, "the dispatcher is destroyed by the time the shutdown handler returns, in the same synchronous frame");
+    assert.equal(dispatcherOf(platform)?.destroyed, true, "the dispatcher is destroyed by the time the awaited shutdown handler resolves");
   });
 
-  test("shutdown destroys the account-credentialed dispatcher too, and aborts before it", (t) => {
+  test("shutdown destroys the account-credentialed dispatcher too, and aborts before it", async (t) => {
 
     /* The account-credentialed twin of the v1 dispatcher-teardown assertions above. Its own transport keeps its own keep-alive pool, so it owns a teardown
      * registration of its own, and without this assertion deleting that registration reds nothing: the pool simply outlives the plugin, holding a connection
@@ -356,10 +381,129 @@ describe("HydrawisePlatform configure", () => {
       destroyedAtAbort = v2DispatcherOf(platform)?.destroyed;
     });
 
-    emit(SHUTDOWN);
+    await platform.shutdown();
 
     assert.equal(destroyedAtAbort, false, "the abort runs first, while the second dispatcher is still live");
     assert.equal(v2DispatcherOf(platform)?.destroyed, true, "the shutdown handler destroys the account-credentialed dispatcher as well");
+  });
+
+  test("shutdown states each built controller offline, retained, and waits for the word to be written before it aborts the signal", async () => {
+
+    const { emit, platform } = buildPlatform();
+
+    await using mqtt = installMqttDouble(platform);
+    await using dispatcher = installMockDispatcher();
+    programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
+    programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
+
+    emit(DID_FINISH_LAUNCHING);
+
+    // The controller states offline as it is built and online once its first poll lands, so the row waits for the online word: an offline recorded after it can
+    // only be the one shutdown states.
+    await waitUntil(() => mqtt.publishedTo(AVAILABILITY).at(-1)?.payload === "online", { description: "the controller's first online word" });
+
+    const before = mqtt.publishedTo(AVAILABILITY).length;
+
+    /* Sample the topic AT ABORT TIME. The double outlives the platform's signal, so a word published after the abort would still be recorded and the end state
+     * could not tell it from one published before; the frame the abort runs in is the only place the order is observable. A recorded word was also published
+     * while the client was connected, because the double refuses every publish while it is not.
+     */
+    let wordsAtAbort = mqtt.publishedTo(AVAILABILITY).slice(before);
+
+    onAbort(platform.signal, () => {
+
+      wordsAtAbort = mqtt.publishedTo(AVAILABILITY).slice(before);
+    });
+
+    // Hold the word in flight, where a real publish sits while mqtt.js puts it on the connection, so the row sees whether the teardown waits for the write.
+    const release = mqtt.holdPublishes();
+    const shutdown = platform.shutdown();
+
+    await settle();
+
+    assert.equal(platform.signal.aborted, false, "while the word is still being written, the teardown waits for it");
+    assert.equal(mqtt.publishedTo(AVAILABILITY).length, before, "and the held word is not yet recorded");
+
+    release();
+    await shutdown;
+
+    assert.equal(wordsAtAbort.length, 1, "one word reached the topic between the hold and the abort");
+
+    const word = present(wordsAtAbort[0], "the word recorded before the abort");
+
+    assert.equal(word.payload, "offline", "the word is offline");
+    assert.equal(word.retain, true, "and retained, so a subscriber attaching after the plugin stops still reads it");
+    assert.equal(platform.signal.aborted, true, "the teardown runs once the word is written");
+  });
+
+  test("a refused offline word holds nothing up: shutdown resolves at once and the abort still runs", async () => {
+
+    // Debug is on so the refusal's debug line reaches the capture, through the warn channel the platform's debug gate emits on.
+    const { emit, entries, platform, registered } = buildPlatform({ debug: true });
+
+    await using mqtt = installMqttDouble(platform);
+    await using dispatcher = installMockDispatcher();
+    programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
+    programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
+
+    emit(DID_FINISH_LAUNCHING);
+    await waitUntil(() => registered.length >= 1, { description: "the first accessory registration" });
+
+    // The broker session is gone, so the word is refused at once, as the library's client refuses a publish it holds no session for.
+    mqtt.connected = false;
+
+    const refusedBefore = mqtt.rejectedPublishes;
+
+    assert.equal(await shutdownWithinATurn(platform), true, "a refusal ends the wait at once rather than holding the teardown for the grace");
+    assert.equal(platform.signal.aborted, true, "and the abort still runs");
+    assert.ok(mqtt.rejectedPublishes > refusedBefore, "the offline word was refused rather than recorded");
+    assert.ok(loggedAt(entries, "warn", AVAILABILITY + " offline at shutdown"),
+      "the refusal is noted at debug with its topic, since the plugin is stopping and the user has nothing to act on");
+  });
+
+  test("a word the broker never takes holds the teardown for the grace at most, and the abort still runs", async (t) => {
+
+    // Debug is on so the abandoned word's debug line reaches the capture, through the warn channel the platform's debug gate emits on.
+    const { emit, entries, platform } = buildPlatform({ debug: true });
+
+    await using mqtt = installMqttDouble(platform);
+    await using dispatcher = installMockDispatcher();
+    programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
+    programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
+
+    emit(DID_FINISH_LAUNCHING);
+    await waitUntil(() => mqtt.publishedTo(AVAILABILITY).at(-1)?.payload === "online", { description: "the controller's first online word" });
+
+    /* The production clock arms the grace on the global timers, which the mock replaces from here on, so the row crosses the grace in virtual time rather than
+     * waiting it out. The hold is never released: it stands for a broker that never takes the write, so only the grace can end the wait.
+     */
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    mqtt.holdPublishes();
+
+    const shutdown = platform.shutdown();
+
+    t.mock.timers.tick((HYDRAWISE_SHUTDOWN_GRACE * 1000) - 1);
+    await settle();
+
+    assert.equal(platform.signal.aborted, false, "the teardown waits out the grace for a word still being written");
+
+    t.mock.timers.tick(1);
+    await shutdown;
+
+    assert.equal(platform.signal.aborted, true, "the grace ends the wait, and the abort runs");
+    assert.equal(mqtt.publishedTo(AVAILABILITY).at(-1)?.payload, "online", "the abandoned word was never recorded");
+    assert.ok(loggedAt(entries, "warn", AVAILABILITY + " offline at shutdown: The operation was aborted due to timeout"),
+      "the held publish rejected with the deadline's reason");
+  });
+
+  test("with no MQTT client, shutdown states nothing and tears down at once", async () => {
+
+    const { platform } = buildPlatform();
+
+    assert.equal(platform.mqtt, null, "no broker URL is configured, so there is no client to state a word on");
+    assert.equal(await shutdownWithinATurn(platform), true, "shutdown waits on no broker");
+    assert.equal(platform.signal.aborted, true, "the abort runs");
+    assert.equal(dispatcherOf(platform)?.destroyed, true, "and the dispatcher is destroyed after it");
   });
 });
 
@@ -539,5 +683,33 @@ describe("HydrawisePlatform restore-time refusal and unconfigured availability",
 
     assert.equal(statedOffline(DISABLED.serial_number, afterDiscovery), 1, "a later session restates the disabled controller, its accessory long removed");
     assert.equal(statedOffline(OWNER.serialNumber, afterDiscovery), 0, "and leaves the built controller to state its own word");
+  });
+
+  test("shutdown states the controller it built offline and leaves a restored controller it did not build to the word already standing", async () => {
+
+    const { emit, platform } = buildPlatform({ options: ["Disable.Device." + DISABLED.serial_number] });
+
+    await using mqtt = installMqttDouble(platform);
+    await using dispatcher = installMockDispatcher();
+
+    restoreController(platform);
+    restoreController(platform, { controllerId: DISABLED.controller_id, name: DISABLED.name, serialNumber: DISABLED.serial_number });
+
+    programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails({ controllers: [ { ...syntheticController }, { ...DISABLED } ] }));
+    programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
+
+    const unbuilt = DISABLED.serial_number + "/availability";
+
+    // Discovery states the disabled controller offline once it has settled which controllers it builds, so that word is the one standing when shutdown begins.
+    emit(DID_FINISH_LAUNCHING);
+    await waitUntil(() => mqtt.publishedTo(unbuilt).length >= 1, { description: "the end of discovery to state the disabled controller" });
+    await waitUntil(() => mqtt.publishedTo(AVAILABILITY).at(-1)?.payload === "online", { description: "the built controller's first online word" });
+
+    const unbuiltBefore = mqtt.publishedTo(unbuilt).length;
+
+    await platform.shutdown();
+
+    assert.equal(mqtt.publishedTo(unbuilt).length, unbuiltBefore, "shutdown states nothing for the controller this run did not build");
+    assert.equal(mqtt.publishedTo(AVAILABILITY).at(-1)?.payload, "offline", "while the controller it built is stated offline");
   });
 });

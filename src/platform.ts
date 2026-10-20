@@ -3,16 +3,17 @@
  * platform.ts: homebridge-hunter-hydrawise platform class.
  */
 import type { API, Characteristic, DynamicPlatformPlugin, HAP, Logging, PlatformAccessory, PlatformConfig } from "homebridge";
-import { APIEvent, FeatureOptions, MQTT_AVAILABILITY_OFFLINE, RateBudget, TimerRegistry, classifyTransportError, composeSignals, createApiDispatcher,
-  createMqttClient, debugGatedLog, loopFaultReporter, mqttTopic, notResponding, retry, sanitizeName, superviseLoop, systemClock } from "homebridge-plugin-utils";
+import { APIEvent, FeatureOptions, MQTT_AVAILABILITY_OFFLINE, RateBudget, TimerRegistry, armDeadline, classifyTransportError, composeSignals, createApiDispatcher,
+  createMqttClient, debugGatedLog, formatErrorMessage, loopFaultReporter, mqttTopic, notResponding, retry, sanitizeName, superviseLoop,
+  systemClock } from "homebridge-plugin-utils";
 import type { Categories, Clock, HomebridgePluginLogging, MqttClient, Nullable } from "homebridge-plugin-utils";
 import type { CustomerDetailsResponse, HydrawiseAccessory, HydrawiseAccessoryContext, HydrawiseControllerAccessory, HydrawiseControllerConfig,
   HydrawiseControllerIdentity, HydrawiseEndpoint, HydrawiseZoneIdentity, HydrawiseZoneSuspensionResult } from "./types.ts";
 import { HYDRAWISE_API_BASE_URL, HYDRAWISE_API_BUDGET_CALLS, HYDRAWISE_API_BUDGET_WINDOW, HYDRAWISE_API_RETRY_ATTEMPTS, HYDRAWISE_API_RETRY_INTERVAL,
   HYDRAWISE_API_RETRY_STATUS_CODES, HYDRAWISE_API_TIMEOUT, HYDRAWISE_COMMAND_BUDGET_CALLS, HYDRAWISE_COMMAND_BUDGET_WINDOW, HYDRAWISE_COMMAND_ENDPOINT,
-  HYDRAWISE_REVERT_DELAY, HYDRAWISE_TRANSPORT_FAULT_SENTENCES, HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_V2_MUTATION_BUDGET_CALLS,
-  HYDRAWISE_V2_MUTATION_BUDGET_WINDOW, HYDRAWISE_V2_REFRESH_INTERVAL, HYDRAWISE_ZONE_ACCESSORY_CATEGORY, HYDRAWISE_ZONE_ACCESSORY_GRACE_POLLS, PLATFORM_NAME,
-  PLUGIN_NAME } from "./settings.ts";
+  HYDRAWISE_REVERT_DELAY, HYDRAWISE_SHUTDOWN_GRACE, HYDRAWISE_TRANSPORT_FAULT_SENTENCES, HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW,
+  HYDRAWISE_V2_MUTATION_BUDGET_CALLS, HYDRAWISE_V2_MUTATION_BUDGET_WINDOW, HYDRAWISE_V2_REFRESH_INTERVAL, HYDRAWISE_ZONE_ACCESSORY_CATEGORY,
+  HYDRAWISE_ZONE_ACCESSORY_GRACE_POLLS, PLATFORM_NAME, PLUGIN_NAME } from "./settings.ts";
 import type { HydrawiseGlobalFlagOption, HydrawiseGlobalValueOption, HydrawiseOptions } from "./options.ts";
 import { controllerIdentity, isControllerIdentity, isZoneAccessoryContext, sameControllerIdentity, sameZoneIdentity, zoneAccessoryId } from "./types.ts";
 import { featureOptionCategories, featureOptions } from "./options.ts";
@@ -55,9 +56,10 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
    * the ordering teardown depends on is expressed by the order things are registered rather than by a handler body that has to be read to be trusted, and the
    * order and the work stay together at each registration site.
    *
-   * The SYNCHRONOUS variant, deliberately: every teardown this platform registers completes synchronously, and Homebridge's shutdown is observable within the
-   * single frame that fires it, so the asynchronous stack would insert a microtask gap between disposers and buy nothing in return. The class is reached as a
-   * platform global, which the entry point's polyfill import guarantees exists on every runtime this package supports.
+   * The SYNCHRONOUS variant, deliberately: every teardown this platform registers completes synchronously, so the stack disposes whole within one frame, and the
+   * asynchronous stack would insert a microtask gap between disposers and buy nothing in return. Shutdown's wait for the offline words comes before the stack
+   * disposes rather than inside it, so the stack itself never waits. The class is reached as a platform global, which the entry point's polyfill import guarantees
+   * exists on every runtime this package supports.
    */
   private readonly teardown = new DisposableStack();
 
@@ -201,9 +203,11 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     api.on(APIEvent.DID_FINISH_LAUNCHING, () => void superviseLoop({ loop: () => this.configureHydrawise(), onError: loopFaultReporter(this.log, "controller discovery"),
       signal: this.signal }));
 
-    // Tear ourselves down cleanly when Homebridge shuts down. This is the single owner of platform shutdown, and it is one call: disposing the stack runs every
-    // registered teardown, synchronously, inside this frame.
-    api.on(APIEvent.SHUTDOWN, () => this.teardown.dispose());
+    /* Tear ourselves down cleanly when Homebridge shuts down, through the method that owns platform shutdown: it states every controller this run built offline on
+     * MQTT first, and disposes the teardown stack after the words are written. The words precede the stack because the stack's first act is the abort, which ends
+     * the MQTT connection by destroying its socket, and a word still unwritten when that happens is lost.
+     */
+    api.on(APIEvent.SHUTDOWN, () => void this.shutdown());
 
     /* Register that teardown work last, once everything it undoes has actually been built. Disposal is reverse registration order, so the dispatcher destroys named
      * first here run LAST and the signal abort named last runs FIRST: the abort cancels every signal-aware resource we own - the MQTT client, the retry waits, the
@@ -329,9 +333,10 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     }));
   }
 
-  /* The platform's only availability statement: a retained offline for every controller restored from the cache this run that the platform has not built. A
-   * controller this run has not built cannot be reached, and nothing else speaks for it...a built controller states its own availability, so no serial is stated
-   * twice. It runs on every broker session and once more when discovery has settled which controllers it builds.
+  /* The platform's availability statement for the controllers it does not run: a retained offline for every controller restored from the cache this run that the
+   * platform has not built. A controller this run has not built cannot be reached, and nothing else speaks for it...a built controller states its own availability
+   * while it runs, and shutdown states each built controller offline as the plugin stops, so this statement and shutdown's cover disjoint serials. It runs on every
+   * broker session and once more when discovery has settled which controllers it builds.
    */
   private publishUnconfiguredAvailability(): void {
 
@@ -342,6 +347,60 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       if(!built.has(serial)) {
 
         this.mqtt?.publishGuarded(mqttTopic(serial, mqttTopics.availability.topic), MQTT_AVAILABILITY_OFFLINE, { retain: true });
+      }
+    }
+  }
+
+  /** Shut the platform down: state every controller this run built offline on MQTT, and then dispose the teardown stack, which aborts the lifetime signal first
+   * and closes the connection pools after it. The words come before the abort because the abort ends the MQTT connection by destroying its socket, which drops a
+   * write not yet flushed, so a word issued alongside the teardown would be lost and the broker would keep each controller's last word for a plugin that has
+   * stopped. The wait is bounded by the shutdown grace, so a broker that never takes a write delays the teardown by that beat at most, and nothing in the wait
+   * rejects, so the teardown always runs.
+   *
+   * @returns A promise that resolves once the teardown stack has disposed, and never rejects.
+   */
+  public async shutdown(): Promise<void> {
+
+    await this.stateOffline();
+
+    /* A written word is not yet on the wire: mqtt.js reports a publish written once it is handed to the connection, and flushes the bytes on a deferred turn of
+     * its own. Yielding one macrotask here lets every deferral the publishes scheduled run before the socket is destroyed, whatever frame Homebridge entered
+     * shutdown from, so the guarantee is this method's own rather than a property of the caller's call stack or of the library's internal scheduling.
+     */
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    this.teardown.dispose();
+  }
+
+  /* State every controller this run built offline on its availability topic, retained, and wait until each word is written or refused, or until the shutdown
+   * grace runs out. A built controller keeps its own word while it runs, and nothing speaks for it once the plugin stops, because the client's last will covers
+   * only the plugin's own availability topic. A controller this run did not build is left alone, since its retained offline already stands. The publish is the
+   * plain one rather than the guarded one because the wait needs its outcome, and a refusal is logged at debug alone, since the plugin is stopping and the user
+   * has nothing to act on.
+   */
+  private async stateOffline(): Promise<void> {
+
+    const mqtt = this.mqtt;
+
+    if(!mqtt) {
+
+      return;
+    }
+
+    // The grace is one deadline every word carries as its own signal, so a write the broker never takes is abandoned when the grace runs out, and the deadline's
+    // timer is released once the words have settled.
+    using deadline = armDeadline(HYDRAWISE_SHUTDOWN_GRACE * 1000, { clock: this.clock });
+
+    // Every word is issued here, synchronously and ahead of the first await, so the deadline bounds all of them together from the moment it is armed.
+    const topics = Object.values(this.configuredDevices).flatMap(controller => controller ? [controller.controller.serial_number] : [])
+      .map(serial => mqttTopic(serial, mqttTopics.availability.topic));
+    const outcomes = await Promise.allSettled(topics.map(topic => mqtt.publish(topic, MQTT_AVAILABILITY_OFFLINE, { retain: true, signal: deadline.signal })));
+
+    for(const [ index, outcome ] of outcomes.entries()) {
+
+      if(outcome.status === "rejected") {
+
+        this.log.debug("Unable to state %s offline at shutdown: %s.", topics[index], formatErrorMessage(outcome.reason));
       }
     }
   }

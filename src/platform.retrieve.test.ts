@@ -84,13 +84,13 @@ describe("HydrawisePlatform retrieve", () => {
 
   test("returns null quietly when the platform signal is already aborted", async () => {
 
-    const { emit, entries, platform } = buildPlatform();
+    const { entries, platform } = buildPlatform();
 
     await using dispatcher = installMockDispatcher();
     programJsonReply(dispatcher.agent, "customerdetails.php", { controller_id: 500001 });
 
-    // Firing shutdown aborts the platform signal, which supersedes every other classification: retrieve returns null and logs nothing.
-    emit(SHUTDOWN_EVENT);
+    // Shutdown aborts the platform signal once its offline words settle, which supersedes every other classification: retrieve returns null and logs nothing.
+    await platform.shutdown();
 
     const response = await platform.retrieve("customerdetails.php");
 

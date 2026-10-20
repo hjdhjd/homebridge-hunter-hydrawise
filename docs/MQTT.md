@@ -70,8 +70,8 @@ The topics and messages that `homebridge-hunter-hydrawise` publishes are:
 <!-- MQTT PUBLISHED:END -->
 
 Each controller's `availability` topic carries a retained `online` or `offline`, reading `offline` until the controller's first poll reaches Hydrawise,
-while Hydrawise is not responding for it or your Hydrawise account login reports it offline, and for a controller the plugin does not use, such as one you have
-disabled.
+while Hydrawise is not responding for it or your Hydrawise account login reports it offline, once the plugin shuts down, and for a controller the plugin does
+not use, such as one you have disabled.
 
 The `controller` payload is a JSON array with one entry per zone, in the order Hydrawise reports them. Each entry carries:
 

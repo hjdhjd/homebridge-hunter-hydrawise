@@ -156,7 +156,7 @@ describe("HydrawisePlatform consolidated options", () => {
     assert.equal(platform.config.debug, false, "an unasked-for flag resolves off");
   });
 
-  test("a configured broker URL option constructs a client the platform teardown ends", (t) => {
+  test("a configured broker URL option constructs a client the platform teardown ends", async (t) => {
 
     const { emit, platform } = buildPlatform({ options: ["Enable.Mqtt.Url=mqtt://127.0.0.1:1"] });
 
@@ -165,7 +165,7 @@ describe("HydrawisePlatform consolidated options", () => {
     // assert.ok narrows the nullable field, which assert.notEqual cannot do, so the aborted read below type-checks without a cast.
     assert.ok(platform.mqtt, "a broker URL configured as an option constructs a client with no legacy property in play");
 
-    emit(SHUTDOWN);
+    await platform.shutdown();
 
     assert.equal(platform.mqtt.aborted, true, "platform teardown ends the client, so no reconnect handle outlives the test");
   });
