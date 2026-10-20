@@ -13,9 +13,9 @@
 // a Node below the release that ships them. It is a no-op on a runtime that already has them, and the runtime-floor conformance test enumerates it among the lines
 // the sunset deletes.
 import "homebridge-plugin-utils/polyfills";
-import { Characteristic, Service, TestAccessory, makeTestAccessory } from "./hap.helpers.ts";
+import { Characteristic, Service, TestAccessory, TestHapStatusError, makeTestAccessory } from "./hap.helpers.ts";
 import type { Clock, HomebridgePluginLogging, Nullable, RateBudget } from "homebridge-plugin-utils";
-import { FeatureOptions, TimerRegistry, sanitizeName, systemClock } from "homebridge-plugin-utils";
+import { FeatureOptions, HAPStatus, TimerRegistry, sanitizeName, systemClock } from "homebridge-plugin-utils";
 import type { HydrawiseAccessory, HydrawiseControllerConfig, HydrawiseControllerHardware, HydrawiseControllerIdentity, HydrawiseControllerV2Facts,
   HydrawiseV2MutationResult, HydrawiseZoneSuspensionResult, HydrawiseZoneV2Facts } from "../types.ts";
 import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
@@ -116,16 +116,33 @@ export class RetrieveRecorder {
   }
 }
 
-// The HAP namespace shape every double in this file exposes: the Service / Characteristic test namespaces plus a deterministic uuid generator that echoes
-// its input, so an accessory's UUID is simply the controller id string production hands it.
+/* The HAP namespace shape every double in this file exposes: the Service / Characteristic test namespaces, the status enum and the status error class a refusal is
+ * built from, and a deterministic uuid generator that echoes its input, so an accessory's UUID is simply the controller id string production hands it. The enum is
+ * the library's own mirror of HAP's, so a refusal row compares against the very values production throws with.
+ */
 interface TestHap {
 
   Characteristic: typeof Characteristic;
+  HAPStatus: typeof HAPStatus;
+  HapStatusError: typeof TestHapStatusError;
   Service: typeof Service;
   uuid: { generate: (data: string) => string };
 }
 
-const testHap: TestHap = { Characteristic, Service, uuid: { generate: (data: string): string => data } };
+const testHap: TestHap = { Characteristic, HAPStatus, HapStatusError: TestHapStatusError, Service, uuid: { generate: (data: string): string => data } };
+
+/**
+ * Whether a thrown value is the refusal the Not Responding rule throws: the status error double carrying the communication-failure status, the one HomeKit
+ * renders as No Response. A refusal row hands this to `assert.rejects`, so it asserts the class and the status together rather than only that something threw.
+ *
+ * @param error - The value a refused read or write rejected with.
+ *
+ * @returns True when the value is that refusal.
+ */
+export function isNotResponding(error: unknown): boolean {
+
+  return (error instanceof TestHapStatusError) && (error.hapStatus === HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+}
 
 // One recorded reconcileZoneAccessories call: the whole argument object the controller passed. Typed off the production signature, so a test reads the request the
 // projection actually built - which zones it named standalone, the display name each carried, and the pre-enablement relay-id population.
@@ -502,15 +519,21 @@ export function makeTestApi(): TestApiResult {
  * Seed a cached accessory onto a real platform through its configureAccessory path, as Homebridge does when it restores accessories before DID_FINISH_LAUNCHING.
  * The construction-boundary cast to the PlatformAccessory parameter type is confined here so a configure test's body stays cast-free.
  *
+ * The optional setup runs on the fresh accessory BEFORE the platform sees it, which is where Homebridge's cache restore puts the services and the context a
+ * previous session left behind. That ordering is what lets a restore row reach the handlers the platform binds on the primary characteristic at restore.
+ *
  * @param platform    - The real HydrawisePlatform to seed.
  * @param displayName - The cached accessory's display name.
  * @param uuid        - The cached accessory's UUID (the platform matches this against the generated controller UUID to reuse it).
+ * @param setup       - Optionally, what the cache carried: the services, and a zone accessory's context, added before the platform is handed the accessory.
  *
  * @returns The seeded TestAccessory, so a test can read its services after discovery reuses it.
  */
-export function seedAccessory(platform: HydrawisePlatform, displayName: string, uuid: string): TestAccessory {
+export function seedAccessory(platform: HydrawisePlatform, displayName: string, uuid: string, setup?: (accessory: TestAccessory) => void): TestAccessory {
 
   const accessory = new TestPlatformAccessory(displayName, uuid);
+
+  setup?.(accessory);
 
   platform.configureAccessory(accessory as unknown as Parameters<HydrawisePlatform["configureAccessory"]>[0]);
 

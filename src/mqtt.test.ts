@@ -24,4 +24,16 @@ describe("the MQTT topic catalog", () => {
     assert.ok(reference.subscribed.includes("| `controller/get`"), "the subscribed table documents the controller topic's get child");
     assert.ok(reference.subscribed.includes("| `controller/set`"), "and its set child");
   });
+
+  test("declares each controller's availability on the family's tail, in the family's words for a controller", () => {
+
+    assert.equal(mqttTopics.availability.topic, MQTT_AVAILABILITY_TOPIC, "the per-controller statement is published on the family's availability tail");
+    assert.ok(mqttTopics.availability.publish.includes("A controller is available only when"), "its documented text names the controller as what is available");
+
+    // The device-level row the catalog renders sits beside the controller topic, apart from the plugin-level row the client publishes on its own.
+    const reference = renderMqttTopicsReference(mqttTopics);
+
+    assert.ok(reference.published.includes(mqttTopics.availability.publish), "the published tables carry the per-controller availability row");
+    assert.ok(reference.published.includes("| `controller`"), "beside the controller topic");
+  });
 });

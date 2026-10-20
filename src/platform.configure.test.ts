@@ -3,16 +3,27 @@
  * platform.configure.test.ts: Discovery and lifecycle behavior of the HydrawisePlatform, driven by firing the captured DID_FINISH_LAUNCHING handler to
  * run the private configureHydrawise against a MockAgent-backed wire. Covers the discovery happy path, the short-circuiting second pass and cached-accessory reuse,
  * orphan pruning, the bug-16 device gate in both directions, the no-API-key early return, the bug-2 debug routing, the MQTT construction arms, the discovery
- * retry failure paths, and the shutdown teardown.
+ * retry failure paths, the shutdown teardown, the refusal a restored accessory answers with until its controller vouches for it, and the retained offline the
+ * platform states for a restored controller this run does not build.
  */
-import { buildPlatform, dispatcherOf, installMockDispatcher, programJsonReply, programStatusReply, seedAccessory, v2DispatcherOf } from "./testing/platform.helpers.ts";
+
+// The Hydrawise API wire shapes use snake_case keys such as controller_id, so camelcase is disabled here to let the controller fixture mirror the wire verbatim.
+/* eslint-disable camelcase */
+import { Characteristic, Service } from "./testing/hap.helpers.ts";
+import { HydrawiseReservedNames, suspendZoneSubtype, zoneAccessoryId } from "./types.ts";
+import { MqttClient, onAbort } from "homebridge-plugin-utils";
+import type { TestAccessory, TestCharacteristic } from "./testing/hap.helpers.ts";
+import { buildPlatform, dispatcherOf, installMockDispatcher, isNotResponding, programJsonReply, programStatusReply, seedAccessory,
+  v2DispatcherOf } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
-import { logCount, loggedAt, waitUntil } from "homebridge-plugin-utils/testing";
+import { logCount, loggedAt, present, waitUntil } from "homebridge-plugin-utils/testing";
 import { makeCustomerDetails, normalSchedule } from "./api.helpers.ts";
-import { Service } from "./testing/hap.helpers.ts";
+import type { MqttConnectHandler } from "homebridge-plugin-utils";
 import assert from "node:assert/strict";
-import { onAbort } from "homebridge-plugin-utils";
 import { syntheticController } from "./api.fixtures.ts";
+
+// The subtype the suspend-all switch carries on a controller accessory, as the controller composes it.
+const SUSPEND_ALL_SUBTYPE: string = HydrawiseReservedNames.SWITCH_SUSPEND_ALL;
 
 const DID_FINISH_LAUNCHING = "didFinishLaunching";
 const SHUTDOWN = "shutdown";
@@ -349,5 +360,184 @@ describe("HydrawisePlatform configure", () => {
 
     assert.equal(destroyedAtAbort, false, "the abort runs first, while the second dispatcher is still live");
     assert.equal(v2DispatcherOf(platform)?.destroyed, true, "the shutdown handler destroys the account-credentialed dispatcher as well");
+  });
+});
+
+describe("HydrawisePlatform restore-time refusal and unconfigured availability", () => {
+
+  // The synthetic controller's persisted identity, as a previous session wrote it into its accessory's context and into each zone accessory's owner stamp.
+  const OWNER = { controllerId: syntheticController.controller_id, name: syntheticController.name, serialNumber: syntheticController.serial_number };
+
+  // A second account controller the user has disabled, so discovery settles it without building it.
+  const DISABLED = { ...syntheticController, controller_id: 500002, name: "Second Controller", serial_number: "SN9Z8Y7X6W5" };
+
+  // Restore the controller accessory a previous session left: its irrigation system and one cached valve, under the identity it persisted.
+  function restoreController(platform: Parameters<typeof seedAccessory>[0], identity = OWNER): TestAccessory {
+
+    return seedAccessory(platform, identity.name, identity.controllerId.toString(), (seed) => {
+
+      seed.context = { controller: identity };
+      seed.addService(new Service.IrrigationSystem(identity.name));
+      seed.addService(new Service.Valve("Front Lawn North", "700001"));
+      seed.addService(new Service.Switch(identity.name + " Suspend All Zones", SUSPEND_ALL_SUBTYPE));
+    });
+  }
+
+  // Restore a standalone zone accessory a previous session left: its valve, its suspension switch, and the identity pair the platform stamped on it.
+  function restoreZone(platform: Parameters<typeof seedAccessory>[0]): TestAccessory {
+
+    return seedAccessory(platform, "Front Lawn South", zoneAccessoryId(OWNER.controllerId, 700002), (seed) => {
+
+      seed.context = { ownerController: OWNER, zone: { name: "Front Lawn South", relay: 2, relayId: 700002 } };
+      seed.addService(new Service.Valve("Front Lawn South", "700002"));
+      seed.addService(new Service.Switch("Front Lawn South Suspend", suspendZoneSubtype(700002)));
+    });
+  }
+
+  // One restored suspension switch's On characteristic, located by its subtype.
+  function suspend(accessory: TestAccessory, subtype: string): TestCharacteristic {
+
+    return present(accessory.getServiceById(Service.Switch, subtype), "the restored suspension switch").getCharacteristic(Characteristic.On);
+  }
+
+  // One restored service's Active characteristic, located by its subtype or as the accessory's bare irrigation system.
+  function active(accessory: TestAccessory, subtype?: string): TestCharacteristic {
+
+    const service = (subtype === undefined) ? accessory.getService(Service.IrrigationSystem) : accessory.getServiceById(Service.Valve, subtype);
+
+    return present(service, "the restored service").getCharacteristic(Characteristic.Active);
+  }
+
+  test("a restored controller accessory and a restored zone accessory refuse every bound handler before discovery, reads and writes", async (t) => {
+
+    const { emit, platform } = buildPlatform();
+
+    t.after(() => emit(SHUTDOWN));
+
+    const controller = restoreController(platform);
+    const zone = restoreZone(platform);
+
+    await assert.rejects(() => active(controller).triggerGet(), isNotResponding, "the irrigation system refuses a read");
+    await assert.rejects(() => active(controller).triggerSet(Characteristic.Active.INACTIVE), isNotResponding, "and a write");
+    await assert.rejects(() => active(controller, "700001").triggerSet(Characteristic.Active.ACTIVE), isNotResponding, "a cached valve on it refuses a write");
+    await assert.rejects(() => active(zone, "700002").triggerGet(), isNotResponding, "the zone accessory's valve refuses a read");
+    await assert.rejects(() => active(zone, "700002").triggerSet(Characteristic.Active.ACTIVE), isNotResponding, "and a write");
+    await assert.rejects(() => suspend(controller, SUSPEND_ALL_SUBTYPE).triggerSet(true), isNotResponding, "the cached suspend-all switch refuses a write");
+    await assert.rejects(() => suspend(zone, suspendZoneSubtype(700002)).triggerSet(true), isNotResponding, "and so does the cached per-zone switch");
+  });
+
+  test("once discovery claims a restored controller accessory, it answers with its controller's verdict", async (t) => {
+
+    const { emit, platform } = buildPlatform();
+
+    t.after(() => emit(SHUTDOWN));
+    await using dispatcher = installMockDispatcher();
+
+    const controller = restoreController(platform);
+
+    programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
+    programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
+
+    emit(DID_FINISH_LAUNCHING);
+    await waitUntil(() => platform.configuredDevices[OWNER.controllerId.toString()]?.unavailable === false, { description: "the controller's first poll to land" });
+
+    assert.equal(await active(controller).triggerGet(), Characteristic.Active.ACTIVE, "the claimed accessory answers once its controller reaches Hydrawise");
+  });
+
+  test("a discovery that never answers, as with a revoked key, leaves every restored accessory refusing", async (t) => {
+
+    const { emit, entries, platform } = buildPlatform();
+
+    t.after(() => emit(SHUTDOWN));
+    await using dispatcher = installMockDispatcher();
+
+    const controller = restoreController(platform);
+    const zone = restoreZone(platform);
+
+    programStatusReply(dispatcher.agent, "customerdetails.php", 404);
+
+    emit(DID_FINISH_LAUNCHING);
+    await waitUntil(() => loggedAt(entries, "error", "Invalid API key"), { description: "an error line containing \"Invalid API key\"" });
+
+    await assert.rejects(() => active(controller).triggerGet(), isNotResponding, "the controller accessory still refuses");
+    await assert.rejects(() => active(zone, "700002").triggerGet(), isNotResponding, "and so does the zone accessory");
+  });
+
+  test("a restored accessory whose context names no controller refuses, even while the controller its UUID resembles is reachable", async (t) => {
+
+    const { emit, platform } = buildPlatform();
+
+    t.after(() => emit(SHUTDOWN));
+    await using dispatcher = installMockDispatcher();
+
+    // A zone-shaped UUID under the synthetic controller, carrying a controller field that is no identity at all, so the context classifies as no zone of anyone's.
+    const malformed = seedAccessory(platform, "Malformed", zoneAccessoryId(OWNER.controllerId, 700003), (seed) => {
+
+      seed.context = { controller: "not an identity" };
+      seed.addService(new Service.IrrigationSystem("Malformed"));
+    });
+
+    programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
+    programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
+
+    emit(DID_FINISH_LAUNCHING);
+    await waitUntil(() => platform.configuredDevices[OWNER.controllerId.toString()]?.unavailable === false, { description: "the controller's first poll to land" });
+
+    await assert.rejects(() => active(malformed).triggerGet(), isNotResponding, "an accessory nothing in this run vouches for refuses");
+  });
+
+  test("a restored controller this run does not build is stated offline, retained, on connect and after discovery, and a built one is not", async (t) => {
+
+    // The client is the library's real one, pointed at a port nothing listens on, with its connect registration and its guarded publish recorded rather than run,
+    // so the platform's own registration is what a session's arrival drives.
+    const connects: MqttConnectHandler[] = [];
+    const publishes: { init: unknown; payload: unknown; topic: string }[] = [];
+
+    t.mock.method(MqttClient.prototype, "onConnect", (handler: MqttConnectHandler): void => {
+
+      connects.push(handler);
+    });
+
+    t.mock.method(MqttClient.prototype, "publishGuarded", (topic: string, payload: unknown, init?: unknown): void => {
+
+      publishes.push({ init, payload, topic });
+    });
+
+    const { emit, platform } = buildPlatform({ mqttUrl: "mqtt://127.0.0.1:1", options: ["Disable.Device." + DISABLED.serial_number] });
+
+    t.after(() => emit(SHUTDOWN));
+    await using dispatcher = installMockDispatcher();
+
+    restoreController(platform);
+    restoreController(platform, { controllerId: DISABLED.controller_id, name: DISABLED.name, serialNumber: DISABLED.serial_number });
+
+    // The platform registered its statement at construction, before any controller existed, so it is the first registration recorded.
+    const platformConnect = present(connects[0], "the platform's connect registration");
+
+    // The statement the platform makes: retained offline, with no change gate, which is what tells it apart from a controller stating its own word.
+    const statedOffline = (serial: string, since = 0): number => publishes.slice(since).filter(entry => (entry.topic === serial + "/availability") &&
+      (entry.payload === "offline") && (JSON.stringify(entry.init) === JSON.stringify({ retain: true }))).length;
+
+    await platformConnect();
+
+    assert.equal(statedOffline(OWNER.serialNumber), 1, "before discovery the controller about to be built is not yet built, so it is stated offline");
+    assert.equal(statedOffline(DISABLED.serial_number), 1, "and so is the disabled one");
+
+    const beforeDiscovery = publishes.length;
+
+    programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails({ controllers: [ { ...syntheticController }, { ...DISABLED } ] }));
+    programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
+
+    emit(DID_FINISH_LAUNCHING);
+    await waitUntil(() => statedOffline(DISABLED.serial_number, beforeDiscovery) >= 1, { description: "the end of discovery to state the disabled controller" });
+
+    assert.equal(statedOffline(OWNER.serialNumber, beforeDiscovery), 0, "discovery states nothing for the controller it built");
+
+    const afterDiscovery = publishes.length;
+
+    await platformConnect();
+
+    assert.equal(statedOffline(DISABLED.serial_number, afterDiscovery), 1, "a later session restates the disabled controller, its accessory long removed");
+    assert.equal(statedOffline(OWNER.serialNumber, afterDiscovery), 0, "and leaves the built controller to state its own word");
   });
 });

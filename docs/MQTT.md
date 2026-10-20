@@ -62,11 +62,16 @@ The topics and messages that `homebridge-hunter-hydrawise` publishes are:
 |-----------------|----------------------------------
 | `availability`  | `online` while the plugin holds a broker session, `offline` by the broker's last will when the plugin exits or its connection drops. Retained either way.
 
-| Topic         | Message Published
-|---------------|----------------------------------
-| `controller`  | A JSON array with one entry per zone, in the order Hydrawise reports them, carrying each zone's `name`, `relay`, `run`, `time`, and `timestr`. While the enhanced-features data from your Hydrawise account login is current, each entry also carries `state`, and a suspended zone carries `suspendedUntil`.
+| Topic           | Message Published
+|-----------------|----------------------------------
+| `availability`  | `online` when the plugin can reach Hydrawise for this controller, `offline` when it cannot. Retained, so a subscriber attaching later reads the last statement. A controller is available only when this topic and the plugin-level `availability` topic both read `online`.
+| `controller`    | A JSON array with one entry per zone, in the order Hydrawise reports them, carrying each zone's `name`, `relay`, `run`, `time`, and `timestr`. While the enhanced-features data from your Hydrawise account login is current, each entry also carries `state`, and a suspended zone carries `suspendedUntil`.
 
 <!-- MQTT PUBLISHED:END -->
+
+Each controller's `availability` topic carries a retained `online` or `offline`, reading `offline` until the controller's first poll reaches Hydrawise,
+while Hydrawise is not responding for it or your Hydrawise account login reports it offline, and for a controller the plugin does not use, such as one you have
+disabled.
 
 The `controller` payload is a JSON array with one entry per zone, in the order Hydrawise reports them. Each entry carries:
 
@@ -114,7 +119,7 @@ The topics that `homebridge-hunter-hydrawise` subscribes to are:
 | Topic             | Message Expected
 |-------------------|----------------------------------
 | `controller/get`  | `true` requests a publish of the controller's current status on the `controller` topic.
-| `controller/set`  | `start <zone> [<duration>]` runs a zone and `stop <zone>` stops it, where the zone is the zone number shown on the irrigation controller and the duration is in seconds. With no duration, the zone runs for its next scheduled duration, or for its remaining time while already running. A duration that is not an integer, or no duration for a zone with no scheduled run, is refused and logged.
+| `controller/set`  | `start <zone> [<duration>]` runs a zone and `stop <zone>` stops it, where the zone is the zone number shown on the irrigation controller and the duration is in seconds. With no duration, the zone runs for its next scheduled duration, or for its remaining time while already running. A duration that is not an integer, or no duration for a zone with no scheduled run, is refused and logged. Every command is refused and logged while the controller is not responding.
 
 <!-- MQTT SUBSCRIBED:END -->
 

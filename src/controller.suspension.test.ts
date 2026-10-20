@@ -23,11 +23,11 @@ import type { HydrawiseAccessoryContext, HydrawiseZoneConfig, HydrawiseZoneSched
   StatusScheduleResponse } from "./types.ts";
 import { RateBudget, getServiceName } from "homebridge-plugin-utils";
 import type { TestAccessory, TestService } from "./testing/hap.helpers.ts";
+import { TestClock, advanceThroughSchedule, logCount, loggedAt, waitUntil } from "homebridge-plugin-utils/testing";
 import { UNSCHEDULED_SENTINEL, bareSensors } from "./api.fixtures.ts";
-import { buildController, makeV2Facts, makeZoneV2Facts, pollsCompleted, waitFor } from "./testing/platform.helpers.ts";
+import { buildController, isNotResponding, makeV2Facts, makeZoneV2Facts, pollsCompleted, waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
-import { logCount, loggedAt, waitUntil } from "homebridge-plugin-utils/testing";
 import type { BuildControllerResult } from "./testing/platform.helpers.ts";
 import { HydrawiseV2Client } from "./v2.ts";
 import { MockAgent } from "undici";
@@ -632,6 +632,9 @@ describe("HydrawiseController per-zone suspension command guard", () => {
 
     const all = await waitFor(() => suspendSwitch(h.accessory, SUSPEND_ALL_SUBTYPE), { description: "the suspend-all switch to appear" });
 
+    // The account-wide switch exists from construction, while the controller answers HomeKit only once its first poll has landed, which Alpha's own switch marks.
+    await waitUntil(() => suspendSwitch(h.accessory) !== undefined, { description: "Alpha's suspension switch to appear" });
+
     assert.equal(suspendSwitch(h.accessory, BETA_SWITCH_SUBTYPE), undefined, "the disabled zone has no switch of its own to be stamped through");
 
     await all.getCharacteristic(Characteristic.On).triggerSet(true);
@@ -879,10 +882,11 @@ describe("HydrawiseController suspension commands composed into the projection",
     assert.equal(logCount(h.entries, "info", "Suspended until"), 1, "and narrates nothing a second time");
   });
 
-  test("a suspend-all issued before the first poll classifies nothing and stamps its own answer", async (t) => {
+  test("a suspend-all issued before the first poll is refused, and sends, stamps, and writes nothing", async (t) => {
 
-    /* The pre-first-poll window, where there is no wire report to classify against at all. The account-wide switch answers from its own command record, the
-     * per-zone stamp loop has an empty population to walk, and the re-derive is structurally a no-op because the projection step returns early.
+    /* The pre-first-poll window, where nothing in this run has reached Hydrawise. The controller cannot vouch for the account-wide switch yet, so the write is
+     * refused with the communication failure before the handler runs: no command reaches the wire, no stamp is recorded for a later snapshot to be judged
+     * against, and the accessory cache is not written.
      */
     const h = buildController({ hasV2Client: true, program: (recorder) => {
 
@@ -892,12 +896,43 @@ describe("HydrawiseController suspension commands composed into the projection",
     t.after(() => h.abort());
 
     const all = await waitFor(() => suspendSwitch(h.accessory, SUSPEND_ALL_SUBTYPE), { description: "the suspend-all switch to appear" });
+    const constructed = all.getCharacteristic(Characteristic.On).value;
 
-    await all.getCharacteristic(Characteristic.On).triggerSet(true);
+    await assert.rejects(() => all.getCharacteristic(Characteristic.On).triggerSet(!constructed), isNotResponding,
+      "the write is refused with the communication failure");
 
-    assert.equal(all.getCharacteristic(Characteristic.On).value, true, "the account-wide switch answers from the command it just recorded");
-    assert.deepEqual(projectionOf(h), [], "and nothing is classified, because no poll has reported a zone to classify");
-    assert.equal(h.flushes.length, 0, "so the command writes nothing to the accessory cache");
+    assert.equal(h.retrieve.callsTo("setzone.php").length, 0, "no command reaches the wire");
+    assert.equal(all.getCharacteristic(Characteristic.On).value, constructed, "the switch keeps the state it was constructed with");
+    assert.deepEqual(projectionOf(h), [], "nothing is classified, because no poll has reported a zone to classify");
+    assert.equal(h.flushes.length, 0, "and the accessory cache is not written");
+  });
+
+  test("a command's stamp and a snapshot's stamp read one clock, so the guard holds on a virtual timeline too", async (t) => {
+
+    /* The stamps the guard compares come from the platform's clock: the instant a command was accepted and the instant a fetch was made. On a virtual timeline
+     * that starts at zero, a command stamped from any other clock would read decades newer than every snapshot, and the newer snapshot below could never retire it.
+     */
+    const clock = new TestClock();
+    const h = buildController({ clock, hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: pacedSchedule([alphaZone()]), kind: "response" }), signalAborted: false,
+      userOptions: [SUSPEND_ZONE_ON] });
+
+    t.after(() => h.abort());
+
+    await advanceThroughSchedule(clock, []);
+
+    const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
+    const clockSeconds = (): number => Math.floor(clock.now() / 1000);
+
+    await service.getCharacteristic(Characteristic.On).triggerSet(true);
+
+    applyFacts(h, { [ALPHA_RELAY_ID]: false }, clockSeconds());
+    assert.equal(readsSuspended(h.accessory), true, "a snapshot stamped in the command's own second leaves the command standing");
+
+    clock.advance(1000);
+
+    applyFacts(h, { [ALPHA_RELAY_ID]: false }, clockSeconds());
+    assert.equal(readsSuspended(h.accessory), false, "a snapshot stamped a second later on the same clock retires it");
   });
 
   test("a projection restored carrying a commanded suspension survives the restart and reconciles on fresh facts", async (t) => {

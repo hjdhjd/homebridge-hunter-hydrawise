@@ -17,8 +17,9 @@
  * characteristics (the public array getCharacteristicConstructor destructures), optionalCharacteristics, addOptionalCharacteristic, testCharacteristic,
  * getCharacteristic, updateCharacteristic, removeCharacteristic, and removeService's target shape; a characteristic exposes UUID, value, updateValue,
  * onGet, onSet, and the triggerGet / triggerSet test knobs; an accessory exposes context, displayName, updateDisplayName, _associatedHAPAccessory,
- * services, addService, getService, getServiceById, and removeService.
+ * services, addService, getService, getServiceById, and removeService. The status error a refusal throws is doubled here too, as TestHapStatusError.
  */
+import type { HAPStatus } from "homebridge-plugin-utils";
 
 // Identity classes for the HAP Characteristic kinds the plugin touches. Each kind is its own marker class carrying the UUID identity string HAP exposes on
 // every characteristic, and, where production compares against named constants, the HAP integer constants as statics. A hapKind field names the kind for
@@ -174,6 +175,22 @@ export const Characteristic = {
   StatusFault: StatusFaultCharacteristicType,
   ValveType: ValveTypeCharacteristicType
 } as const;
+
+/* The HAP status error double. Production reaches HAP's own HapStatusError through `api.hap` and binds it as the class a refusal is constructed from, so the platform
+ * doubles hand the plugin this class in its place, carrying the one field the refusal rows read: the status it was constructed with.
+ */
+export class TestHapStatusError extends Error {
+
+  public readonly hapStatus: HAPStatus;
+
+  public constructor(status: HAPStatus) {
+
+    super("HAP Status Error: " + status.toString());
+
+    this.hapStatus = status;
+    this.name = "HapStatusError";
+  }
+}
 
 // The constructor-as-key shapes both namespaces expose. The argument list is intentionally permissive: the characteristic markers take no arguments, the service
 // markers take HAP's (displayName?, subtype?) pair, and the alias must admit either when used as a Map key.

@@ -326,7 +326,8 @@ describe("HydrawiseController valve and suspend onSet", () => {
 
     t.after(() => h.abort());
 
-    await waitUntil(() => h.accessory.getServiceById(Service.Switch, "All") !== undefined, { description: "the suspend-all switch to appear" });
+    // Wait until the first poll has run, so the controller answers HomeKit, then drive the suspend.
+    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
 
     const suspend = h.accessory.getServiceById(Service.Switch, "All");
 
@@ -349,7 +350,8 @@ describe("HydrawiseController valve and suspend onSet", () => {
 
     t.after(() => h.abort());
 
-    await waitUntil(() => h.accessory.getServiceById(Service.Switch, "All") !== undefined, { description: "the suspend-all switch to appear" });
+    // Wait until the first poll has run, so the controller answers HomeKit, then drive the suspend.
+    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
 
     const suspend = h.accessory.getServiceById(Service.Switch, "All");
 

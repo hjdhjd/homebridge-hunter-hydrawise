@@ -7,14 +7,14 @@
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
 /* eslint-disable camelcase */
+import { HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
 import type { HydrawiseControllerV2Facts, HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
-import { assertNoUnhandledRejections, expectAt, loggedAt, waitUntil } from "homebridge-plugin-utils/testing";
+import { TestClock, advanceThroughSchedule, assertNoUnhandledRejections, expectAt, logCount, loggedAt, present, waitUntil } from "homebridge-plugin-utils/testing";
 import { buildController, makeV2Facts, makeZoneV2Facts } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
 import type { BuildControllerResult } from "./testing/platform.helpers.ts";
 import { HYDRAWISE_UNSCHEDULED_SENTINEL } from "./types.ts";
-import { HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
 import { Service } from "./testing/hap.helpers.ts";
 import assert from "node:assert/strict";
 import { bareSensors } from "./api.fixtures.ts";
@@ -219,9 +219,9 @@ describe("HydrawiseController MQTT", () => {
     assert.ok(h.mqtt, "the MQTT recorder should be attached");
     const mqtt = h.mqtt;
 
-    await waitUntil(() => mqtt.published.length >= 1, { description: "the first MQTT publish" });
+    await waitUntil(() => mqtt.publishedTo("controller").length >= 1, { description: "the first MQTT publish" });
 
-    const record = expectAt(mqtt.published, 0, "MQTT publish");
+    const record = expectAt(mqtt.publishedTo("controller"), 0, "MQTT publish");
 
     assert.ok(record.topic.endsWith("controller"), "the publish topic should be the controller topic");
     assert.ok(String(record.payload).includes("Alpha"), "the published payload should carry the zone status");
@@ -250,9 +250,69 @@ describe("HydrawiseController MQTT", () => {
       await waitUntil(() => loggedAt(h.entries, "error", failureLine), { description: "the failure line at error level" });
 
       assert.ok(loggedAt(h.entries, "error", failureLine), "a rejected publish should be reported by the client's guarded publish, naming its topic");
-      assert.equal(mqtt.published.length, 0, "and nothing should be recorded as published");
+      assert.equal(mqtt.publishedTo("controller").length, 0, "and nothing should be recorded as published on the controller topic");
       assert.ok(mqtt.rejectedPublishes >= 1, "while the refusal itself is counted");
     });
+  });
+});
+
+describe("HydrawiseController MQTT availability", () => {
+
+  // A wire-realistic body, so the rows below step the polling loop on their own clock rather than racing a fast cadence.
+  const status = makeStatusSchedule({ relays: [runningZone()], sensors: bareSensors });
+  const sleep = (status.nextpoll + HYDRAWISE_API_JITTER) * 1000;
+  const backoff = Math.min(status.nextpoll + HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL * 2) * 1000;
+
+  test("a set command is refused while the controller is lost, before it is parsed and with nothing sent", async (t) => {
+
+    const clock = new TestClock();
+    const h = buildController({ clock, mqtt: true, program: (recorder) => {
+
+      recorder.program("statusschedule.php", { body: status, kind: "response" });
+      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
+    }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    const mqtt = present(h.mqtt, "the MQTT recorder");
+
+    // A good poll, then a run of failures long enough to read lost.
+    await advanceThroughSchedule(clock, [ sleep, backoff, backoff ]);
+
+    assert.equal(logCount(h.entries, "info", "Hydrawise has stopped responding for this controller."), 1, "the controller reads lost");
+
+    // The command names a zone the last good poll reported, so the only thing that can refuse it is the verdict.
+    await assert.rejects(() => mqtt.invokeSet("controller/set", "start 1 300"), /^Error: MQTT: The controller is not responding\.$/,
+      "a command is refused while the controller is not responding");
+
+    assert.equal(h.retrieve.callsTo("setzone.php").length, 0, "and no setzone command is sent");
+  });
+
+  test("a new broker session restates the current word, retained", async (t) => {
+
+    const clock = new TestClock();
+    const h = buildController({ clock, mqtt: true, program: (recorder) => recorder.programDefault("statusschedule.php", { body: status, kind: "response" }),
+      signalAborted: false });
+
+    t.after(() => h.abort());
+
+    const mqtt = present(h.mqtt, "the MQTT recorder");
+    const topic = h.controllerConfig.serial_number + "/availability";
+
+    await advanceThroughSchedule(clock, []);
+
+    const before = mqtt.publishedTo(topic).length;
+
+    assert.equal(mqtt.publishedTo(topic).at(-1)?.payload, "online", "the first poll has stated the controller online");
+
+    // The session drops and returns. The client clears its change-gated memory on the new session, so the restatement goes out although nothing moved.
+    mqtt.connected = false;
+    mqtt.connected = true;
+
+    await advanceThroughSchedule(clock, []);
+
+    assert.equal(mqtt.publishedTo(topic).length, before + 1, "the new session carries one restatement");
+    assert.deepEqual(mqtt.publishedTo(topic).at(-1), { payload: "online", retain: true, topic }, "of the current word, retained");
   });
 });
 

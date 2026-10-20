@@ -12,6 +12,24 @@ export const HYDRAWISE_API_TIMEOUT = 7;
 // How often, in seconds, should we retry Hydrawise API calls when they fail.
 export const HYDRAWISE_API_RETRY_INTERVAL = 60;
 
+/* How many retries the connection pool makes inside one request before it gives up and the caller hears the failure. The library's backoff ladder grows with each
+ * retry, so the count is sized for the ladder to settle inside the request timeout above: a failure then reports as itself - a refused connection, a server that
+ * kept failing - rather than as the timeout overtaking a retry still in progress.
+ */
+export const HYDRAWISE_API_RETRY_ATTEMPTS = 2;
+
+/* The statuses the connection pool retries: the server errors, which are worth a second try because they are usually transient trouble on Hydrawise's side. A 400
+ * is the server's final word on the request, so a retry would only repeat it; a 404 means the API key is invalid and a 429 that the rate limit has been reached,
+ * and each carries a meaning the caller reports at once rather than one a retry could change.
+ */
+export const HYDRAWISE_API_RETRY_STATUS_CODES = Object.freeze([ 500, 502, 503, 504 ]);
+
+/* How many consecutive failed polls a controller survives before it reads as lost and HomeKit shows its accessories as not responding. Long enough to outlast a
+ * blip at the polling cadence, and short enough that a real outage shows within a glance at the Home app. A controller that is lost keeps polling at the same
+ * cadence, and the first good poll brings it back.
+ */
+export const HYDRAWISE_POLL_LOSS_THRESHOLD = 3;
+
 // How much, in seconds, jitter should we inject into the API polling interval. This helps ensure we stay clear of the Hydrawise API rate limits.
 export const HYDRAWISE_API_JITTER = 0.2;
 

@@ -119,11 +119,13 @@ describe("HydrawiseController updateState defect assertions", () => {
       // publish is the recovered default (scheduled). We assert at exactly this checkpoint because the distinguishing shape holds only here: the second publish
       // differs from the stale first, and statusschedule.php has been called three times (poll 1, the malformed attempt, and the recovering retry) before it. A loop
       // that swallowed the malformed body instead would republish the stale status as the second publish after only two calls, converging by the third publish.
-      await waitUntil(() => mqtt.published.length >= 2, { description: "the second MQTT publish" });
+      // Every read is of the controller topic, so the availability word beside it cannot shift which publish is which.
+      await waitUntil(() => mqtt.publishedTo("controller").length >= 2, { description: "the second MQTT publish" });
 
-      const first = expectAt(mqtt.published, 0, "MQTT publish").payload;
+      const first = expectAt(mqtt.publishedTo("controller"), 0, "MQTT publish").payload;
 
-      assert.notEqual(mqtt.published[1]?.payload, first, "the malformed poll retries; the second publish is the recovered status, not the stale prior poll");
+      assert.notEqual(mqtt.publishedTo("controller")[1]?.payload, first,
+        "the malformed poll retries; the second publish is the recovered status, not the stale prior poll");
       assert.ok(h.retrieve.callsTo("statusschedule.php").length >= 3, "poll 1, the malformed attempt, and the recovering retry all precede the second publish");
       assert.ok(loggedAt(h.entries, "error", "Unable to retrieve the current status"), "a malformed body should log the failure");
     });
@@ -147,11 +149,12 @@ describe("HydrawiseController updateState defect assertions", () => {
 
       // A valid-JSON body missing relays fails the shape guard and throws through the same path as a parse failure, so the loop retries. The second publish is the
       // recovered default, reached after three statusschedule.php calls - the same distinguishing shape the malformed-body scenario asserts.
-      await waitUntil(() => mqtt.published.length >= 2, { description: "the second MQTT publish" });
+      await waitUntil(() => mqtt.publishedTo("controller").length >= 2, { description: "the second MQTT publish" });
 
-      const first = expectAt(mqtt.published, 0, "MQTT publish").payload;
+      const first = expectAt(mqtt.publishedTo("controller"), 0, "MQTT publish").payload;
 
-      assert.notEqual(mqtt.published[1]?.payload, first, "the mis-shaped poll retries; the second publish is the recovered status, not the stale prior poll");
+      assert.notEqual(mqtt.publishedTo("controller")[1]?.payload, first,
+        "the mis-shaped poll retries; the second publish is the recovered status, not the stale prior poll");
       assert.ok(h.retrieve.callsTo("statusschedule.php").length >= 3, "poll 1, the mis-shaped attempt, and the recovering retry all precede the second publish");
       assert.ok(loggedAt(h.entries, "error", "Unable to retrieve the current status"), "a mis-shaped body should log the failure");
     });

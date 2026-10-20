@@ -4,17 +4,18 @@
  */
 import type { API, CharacteristicValue, HAP, Service } from "homebridge";
 import { HAP_DEFAULT_MODEL, HAP_DURATION_CEILING, HOMEBRIDGE_UNKNOWN_FIRMWARE, HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER,
-  HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_REVERT_DELAY, HYDRAWISE_SUSPEND_DURATION, HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
+  HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_POLL_LOSS_THRESHOLD, HYDRAWISE_REVERT_DELAY, HYDRAWISE_SUSPEND_DURATION,
+  HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
 import { HYDRAWISE_UNSCHEDULED_SENTINEL, HydrawiseReservedNames, controllerIdentity, isControllerIdentity, isScheduleStatus, isSuspendZoneSubtype,
   isZoneIdentity, isZoneStoppedBySensor, sameControllerIdentity, sameScheduleStatus, sameZoneIdentity, scheduleStatus, suspendZoneSubtype,
   zoneIdentity, zoneScheduleStatus } from "./types.ts";
-import type { HomebridgePluginLogging, Nullable } from "homebridge-plugin-utils";
+import type { HomebridgePluginLogging, MqttAvailabilityPayload, Nullable } from "homebridge-plugin-utils";
 import type { HydrawiseAccessory, HydrawiseControllerAccessory, HydrawiseControllerConfig, HydrawiseControllerHardware, HydrawiseControllerIdentity,
   HydrawiseControllerV2Facts, HydrawiseScheduleStatus, HydrawiseZoneConfig, HydrawiseZoneIdentity, HydrawiseZoneScheduleStatus, HydrawiseZoneSuspensionResult,
   SetZoneResponse, StatusScheduleResponse } from "./types.ts";
 import type { HydrawiseControllerOption, HydrawiseControllerValueOption, HydrawiseZoneOption, HydrawiseZoneValueOption } from "./options.ts";
-import { acquireService, getServiceName, loopFaultReporter, mqttTopic, prefixedLog, retry, sameEntries, sanitizeName, setAccessoryName, setServiceName,
-  superviseLoop, validCharacteristic, validService } from "homebridge-plugin-utils";
+import { MQTT_AVAILABILITY_OFFLINE, MQTT_AVAILABILITY_ONLINE, acquireService, getServiceName, loopFaultReporter, mqttTopic, notResponding, prefixedLog, retry,
+  sameEntries, sanitizeName, setAccessoryName, setServiceName, superviseLoop, validCharacteristic, validService } from "homebridge-plugin-utils";
 import type { Dispatcher } from "undici";
 import type { HydrawisePlatform } from "./platform.ts";
 import { mqttTopics } from "./mqtt.ts";
@@ -26,21 +27,20 @@ interface HydrawiseHints {
   suspendAll: boolean;
 }
 
-/* One completed poll, as it crosses from the wire half of the polling loop to the HomeKit half: whether this is the controller's first completed poll, and the
- * status body that poll fetched.
- *
- * isFirstRun travels here because it cannot be recovered on the far side. It is read from the pre-fetch nextpoll sentinel, before the fetch overwrites the status
- * it describes, and the zone walk reads it to decide whether to attach a valve's set handler - the warm-restart case, where the valve service comes back from the
- * accessory cache but this process has never bound a handler to it.
+/* One completed poll, as it crosses from the wire half of the polling loop to the HomeKit half: the status body that poll fetched.
  *
  * The status field is deliberately the same object the controller holds, not a defensive copy. The projection reads instance state directly throughout, and it is
  * the only consumer in the process, so a copy would hand it one object while every other read in the same pass saw another.
  */
 interface HydrawisePollUpdate {
 
-  readonly isFirstRun: boolean;
   readonly status: StatusScheduleResponse;
 }
+
+/* The polling loop's verdict on whether Hydrawise answers for this controller. Pending until the first poll lands, reachable once one has, and lost after a run of
+ * consecutive failed polls, or when the loop itself has ended; a lost controller keeps polling, and its next good poll makes it reachable again.
+ */
+type HydrawiseContact = "lost" | "pending" | "reachable";
 
 // Per-zone state we track across polling cycles so we can detect and report start, stop, rain-sensor, and suspension transitions.
 interface HydrawiseZoneHints {
@@ -203,7 +203,25 @@ interface HydrawiseZoneSuspendCommand {
 export class HydrawiseController {
 
   private readonly accessory: HydrawiseControllerAccessory;
+
+  // The one place that decides whether this controller's own accessory answers HomeKit at all, bound once over the per-host verdict below. Every handler on the
+  // controller accessory is wired through it, and the verdict is read fresh on each call, so a loss refuses the very next read or write and a return answers it,
+  // with no rewiring.
+  private readonly answering: ReturnType<typeof notResponding>;
   private readonly api: API;
+
+  // This controller's availability topic tail, composed once beside the controller topic and for the same reason.
+  private readonly availabilityTopic: string;
+
+  /* Every service this process has bound its handlers to: each valve, and each per-zone suspension switch. The walk binds a service the first time it reaches it
+   * and never again, whichever way the service arrived - created this pass, kept from the accessory cache on the first poll, or a cached standalone valve a later
+   * poll hosts for the first time - so each service is bound once. It holds services weakly, so one removed with its zone leaves nothing behind.
+   */
+  private readonly bound = new WeakSet<Service>();
+
+  // The polling loop's reachability verdict, read by every refusal and by the availability word. It moves only through setContact(), which narrates each
+  // transition and restates the word.
+  private contact: HydrawiseContact = "pending";
   public readonly controller: HydrawiseControllerConfig;
 
   // This controller's MQTT topic tail, composed once from its serial and the catalog's tail, because neither changes for the life of the controller.
@@ -213,13 +231,12 @@ export class HydrawiseController {
   private readonly hap: HAP;
   private readonly hints: HydrawiseHints;
 
-  /* The last availability the account API actually reported, and the seed the transition line compares against. It is deliberately NOT read from the
-   * characteristic: that is constructed carrying no-fault, which is indistinguishable from a genuine first report of "online", so a controller that is offline
-   * the very first time it is heard from would otherwise narrate a transition that never happened. Null means nothing has reported yet, so the first arrival
-   * seeds silently whatever it says.
+  /* The last availability the account API actually reported, and the seed the transition line compares against. Null means nothing has reported yet: a first
+   * arrival that says online seeds silently, while a first arrival that says offline is narrated, because the controller refuses on that reading and a silent
+   * refusal would leave the user no cause in the log.
    *
-   * It lives in memory and dies with the process by design, on the same terms as the zone ledger's own seeds: after a restart the first arrival re-seeds
-   * silently, so restarting never manufactures a transition either.
+   * It lives in memory and dies with the process by design, on the same terms as the zone ledger's own seeds: after a restart the first arrival is judged as a
+   * first arrival again, so restarting never narrates a flip that did not happen.
    */
   private lastKnownOnline: Nullable<boolean> = null;
 
@@ -234,6 +251,9 @@ export class HydrawiseController {
 
   public readonly log: HomebridgePluginLogging;
   private readonly platform: HydrawisePlatform;
+
+  // How many polls in a row have failed since the last good one, the count the loss verdict is read from. The retry that finally succeeds resets it.
+  private pollFailures = 0;
   private status: StatusScheduleResponse;
 
   // The most recent account-credentialed facts this controller was handed, or null when none have ever arrived. Every reader goes through the freshness
@@ -276,9 +296,11 @@ export class HydrawiseController {
     // this.hints.suspendAll before any external reader can observe this.hints - that ordering is what makes the empty-object cast safe.
     this.hints = {} as HydrawiseHints;
     this.controller = controller;
+    this.availabilityTopic = mqttTopic(this.controller.serial_number, mqttTopics.availability.topic);
     this.controllerTopic = mqttTopic(this.controller.serial_number, mqttTopics.controller.topic);
     this.platform = platform;
     this.zoneHints = new HydrawiseZoneHintLedger();
+    this.answering = this.answeringFor(this.accessory);
 
     // Prefix every log line with this controller's live name. The platform's logger already gates debug routing through the user's debug setting, so debug lines
     // prefixed here route intact.
@@ -329,6 +351,9 @@ export class HydrawiseController {
     /* Kick off our state updates under supervision so a genuine fault in the polling loop surfaces once through the reporter, while a shutdown abort unwinds the
      * loop silently. The wire half and the HomeKit half sit inside this ONE envelope because they are one fault domain: a throw from either ends the same loop and
      * owes the operator the same single report, so the generator needs no supervision of its own - its throws land here.
+     *
+     * A loop that ended anywhere but at shutdown vouches for nothing from then on, so the controller reads lost the moment the envelope settles. The reporter has
+     * already said why, so the verdict moves quietly rather than adding a second line about the same fault.
      */
     void superviseLoop({ loop: async (signal): Promise<void> => {
 
@@ -336,7 +361,16 @@ export class HydrawiseController {
 
         this.applyStatus(update);
       }
-    }, onError: loopFaultReporter(this.log, "zone status"), signal: this.platform.signal });
+    }, onError: loopFaultReporter(this.log, "zone status"), signal: this.platform.signal }).then(() => {
+
+      if(!this.platform.signal.aborted) {
+
+        this.setContact("lost", { quiet: true });
+      }
+    });
+
+    // State the availability this controller starts with, which is offline until its first poll lands.
+    this.refreshAvailability();
   }
 
   // Configure controller-specific settings.
@@ -456,13 +490,16 @@ export class HydrawiseController {
    * fact about the zones it named.
    *
    * Each write is CHANGE-GATED, which is what lets a recurring cadence run this freely. A tick or a command that moved no classification writes nothing to the
-   * accessory cache and publishes nothing on MQTT, where an unconditional pair would write the cache to disk every quarter hour and republish an unchanged
-   * payload with it. The poll cadence keeps its own unconditional publish, which is a contract of its own and deliberately not shared here.
+   * accessory cache and republishes no status payload, where an unconditional pair would write the cache to disk every quarter hour and republish an unchanged
+   * payload with it. The poll cadence keeps its own unconditional status publish, which is a contract of its own and deliberately not shared here. The
+   * availability word is re-judged at the end of every pass behind its own change gate, because the facts a tick brings can move the verdict without moving
+   * any zone's classification.
    *
    * The facts are resolved ONCE and threaded through both the classification and the payload, on the same terms every other pass in this class resolves them, so
    * a lifetime boundary crossed midway cannot leave the two describing different worlds.
    *
-   * Before the first completed poll this is structurally a no-op: the projection step returns early with nothing to classify, so neither gate opens.
+   * Before the first completed poll the projection step returns early with nothing to classify, so neither of its gates opens, and only the availability word can
+   * move.
    *
    * @param mustFlush - Whether something outside the projection also has to reach the accessory cache this pass, which the projection's own change gate cannot
    *                    see. The hardware facts are the case: HAP's characteristics are their only store, so a hardware change has to be flushed to survive.
@@ -481,6 +518,9 @@ export class HydrawiseController {
 
       this.platform.mqtt?.publishGuarded(this.controllerTopic, this.statusJson(facts));
     }
+
+    // The facts this re-derive read can move the availability verdict as well, so the word is re-judged here too. It publishes only when it changed.
+    this.refreshAvailability();
   }
 
   /* Adopt the denormalized account roster the platform recomposed, and make it durable when it actually moved.
@@ -514,8 +554,9 @@ export class HydrawiseController {
     return (a.firmware === b.firmware) && (a.model === b.model);
   }
 
-  /* Report a change in whether Hydrawise can reach this controller, and remember what was reported. The line fires only when a new non-null reading DIFFERS from
-   * a non-null one already recorded, so the first arrival seeds silently whatever it says and a refresh that simply cannot tell changes nothing.
+  /* Report a change in whether Hydrawise can reach this controller, and remember what was reported. A later non-null reading is narrated only when it DIFFERS from
+   * the one already recorded, and a refresh that simply cannot tell changes nothing. The first reading seeds the record, silently when it says online and with the
+   * offline line when it says offline, because the controller refuses on that reading and the log is where the user finds out why.
    */
   private reportAvailability(online: Nullable<boolean>): void {
 
@@ -524,7 +565,7 @@ export class HydrawiseController {
       return;
     }
 
-    if((this.lastKnownOnline !== null) && (this.lastKnownOnline !== online)) {
+    if((this.lastKnownOnline === null) ? !online : (this.lastKnownOnline !== online)) {
 
       this.log.info(online ? "The controller is back online." : "The controller is offline.");
     }
@@ -532,13 +573,96 @@ export class HydrawiseController {
     this.lastKnownOnline = online;
   }
 
+  /** Whether this controller cannot vouch for anything it shows: the polling loop has not reached Hydrawise yet this run or has lost it, or the account API's
+   * fresh word is that the controller itself is offline. The account's word counts only on an install with the credentials that fetch it, so an install with an
+   * API key alone answers from the polling loop's verdict and nothing else.
+   *
+   * @returns True while every accessory this controller projects onto should refuse.
+   */
+  public get unavailable(): boolean {
+
+    return (this.contact !== "reachable") || (this.platform.hasV2Client && (this.currentFacts?.online === false));
+  }
+
+  /** Whether one accessory this controller projects onto refuses: the controller-wide answer above, or a standalone zone accessory the last poll did not host. An
+   * accessory held through its wire-absence grace is one no poll is describing, so nothing vouches for its values until a poll hosts it again. Every refusal reads
+   * this, the controller's own handlers and the platform's restore-time ones alike.
+   *
+   * @param host - The accessory a refusal speaks for.
+   *
+   * @returns True while that accessory should refuse.
+   */
+  public unavailableFor(host: HydrawiseAccessory): boolean {
+
+    return this.unavailable || ((host !== this.accessory) && ![...this.zoneHosts.values()].includes(host));
+  }
+
+  // The Not Responding rule for one accessory this controller projects onto, bound once per accessory over the per-host answer above. The predicate is read on
+  // every call, so the wrapper never needs rebinding as the verdict or the hosting moves.
+  private answeringFor(host: HydrawiseAccessory): ReturnType<typeof notResponding> {
+
+    return notResponding({ errorClass: this.hap.HapStatusError, unavailable: () => this.unavailableFor(host) });
+  }
+
+  /* Move the polling loop's verdict, narrating the move and restating the availability word. An unchanged verdict is a no-op, so a caller states what it learned
+   * without first asking what was known. Each loss is one line and each recovery another, while the first contact of the run says nothing, because discovery's
+   * connection line already said it. A quiet move narrates nothing, for a loss whose cause the caller has already reported.
+   */
+  private setContact(next: Exclude<HydrawiseContact, "pending">, { quiet = false }: { quiet?: boolean } = {}): void {
+
+    const prior = this.contact;
+
+    if(prior === next) {
+
+      return;
+    }
+
+    this.contact = next;
+
+    if(!quiet) {
+
+      switch(next) {
+
+        case "lost":
+
+          this.log.info((prior === "pending") ?
+            "Hydrawise is not responding for this controller. HomeKit will show it as not responding until the connection recovers." :
+            "Hydrawise has stopped responding for this controller. HomeKit will show it as not responding until the connection recovers.");
+
+          break;
+
+        case "reachable":
+
+          if(prior === "lost") {
+
+            this.log.info("Hydrawise is responding again for this controller.");
+          }
+
+          break;
+      }
+    }
+
+    this.refreshAvailability();
+  }
+
+  /* Publish this controller's availability word on its own topic, retained so a subscriber attaching later reads the last statement, and change-gated so a
+   * verdict re-judged with nothing moved costs nothing on the wire. The word reads the same verdict the refusals do, so MQTT and HomeKit cannot disagree.
+   */
+  private refreshAvailability(): void {
+
+    const word: MqttAvailabilityPayload = this.unavailable ? MQTT_AVAILABILITY_OFFLINE : MQTT_AVAILABILITY_ONLINE;
+
+    this.platform.mqtt?.publishGuarded(this.availabilityTopic, word, { ifChanged: true, retain: true });
+  }
+
   /* The account-credentialed facts if and only if they can still be trusted, and null otherwise. This is the single freshness judgment in the class, and every
    * way there is nothing to trust - none ever arrived, the last ones have aged past their lifetime, or no credentials are configured at all - answers the same
    * null, so no consumer has to tell them apart.
    *
    * It hands back the WHOLE snapshot rather than the zones map alone, because every gated consumer draws the same judgment: the per-zone classifier inputs, the
-   * projection's availability stamp, the MQTT payload's additive fields, and the fault characteristic. Returning the map alone would force a second, parallel
-   * freshness read for the facts that are not per-zone, which is exactly the divergence one chokepoint exists to prevent.
+   * projection's availability stamp, the MQTT payload's additive fields, and the availability verdict, which reads the cloud's word on whether the controller is
+   * online. Returning the map alone would force a second, parallel freshness read for the facts that are not per-zone, which is exactly the divergence one
+   * chokepoint exists to prevent.
    *
    * A pass resolves this ONCE and threads the answer down, so a lifetime boundary crossed midway through a poll can never split that poll's classifications
    * between two different answers.
@@ -564,11 +688,9 @@ export class HydrawiseController {
    * This is deliberately not a whole applyStatus re-run. That method also drives the standalone-accessory reconcile, whose wire-absence grace COUNTS POLLS, so
    * re-entering it outside a poll would double-count that grace and could demote an accessory the wire never actually dropped.
    *
-   * Before the first completed poll there is nothing to classify, so only the fault characteristic - which answers to the facts alone - is refreshed.
+   * Before the first completed poll there is nothing to classify, so the pass returns at once having moved nothing.
    */
   private applyProjection(facts: Nullable<HydrawiseControllerFactsSnapshot>): boolean {
-
-    this.refreshStatusFault(facts);
 
     if(!this.status.relays.length) {
 
@@ -811,44 +933,6 @@ export class HydrawiseController {
     return state?.state === "suspended";
   }
 
-  /* Project whether Hydrawise can currently reach this controller onto the irrigation system's fault characteristic, which exists only where the plugin can
-   * actually learn the answer.
-   *
-   * Each reading is handled on its own terms. A live "reachable" clears the fault and a live "unreachable" raises it. A refresh that carried no reading at all
-   * leaves whatever is displayed standing, because overwriting a real answer with a guess is worse than a moment of staleness. And no trustworthy snapshot -
-   * never arrived, or aged out because the refresh loop has stopped - clears the fault, since an unknown state is not a fault and freezing an offline reading on
-   * display forever would be a lie the user cannot clear.
-   */
-  private refreshStatusFault(facts: Nullable<HydrawiseControllerFactsSnapshot>): void {
-
-    if(!this.platform.hasV2Client) {
-
-      return;
-    }
-
-    const service = this.accessory.getService(this.hap.Service.IrrigationSystem);
-
-    if(!service) {
-
-      return;
-    }
-
-    if(!facts) {
-
-      service.updateCharacteristic(this.hap.Characteristic.StatusFault, this.hap.Characteristic.StatusFault.NO_FAULT);
-
-      return;
-    }
-
-    if(facts.online === null) {
-
-      return;
-    }
-
-    service.updateCharacteristic(this.hap.Characteristic.StatusFault,
-      facts.online ? this.hap.Characteristic.StatusFault.NO_FAULT : this.hap.Characteristic.StatusFault.GENERAL_FAULT);
-  }
-
   /* Narrate each zone whose suspension state changed, and store the new state for the next comparison. The states come from the projection this pass persisted,
    * so what the log says and what the webUI shows are the same reading rather than two derivations that can drift.
    *
@@ -889,6 +973,13 @@ export class HydrawiseController {
 
     // Set the state of a given irrigation zone.
     this.platform.mqtt?.subscribeSet(this.controllerTopic, mqttTopics.controller.label, async (value: string): Promise<void> => {
+
+      // A controller that is not responding takes no command, on the same terms its HomeKit handlers refuse one. We throw so the library logs the refusal, before
+      // the command is even parsed.
+      if(this.unavailable) {
+
+        throw new Error("MQTT: The controller is not responding.");
+      }
 
       const action = value.split(" ");
       const zoneValue = parseInt(action[1] ?? "");
@@ -947,6 +1038,10 @@ export class HydrawiseController {
           throw new Error("Invalid command.");
       }
     });
+
+    // Restate this controller's availability on every broker session. The client sends nothing it was asked to publish while disconnected, and the facts the
+    // verdict reads can age out with no event to mark it, so the word a subscriber holds is restated each time a session begins.
+    this.platform.mqtt?.onConnect(() => this.refreshAvailability(), { signal: this.platform.signal });
   }
 
   /* Configure the irrigation system service for HomeKit.
@@ -971,21 +1066,24 @@ export class HydrawiseController {
     service.updateCharacteristic(this.hap.Characteristic.InUse, this.hap.Characteristic.InUse.NOT_IN_USE);
     service.updateCharacteristic(this.hap.Characteristic.ProgramMode, this.hap.Characteristic.ProgramMode.PROGRAM_SCHEDULED);
 
-    /* Whether Hydrawise can reach this controller is a fact only the account-credentialed API reports, so the characteristic that shows it exists only on an
-     * install that configured those credentials. It is one of the optional characteristics the specification permits on this service, and wherever it is present
-     * after the presence gate - attached this pass or kept from the accessory cache - it is stamped with an explicit no-fault starting state, because construction
-     * runs synchronously, long before any refresh can have answered.
-     *
-     * The gate's removal arm is the same clean revert the firmware reset above performs, and it matters for the same reason: HAP round-trips characteristics
-     * through the accessory cache, so an accessory restored from a session that HAD credentials would otherwise keep displaying a reachability nothing is left
-     * to update.
+    /* The irrigation system's Active is this accessory's primary characteristic, so it is where HomeKit reads whether the whole accessory responds, and its
+     * handlers go through the controller's Not Responding rule. A read answers Active, the plugin's standing projection. A write - from the Home app or an
+     * automation - has nothing to command, since the controller is always active as far as Hydrawise is concerned, so it is accepted and Active is put back after a
+     * beat through the platform's registry, the same revert every refused command takes.
      */
-    const faultPresence = validCharacteristic({ characteristic: this.hap.Characteristic.StatusFault, service, validate: this.platform.hasV2Client });
+    service.getCharacteristic(this.hap.Characteristic.Active).onGet(this.answering(() => this.hap.Characteristic.Active.ACTIVE));
 
-    if((faultPresence === "attached") || (faultPresence === "kept")) {
+    service.getCharacteristic(this.hap.Characteristic.Active).onSet(this.answering((): void => {
 
-      service.updateCharacteristic(this.hap.Characteristic.StatusFault, this.hap.Characteristic.StatusFault.NO_FAULT);
-    }
+      this.platform.timers.schedule(() => service.updateCharacteristic(this.hap.Characteristic.Active, this.hap.Characteristic.Active.ACTIVE),
+        HYDRAWISE_REVERT_DELAY);
+    }));
+
+    /* The plugin learns no hardware fault from any API it reads, so the irrigation system carries no fault characteristic on any install, and whether Hydrawise can be
+     * reached is answered through the handlers above instead. The removal runs on every pass, because HAP round-trips characteristics through the accessory cache
+     * and one restored from the cache would otherwise keep displaying a reading nothing is left to update.
+     */
+    validCharacteristic({ characteristic: this.hap.Characteristic.StatusFault, service, validate: false });
   }
 
   // Configure suspend switch services for HomeKit.
@@ -1005,10 +1103,11 @@ export class HydrawiseController {
       return;
     }
 
-    // Suspend or resume the irrigation schedule.
-    service.getCharacteristic(this.hap.Characteristic.On).onGet(() => this.isAllSuspended(this.currentFacts));
+    // Suspend or resume the irrigation schedule. Its handlers go through the controller's Not Responding rule, so a suspend-all is never sent, and never read
+    // back, while the controller cannot be reached.
+    service.getCharacteristic(this.hap.Characteristic.On).onGet(this.answering(() => this.isAllSuspended(this.currentFacts)));
 
-    service.getCharacteristic(this.hap.Characteristic.On).onSet(async (value: CharacteristicValue): Promise<void> => {
+    service.getCharacteristic(this.hap.Characteristic.On).onSet(this.answering(async (value: CharacteristicValue): Promise<void> => {
 
       // We either set the timestamp to the current time, to resume irrigation, or to a year from now to suspend irrigation. Both floor to a whole second so the
       // command carries the integer seconds the API expects rather than a fractional millisecond remainder. The instant is sent to Hydrawise, which reads it as
@@ -1070,17 +1169,18 @@ export class HydrawiseController {
       // Re-derive on the account-wide command's own terms, exactly as a per-zone command does. It runs after the sentence above so the account-wide statement
       // reads ahead of the per-zone transitions the re-derive narrates beneath it.
       this.rederiveProjection();
-    });
+    }));
 
     service.updateCharacteristic(this.hap.Characteristic.On, this.isAllSuspended(this.currentFacts));
 
     this.platform.featureOptions.logFeature("Device.Suspend.All", "Suspend all zones switch", this.log, undefined, this.controller.serial_number);
   }
 
-  // Poll the Hydrawise API forever, yielding one update per completed poll. This is the wire half of the loop: it owns the fetch, the retry policy that recovers
-  // from a failed poll, and the pacing the API asks for, and it touches no HomeKit service. A shutdown abort unwinds it through the signal, which superviseLoop
-  // treats as the expected exit; a throw that outlives the retry policy propagates out of the generator into the same envelope, ending the loop as a terminal
-  // fault.
+  /* Poll the Hydrawise API forever, yielding one update per completed poll. This is the wire half of the loop: it owns the fetch, the retry policy that recovers
+   * from a failed poll, the count of failed polls the loss verdict is read from, and the pacing the API asks for, and it touches no HomeKit service - a verdict it
+   * moves reaches HomeKit through the handlers, which read it on each call. A shutdown abort unwinds it through the signal, which superviseLoop treats as the
+   * expected exit; a throw that outlives the retry policy propagates out of the generator into the same envelope, ending the loop as a terminal fault.
+   */
   private async *pollStatus(signal: AbortSignal): AsyncGenerator<HydrawisePollUpdate, void, undefined> {
 
     for(;;) {
@@ -1091,20 +1191,49 @@ export class HydrawiseController {
       // interval; afterwards we honor the API's nextpoll hint, clamped so a failure never waits longer than twice the retry interval. A shutdown abort ends the
       // retry through the signal.
       // eslint-disable-next-line no-await-in-loop
-      await retry(() => this.getStatus(), { attempts: Infinity,
+      await retry(() => this.pollOnce(), { attempts: Infinity,
         backoff: (): number => (isFirstRun ? HYDRAWISE_API_RETRY_INTERVAL : Math.min(this.status.nextpoll + HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL * 2)) *
           1000, clock: this.platform.clock, signal });
+
+      // A poll has landed, so the run of failures behind the loss verdict starts again from nothing.
+      this.pollFailures = 0;
 
       // Trim whitespace on zone names.
       this.status.relays = this.status.relays.map(x => ({ ...x, name: x.name.trim() }));
 
-      // Hand the completed poll to whoever is consuming this generator. isFirstRun travels with the status because it was read from the pre-fetch sentinel above,
-      // and the status the fetch just adopted cannot answer it.
-      yield { isFirstRun, status: this.status };
+      // Hand the completed poll to whoever is consuming this generator.
+      yield { status: this.status };
 
       // Sleep until our next polling interval due to the Hydrawise API being rate-limited. A shutdown abort interrupts the wait and unwinds the loop.
       // eslint-disable-next-line no-await-in-loop
       await this.platform.clock.delay((this.status.nextpoll + HYDRAWISE_API_JITTER) * 1000, { signal });
+    }
+  }
+
+  /* One poll attempt, as the retry above runs it: fetch the status, and count the attempt when it fails. The count is what the loss verdict reads, so a run of
+   * failed polls long enough to outlast a blip reads lost, while a single failure between good polls never does. A failure caused by shutdown is not counted,
+   * because the plugin stopping says nothing about whether Hydrawise answers. Every failure is rethrown, so the retry's own policy decides what happens next.
+   */
+  private async pollOnce(): Promise<void> {
+
+    try {
+
+      await this.getStatus();
+    } catch(error) {
+
+      if(this.platform.signal.aborted) {
+
+        throw error;
+      }
+
+      this.pollFailures++;
+
+      if(this.pollFailures >= HYDRAWISE_POLL_LOSS_THRESHOLD) {
+
+        this.setContact("lost");
+      }
+
+      throw error;
     }
   }
 
@@ -1114,7 +1243,7 @@ export class HydrawiseController {
   // frame with nothing awaited partway through it.
   private applyStatus(update: HydrawisePollUpdate): void {
 
-    const { isFirstRun, status } = update;
+    const { status } = update;
 
     // Resolve the account-credentialed facts ONCE for this whole pass and thread the answer through everything below, so a lifetime boundary crossed partway
     // through cannot split one poll's classifications between two different answers.
@@ -1233,7 +1362,7 @@ export class HydrawiseController {
       // gate at the same cadence.
       const syncName = this.hasZoneFeature("Device.SyncName", zone.relay_id.toString());
 
-      // Acquire the valve service. The transition the library answers says whether this pass created it, which is what the establishment gates below read.
+      // Acquire the valve service. The transition the library answers says whether this pass created it, which is what the rename gate below reads.
       const { service: valveService, transition } = acquireService({ accessory: host, name: effectiveName, onServiceCreate: (newService: Service): void => {
 
         // Enumerate the valve service to align with the irrigation controller's zone numbering. A standalone accessory hosts no ServiceLabel service for the
@@ -1250,6 +1379,10 @@ export class HydrawiseController {
         newService.updateCharacteristic(this.hap.Characteristic.ValveType, this.hap.Characteristic.ValveType.IRRIGATION);
       }, serviceType: this.hap.Service.Valve, subtype: zone.relay_id.toString() });
 
+      // Whether this process has yet to bind this valve, which is the establishment gate every first-binding step below reads: true for a valve this pass created,
+      // for every valve on the first poll, and for a cached standalone valve a later poll hosts for the first time.
+      const unbound = !this.bound.has(valveService);
+
       // While name synchronization holds for this zone, the effective name - the user's Name option when set, otherwise the name Hydrawise reports - is
       // authoritative: it is applied whenever the service's name differs, so a Hydrawise rename lands on the next poll, a changed Name option lands at the
       // first poll after restart, and a rename made in the Home app yields to the configured truth. Synchronization is deliberately enabled by default,
@@ -1260,10 +1393,9 @@ export class HydrawiseController {
         setServiceName(valveService, effectiveName);
       }
 
-      // A standalone zone accessory carries its own information service, established the first time this process binds the zone's valve on it - the controller's
-      // first poll, or a valve this pass created. The zone carries no wire serial, so we synthesize one from the controller's serial and the relay id: stable,
-      // unique, and purely presentational.
-      if(isStandaloneHost && (isFirstRun || (transition === "attached"))) {
+      // A standalone zone accessory carries its own information service, established the first time this process binds the zone's valve on it. The zone carries no
+      // wire serial, so we synthesize one from the controller's serial and the relay id: stable, unique, and purely presentational.
+      if(isStandaloneHost && unbound) {
 
         this.configureInfo({ accessory: host, serialNumber: this.controller.serial_number + "-" + zone.relay_id.toString() });
       }
@@ -1301,15 +1433,15 @@ export class HydrawiseController {
       const hints = this.zoneHints.ensure(zone.relay_id, isStopped, state?.state === "suspended");
 
       // Establish this zone's companion suspension switch where the user asked for one, and record where it landed for the sweep below to judge against.
-      const suspendSubtype = this.configureZoneSuspendSwitch({ effectiveName, facts, host, isFirstRun, sanitizedName, state, syncName, zone });
+      const suspendSubtype = this.configureZoneSuspendSwitch({ effectiveName, facts, host, sanitizedName, state, syncName, zone });
 
       if(suspendSubtype) {
 
         suspendHosts.set(suspendSubtype, host);
       }
 
-      // Inform the user.
-      if(isFirstRun || (transition === "attached")) {
+      // Inform the user, and bind the valve's handlers, the first time this process reaches this valve.
+      if(unbound) {
 
         // Refresh our stopped state unconditionally on a first sighting or valve rediscovery, seeding the stored value with the live sensor reading so the
         // transition check below does not fire on the zone's first appearance.
@@ -1317,8 +1449,19 @@ export class HydrawiseController {
 
         this.log.info("%s: %s", this.zoneLabel(zone, valveService), this.zoneStatus(zone, state));
 
+        /* The valve's handlers go through the Not Responding rule of the accessory hosting it, so a run is never sent while the controller cannot be reached, nor
+         * while the host is a standalone accessory the last poll did not host. A standalone valve is its accessory's primary characteristic, so it answers reads
+         * too, with the value the poll projected; a valve on the controller accessory leaves reads to the irrigation system, which answers for that accessory.
+         */
+        const answering = this.answeringFor(host);
+
+        if(isStandaloneHost) {
+
+          valveService.getCharacteristic(this.hap.Characteristic.Active).onGet(answering(() => valveService.getCharacteristic(this.hap.Characteristic.Active).value));
+        }
+
         // Manually control the zone valve.
-        valveService.getCharacteristic(this.hap.Characteristic.Active).onSet(async (value: CharacteristicValue): Promise<void> => {
+        valveService.getCharacteristic(this.hap.Characteristic.Active).onSet(answering(async (value: CharacteristicValue): Promise<void> => {
 
           const setOn = value === this.hap.Characteristic.Active.ACTIVE;
           const duration = Number(valveService.getCharacteristic(this.hap.Characteristic.SetDuration).value ?? 0);
@@ -1379,7 +1522,9 @@ export class HydrawiseController {
 
           this.log.info("%s: Manually %s%s.", this.zoneLabel(zone, valveService), setOn ? "started" : "stopped",
             setOn ? " (duration: " + this.getMinutes(duration) + ")" : "");
-        });
+        }));
+
+        this.bound.add(valveService);
       }
 
       // Record what the Hydrawise API says about this zone running. The ledger takes the not-running consequence with it: a zone the wire reports as stopped
@@ -1479,6 +1624,13 @@ export class HydrawiseController {
     // Publish our status to MQTT if configured to do so, through the client's guarded publish so a rejected write - the broker vanishing mid-write, a teardown race -
     // lands in the client's log instead of floating as an unhandled rejection.
     this.platform.mqtt?.publishGuarded(this.controllerTopic, this.statusJson(facts));
+
+    /* This poll landed, so Hydrawise answers for this controller. The verdict moves only here, after the walk has bound every handler and written every value, so the
+     * first read a recovered accessory answers is this poll's own. The word is then re-judged whether or not the verdict moved, because the cloud's word on the
+     * controller can have aged out since the last poll with no event to mark it.
+     */
+    this.setContact("reachable");
+    this.refreshAvailability();
   }
 
   /* Establish, name, and bind one zone's companion suspension switch on whichever accessory now hosts that zone.
@@ -1490,7 +1642,6 @@ export class HydrawiseController {
    * @param options.effectiveName - The zone's effective display name, which the switch's own name is composed from.
    * @param options.facts         - The account-credentialed facts this pass resolved, or null when there are none to trust.
    * @param options.host          - The accessory hosting this zone's valve, and therefore its switch.
-   * @param options.isFirstRun    - Whether this is the controller's first completed poll, which is half the establishment gate.
    * @param options.sanitizedName - The zone's effective name in its sanitized form, which the rename gate compares and requires to be non-empty.
    * @param options.state         - The zone's classified schedule state, which the starting characteristic is written from.
    * @param options.syncName      - Whether this zone's names track the configured truth.
@@ -1498,9 +1649,9 @@ export class HydrawiseController {
    *
    * @returns The composed subtype of the switch this established, or null when the zone is to have none.
    */
-  private configureZoneSuspendSwitch({ effectiveName, facts, host, isFirstRun, sanitizedName, state, syncName, zone }: { effectiveName: string;
-    facts: Nullable<HydrawiseControllerFactsSnapshot>; host: HydrawiseAccessory; isFirstRun: boolean; sanitizedName: string;
-    state: HydrawiseZoneScheduleStatus | undefined; syncName: boolean; zone: HydrawiseZoneConfig; }): Nullable<string> {
+  private configureZoneSuspendSwitch({ effectiveName, facts, host, sanitizedName, state, syncName, zone }: { effectiveName: string;
+    facts: Nullable<HydrawiseControllerFactsSnapshot>; host: HydrawiseAccessory; sanitizedName: string; state: HydrawiseZoneScheduleStatus | undefined;
+    syncName: boolean; zone: HydrawiseZoneConfig; }): Nullable<string> {
 
     if(!this.platform.hasV2Client || !this.hasZoneFeature("Device.Suspend.Zone", zone.relay_id.toString())) {
 
@@ -1521,20 +1672,23 @@ export class HydrawiseController {
       setServiceName(service, name);
     }
 
-    /* Bind the handler under the establishment gate the valve uses - a first poll, or a service this pass created - so a warm restart, where the service returns
-     * from the accessory cache and this process has never bound to it, binds exactly once.
+    /* Bind the handler under the establishment gate the valve uses - a switch this process has not yet bound - so a warm restart, where the service returns from
+     * the accessory cache and this process has never bound to it, binds once. The handler goes through the hosting accessory's Not Responding rule, so a
+     * suspension is never commanded while the controller cannot be reached.
      *
      * The starting state is written on that same gate rather than left to the projection tail, because the tail runs BEFORE this walk and so cannot have shown a
      * switch that did not yet exist. Every refresh after this one is the tail's, and it writes the same polarity: On means suspended.
      */
-    if(isFirstRun || (transition === "attached")) {
+    if(!this.bound.has(service)) {
 
       service.updateCharacteristic(this.hap.Characteristic.On, this.isZoneSuspended(zone.relay_id, state, facts));
 
-      service.getCharacteristic(this.hap.Characteristic.On).onSet(async (value: CharacteristicValue): Promise<void> => {
+      service.getCharacteristic(this.hap.Characteristic.On).onSet(this.answeringFor(host)(async (value: CharacteristicValue): Promise<void> => {
 
         await this.commandZoneSuspension(zone, service, value);
-      });
+      }));
+
+      this.bound.add(service);
     }
 
     return subtype;

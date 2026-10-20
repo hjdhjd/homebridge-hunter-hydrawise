@@ -74,28 +74,12 @@ describe("HydrawisePlatform retrieve", () => {
     await using dispatcher = installMockDispatcher();
     programStatusReply(dispatcher.agent, "customerdetails.php", 403);
 
-    // The status gate classifies any status outside the 2xx range as an error, so a 403 - not 404, not 429, and not in the retryable-statuses set - returns null and
-    // logs its raw status code and reason phrase.
+    // The status gate classifies any status outside the 2xx range as an error, so a 403 - not 404, not 429, and not a server error the pool retries - returns null
+    // and logs its status code and reason phrase.
     const response = await platform.retrieve("customerdetails.php");
 
     assert.equal(response, null, "a 403 outside the 2xx range classifies as an error and returns null");
     assert.ok(loggedAt(entries, "error", "403"), "a 403 logs its raw status code at error level");
-  });
-
-  test("a 500 in the retryable-statuses set returns null and logs the temporarily-unavailable message (the bug 1 fix)", async (t) => {
-
-    const { emit, entries, platform } = buildPlatform();
-
-    t.after(() => emit(SHUTDOWN_EVENT));
-    await using dispatcher = installMockDispatcher();
-    programStatusReply(dispatcher.agent, "customerdetails.php", 500);
-
-    // A 500 is in the retryable-statuses set, so the classifier takes the temporarily-unavailable arm. The MockAgent answers the raw status directly - it stands in for
-    // the global dispatcher, bypassing the retry interceptor - so the 500 reaches the gate on the first attempt.
-    const response = await platform.retrieve("customerdetails.php");
-
-    assert.equal(response, null, "a 500 classifies as an error and returns null");
-    assert.ok(loggedAt(entries, "error", "temporarily unavailable"), "a retryable status logs the temporarily-unavailable message");
   });
 
   test("returns null quietly when the platform signal is already aborted", async () => {

@@ -12,22 +12,25 @@
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
 import { Characteristic, Service, TestAccessory } from "./testing/hap.helpers.ts";
-import { HAP_DEFAULT_MODEL, HOMEBRIDGE_UNKNOWN_FIRMWARE, HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
+import type { CharacteristicType, TestCharacteristic } from "./testing/hap.helpers.ts";
+import { HAP_DEFAULT_MODEL, HOMEBRIDGE_UNKNOWN_FIRMWARE, HYDRAWISE_API_JITTER, HYDRAWISE_REVERT_DELAY, HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
 import type { HydrawiseControllerHardware, StatusScheduleResponse } from "./types.ts";
-import { buildController, makeV2Facts } from "./testing/platform.helpers.ts";
+import { TestClock, advanceThroughSchedule, logCount, present, waitUntil } from "homebridge-plugin-utils/testing";
+import { buildController, isNotResponding, makeV2Facts } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
-import type { CharacteristicType } from "./testing/hap.helpers.ts";
+import type { BuildControllerResult } from "./testing/platform.helpers.ts";
 import assert from "node:assert/strict";
 import { bareSensors } from "./api.fixtures.ts";
-import { waitUntil } from "homebridge-plugin-utils/testing";
+import { suspendZoneSubtype } from "./types.ts";
 
 const CONTROLLER_SERIAL = "SN0A1B2C3D4";
 const STANDALONE_RELAY_ID = 700001;
 const STANDALONE_SUBTYPE = "700001";
 
-// The option entry that promotes the zone onto an accessory of its own.
+// The option entry that promotes the zone onto an accessory of its own, and the one that gives each zone its suspension switch.
 const STANDALONE_ON = "Enable.Device.Standalone." + STANDALONE_SUBTYPE;
+const SUSPEND_ZONE_ON = "Enable.Device.Suspend.Zone." + CONTROLLER_SERIAL;
 
 // The product-line name an unenriched controller displays.
 const PLACEHOLDER_MODEL = "Hydrawise";
@@ -323,126 +326,258 @@ describe("HydrawiseController standalone zone hardware", () => {
 
 describe("HydrawiseController controller availability", () => {
 
-  // The fault characteristic on the irrigation system service, which is where HomeKit shows a controller Hydrawise cannot reach.
-  function faultValue(h: { accessory: TestAccessory }): unknown {
+  // A wire-realistic body carrying the one zone, so a row driving its own clock steps the polling loop rather than racing a fast cadence.
+  const status = makeStatusSchedule({ relays: [makeZone({ name: "Front Lawn", relay: 1, relay_id: STANDALONE_RELAY_ID })], sensors: bareSensors });
+  const sleep = (status.nextpoll + HYDRAWISE_API_JITTER) * 1000;
 
-    return h.accessory.getService(Service.IrrigationSystem)?.getCharacteristic(Characteristic.StatusFault).value;
+  // The option entry that turns on the suspend-all switch, so a row can read the controller accessory's second refusing characteristic.
+  const SUSPEND_ALL_ON = "Enable.Device.Suspend.All." + CONTROLLER_SERIAL;
+
+  // The whole second a clock reads, the unit every facts stamp speaks.
+  function seconds(clock: TestClock): number {
+
+    return Math.floor(clock.now() / 1000);
   }
 
-  // Whether that characteristic exists at all, which is the presence claim rather than the value claim.
-  function hasFault(h: { accessory: TestAccessory }): boolean {
+  // A controller polling the body above on a clock the row drives.
+  function onClock(clock: TestClock, options: { hasV2Client?: boolean; userOptions?: string[] } = {}): BuildControllerResult {
 
-    return h.accessory.getService(Service.IrrigationSystem)?.testCharacteristic(Characteristic.StatusFault) ?? false;
+    return buildController({ ...options, clock, mqtt: true, program: (recorder) => {
+
+      recorder.programDefault("statusschedule.php", { body: status, kind: "response" });
+      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
+    }, signalAborted: false });
   }
 
-  test("an install with no credentials carries no fault characteristic at all", () => {
+  // The irrigation system's Active, the characteristic HomeKit reads the controller accessory's availability from.
+  function primary(h: { accessory: TestAccessory }): TestCharacteristic {
 
-    // The plugin cannot learn reachability without the account credentials, so it publishes no characteristic claiming to know it.
-    assert.equal(hasFault(buildController()), false, "the characteristic is absent where the fact cannot be learned");
+    return present(h.accessory.getService(Service.IrrigationSystem), "the irrigation system").getCharacteristic(Characteristic.Active);
+  }
+
+  // The standalone zone accessory's valve, its own primary characteristic.
+  function standaloneValve(h: BuildControllerResult): TestCharacteristic {
+
+    return present(h.zoneAccessories.get(STANDALONE_RELAY_ID)?.getServiceById(Service.Valve, STANDALONE_SUBTYPE), "the standalone zone's valve")
+      .getCharacteristic(Characteristic.Active);
+  }
+
+  // The last availability word published on this controller's own topic.
+  function lastWord(h: BuildControllerResult): unknown {
+
+    return present(h.mqtt, "the MQTT recorder").publishedTo(h.controllerConfig.serial_number + "/availability").at(-1)?.payload;
+  }
+
+  test("before first contact, the irrigation system and the suspend-all switch refuse reads and writes", async () => {
+
+    // The platform double's signal starts aborted, so the loop never polls and the controller never reaches Hydrawise this run.
+    const h = buildController({ userOptions: [SUSPEND_ALL_ON] });
+    const suspendAll = present(h.accessory.getServiceById(Service.Switch, "All"), "the suspend-all switch").getCharacteristic(Characteristic.On);
+
+    await assert.rejects(() => primary(h).triggerGet(), isNotResponding, "the irrigation system's Active refuses a read");
+    await assert.rejects(() => primary(h).triggerSet(Characteristic.Active.INACTIVE), isNotResponding, "and a write");
+    await assert.rejects(() => suspendAll.triggerGet(), isNotResponding, "the suspend-all switch refuses a read");
+    await assert.rejects(() => suspendAll.triggerSet(true), isNotResponding, "and a write");
   });
 
-  test("a credentialed install starts with an explicit no-fault, before any refresh has answered", () => {
+  test("the cloud's word that the controller is offline refuses a standalone valve, and a good poll does not clear it", async (t) => {
 
-    /* Construction runs synchronously, long before a fetch can resolve, so the characteristic needs a stated starting value rather than whatever HAP would
-     * default it to.
-     */
-    const h = buildController({ hasV2Client: true });
+    const clock = new TestClock();
+    const h = onClock(clock, { hasV2Client: true, userOptions: [STANDALONE_ON] });
 
-    assert.equal(hasFault(h), true, "the characteristic exists on a credentialed install");
-    assert.equal(faultValue(h), Characteristic.StatusFault.NO_FAULT, "and it starts stating no fault");
+    t.after(() => h.abort());
+
+    await advanceThroughSchedule(clock, []);
+    assert.equal(await standaloneValve(h).triggerGet(), Characteristic.Active.ACTIVE, "the hosted valve answers once the first poll has landed");
+
+    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: seconds(clock) });
+    await assert.rejects(() => standaloneValve(h).triggerGet(), isNotResponding, "the cloud's offline word refuses the valve on its own accessory");
+
+    // The next poll lands and rewrites the valve's value, which is exactly what a stored refusal could not survive and a handler-served one does.
+    await advanceThroughSchedule(clock, [sleep]);
+
+    assert.equal(h.retrieve.callsTo("statusschedule.php").length, 2, "the next poll has landed");
+    await assert.rejects(() => standaloneValve(h).triggerGet(), isNotResponding, "and the valve still refuses");
   });
 
-  test("a credentialed restore carrying a cached fault starts at no-fault", () => {
+  test("the cloud's offline word refuses a zone's manual run and its suspension switch as well as its reads", async (t) => {
 
-    /* The kept arm of the presence gate. The accessory comes back from the cache with the irrigation system service already carrying a fault reading, so the gate
-     * keeps the characteristic rather than attaching it, and the starting state is written on that arm too: until a refresh answers, the cached reading is a
-     * reachability nothing in this session has confirmed.
-     */
+    const clock = new TestClock();
+    const h = onClock(clock, { hasV2Client: true, userOptions: [ STANDALONE_ON, SUSPEND_ZONE_ON ] });
+
+    t.after(() => h.abort());
+
+    await advanceThroughSchedule(clock, []);
+
+    const zoneSwitch = present(h.zoneAccessories.get(STANDALONE_RELAY_ID)?.getServiceById(Service.Switch, suspendZoneSubtype(STANDALONE_RELAY_ID)),
+      "the standalone zone's suspension switch").getCharacteristic(Characteristic.On);
+
+    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: seconds(clock) });
+
+    const commandsBefore = h.retrieve.callsTo("setzone.php").length;
+    const suspensionsBefore = h.suspensions.length;
+
+    // Every write on the zone's accessory refuses, the manual run and the suspension alike, and neither reaches the wire.
+    await assert.rejects(() => standaloneValve(h).triggerSet(Characteristic.Active.ACTIVE), isNotResponding, "the manual run refuses while the cloud says offline");
+    await assert.rejects(() => zoneSwitch.triggerSet(true), isNotResponding, "and so does the suspension switch");
+    assert.equal(h.retrieve.callsTo("setzone.php").length, commandsBefore, "no command reached the API");
+    assert.equal(h.suspensions.length, suspensionsBefore, "and no suspension reached the account API");
+  });
+
+  test("facts aged exactly their lifetime still refuse, a second older refuse nothing, and the word follows on the next poll", async (t) => {
+
+    const clock = new TestClock();
+    const h = onClock(clock, { hasV2Client: true });
+
+    t.after(() => h.abort());
+
+    await advanceThroughSchedule(clock, []);
+    assert.equal(lastWord(h), "online", "the first poll states the controller online");
+
+    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: seconds(clock) - HYDRAWISE_V2_FACTS_TTL });
+
+    await assert.rejects(() => primary(h).triggerGet(), isNotResponding, "a snapshot aged exactly its lifetime is still trusted, so it refuses");
+    assert.equal(lastWord(h), "offline", "and the word follows the facts as they land");
+
+    // One second later the same snapshot has aged out. Nothing marks that moment, so the handlers answer at once while the word waits for the next poll.
+    clock.advance(1000);
+
+    assert.equal(await primary(h).triggerGet(), Characteristic.Active.ACTIVE, "one second older, the snapshot is past its lifetime and refuses nothing");
+    assert.equal(lastWord(h), "offline", "the word has had no event to re-judge it");
+
+    await advanceThroughSchedule(clock, [sleep - 1000]);
+
+    assert.equal(lastWord(h), "online", "the next poll re-judges the word");
+  });
+
+  test("an install with an API key alone answers on the same wire, whatever the cloud would say", async (t) => {
+
+    const clock = new TestClock();
+    const h = onClock(clock, { userOptions: [STANDALONE_ON] });
+
+    t.after(() => h.abort());
+
+    await advanceThroughSchedule(clock, []);
+
+    // No client exists here to hand facts over, so this states what one would have said; the verdict reads the cloud's word only where credentials fetch it.
+    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: seconds(clock) });
+
+    assert.equal(await primary(h).triggerGet(), Characteristic.Active.ACTIVE, "the irrigation system answers");
+    assert.equal(await standaloneValve(h).triggerGet(), Characteristic.Active.ACTIVE, "and so does the standalone valve");
+    assert.equal(lastWord(h), "online", "the word stays online");
+  });
+
+  test("a write to the irrigation system's Active returns to Active after the revert beat, and a read answers Active", async (t) => {
+
+    const clock = new TestClock();
+    const h = onClock(clock);
+
+    t.after(() => h.abort());
+
+    await advanceThroughSchedule(clock, []);
+    await primary(h).triggerSet(Characteristic.Active.INACTIVE);
+
+    assert.equal(primary(h).value, Characteristic.Active.INACTIVE, "HomeKit's write lands for the beat");
+
+    clock.advance(HYDRAWISE_REVERT_DELAY);
+
+    assert.equal(primary(h).value, Characteristic.Active.ACTIVE, "and Active is put back after it");
+    assert.equal(await primary(h).triggerGet(), Characteristic.Active.ACTIVE, "a read answers Active");
+  });
+
+  test("a cached standalone zone accessory no poll hosts refuses, binds when a poll first hosts it, and refuses again when unhosted", async (t) => {
+
+    const clock = new TestClock();
+    const sibling = makeZone({ name: "Back Lawn", relay: 2, relay_id: STANDALONE_RELAY_ID + 1 });
+    const zone = makeZone({ name: "Front Lawn", relay: 1, relay_id: STANDALONE_RELAY_ID });
+    const h = buildController({ clock, program: (recorder) => {
+
+      recorder.program("statusschedule.php", { body: { ...status, relays: [sibling] }, kind: "response" });
+      recorder.program("statusschedule.php", { body: { ...status, relays: [ zone, sibling ] }, kind: "response" });
+      recorder.programDefault("statusschedule.php", { body: { ...status, relays: [sibling] }, kind: "response" });
+      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
+    }, signalAborted: false, userOptions: [STANDALONE_ON] });
+
+    t.after(() => h.abort());
+
+    // The zone's accessory as the cache restores it, carrying its valve. The first poll does not report the zone, so nothing hosts the accessory.
+    const restored = new TestAccessory("Front Lawn", "500001.Zone.700001");
+    const valve = restored.addService(new Service.Valve("Front Lawn", STANDALONE_SUBTYPE)).getCharacteristic(Characteristic.Active);
+
+    await advanceThroughSchedule(clock, []);
+    assert.equal(h.retrieve.callsTo("statusschedule.php").length, 1, "the first poll has landed without the zone");
+
+    // The platform keeps the accessory through its grace and hands it back when the zone returns; the reconcile double models that by reusing what it holds.
+    h.zoneAccessories.set(STANDALONE_RELAY_ID, restored);
+
+    await advanceThroughSchedule(clock, [sleep]);
+
+    assert.equal(await valve.triggerGet(), Characteristic.Active.ACTIVE, "the cached valve answers the value the poll that hosts it projected");
+
+    await valve.triggerSet(Characteristic.Active.INACTIVE);
+
+    assert.equal(h.retrieve.callsTo("setzone.php").length, 1, "a stop reaches the wire, so the valve was bound when a poll first hosted it");
+
+    // The zone drops off the wire again, and the accessory is held through its grace with nothing describing it.
+    await advanceThroughSchedule(clock, [sleep]);
+
+    await assert.rejects(() => valve.triggerGet(), isNotResponding, "an accessory the last poll did not host refuses");
+  });
+
+  test("a cached fault reading is removed on a credentialed restore", () => {
+
     const h = buildController({ hasV2Client: true, seedContext: (seed) => {
 
-      seed.addService(Service.IrrigationSystem).updateCharacteristic(Characteristic.StatusFault, Characteristic.StatusFault.GENERAL_FAULT);
+      seed.addService(Service.IrrigationSystem).addOptionalCharacteristic(Characteristic.StatusFault);
     } });
 
-    assert.equal(hasFault(h), true, "the characteristic stays on a credentialed install");
-    assert.equal(faultValue(h), Characteristic.StatusFault.NO_FAULT, "and it starts stating no fault rather than the cached reading");
+    assert.equal(h.accessory.getService(Service.IrrigationSystem)?.testCharacteristic(Characteristic.StatusFault), false,
+      "the plugin learns no hardware fault, so a cached reading is removed even with credentials");
   });
 
-  test("an accessory restored from a credentialed past has the characteristic REMOVED once the credentials are gone", () => {
+  test("a cached fault reading is removed on a restore with an API key alone", () => {
 
-    /* The same clean revert the firmware reset performs, and for the same reason: HAP round-trips characteristics through the accessory cache, so an accessory
-     * that once had credentials would otherwise keep displaying a reachability nothing is left to update.
-     */
     const h = buildController({ seedContext: (seed) => {
 
-      seed.addService(Service.IrrigationSystem).updateCharacteristic(Characteristic.StatusFault, Characteristic.StatusFault.GENERAL_FAULT);
+      seed.addService(Service.IrrigationSystem).addOptionalCharacteristic(Characteristic.StatusFault);
     } });
 
-    assert.equal(hasFault(h), false, "a stale fault reading is removed rather than left standing");
+    assert.equal(h.accessory.getService(Service.IrrigationSystem)?.testCharacteristic(Characteristic.StatusFault), false,
+      "a cached reading is removed without credentials too");
   });
 
-  test("the three readings are distinguished, and the unknown one is proven against a NON-default prior", () => {
+  test("a first reading that says offline is narrated and refuses", async (t) => {
 
-    const h = buildController({ hasV2Client: true });
+    const clock = new TestClock();
+    const h = onClock(clock, { hasV2Client: true });
 
-    h.controller.applyFacts({ facts: makeV2Facts({ online: true }), fetchedAt: now() });
-    assert.equal(faultValue(h), Characteristic.StatusFault.NO_FAULT, "a reachable controller clears the fault");
+    t.after(() => h.abort());
 
-    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: now() });
-    assert.equal(faultValue(h), Characteristic.StatusFault.GENERAL_FAULT, "an unreachable one raises it");
+    await advanceThroughSchedule(clock, []);
 
-    /* The unknown branch is asserted from the FAULTED state deliberately. Applied to the no-fault default it would pass trivially against an implementation that
-     * always wrote no-fault, which is exactly the bug this branch exists to avoid.
-     */
-    h.controller.applyFacts({ facts: makeV2Facts({ online: null }), fetchedAt: now() });
-    assert.equal(faultValue(h), Characteristic.StatusFault.GENERAL_FAULT, "a refresh that could not tell leaves the real reading standing");
+    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: seconds(clock) });
+
+    assert.equal(logCount(h.entries, "info", "The controller is offline."), 1, "the controller refuses on this reading, so the log says why");
+    await assert.rejects(() => primary(h).triggerGet(), isNotResponding, "and the controller accessory refuses");
   });
 
-  test("a snapshot aged past its lifetime clears the fault rather than freezing it on display forever", () => {
+  test("a first reading that says online seeds silently, and only a genuine flip is narrated", () => {
 
     const h = buildController({ hasV2Client: true });
+    const now = Math.floor(Date.now() / 1000);
 
-    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: now() });
-    assert.equal(faultValue(h), Characteristic.StatusFault.GENERAL_FAULT, "the controller is displayed as unreachable");
+    h.controller.applyFacts({ facts: makeV2Facts({ online: true }), fetchedAt: now });
+    assert.equal(logCount(h.entries, "info", "The controller is"), 0, "a first reading of online narrates nothing");
 
-    // A snapshot this old is untrustworthy, and an unknown state is not a fault - leaving the fault up would be a claim the user could never clear.
-    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: now() - (HYDRAWISE_V2_FACTS_TTL + 1) });
-    assert.equal(faultValue(h), Characteristic.StatusFault.NO_FAULT, "a stale snapshot returns the display to no-fault");
-  });
+    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: now });
+    assert.equal(logCount(h.entries, "info", "The controller is offline."), 1, "the flip to offline is narrated once");
 
-  test("the freshness boundary is inclusive, so a snapshot exactly at its lifetime still counts as fresh", () => {
+    h.controller.applyFacts({ facts: makeV2Facts({ online: true }), fetchedAt: now });
+    assert.equal(logCount(h.entries, "info", "The controller is back online."), 1, "the flip back is narrated once");
 
-    // The off-by-one assertion on the comparison operator itself.
-    const h = buildController({ hasV2Client: true });
-
-    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: now() - HYDRAWISE_V2_FACTS_TTL });
-    assert.equal(faultValue(h), Characteristic.StatusFault.GENERAL_FAULT, "a snapshot aged exactly its lifetime is still trusted");
-
-    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: now() - (HYDRAWISE_V2_FACTS_TTL + 1) });
-    assert.equal(faultValue(h), Characteristic.StatusFault.NO_FAULT, "one second older is not");
-  });
-
-  test("the first reading seeds silently, and only a genuine flip is narrated", () => {
-
-    /* The characteristic cannot be the seed for this: it is constructed carrying no-fault, which is indistinguishable from a real first report of "reachable", so
-     * a controller that is offline the very first time it is heard from would narrate an offline transition it never made.
-     */
-    const h = buildController({ hasV2Client: true });
-
-    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: now() });
-
-    assert.equal(h.entries.filter(line => line.message.includes("controller is")).length, 0, "a first reading of OFFLINE narrates nothing");
-
-    h.controller.applyFacts({ facts: makeV2Facts({ online: true }), fetchedAt: now() });
-
-    const back = h.entries.filter(line => (line.level === "info") && line.message.includes("back online"));
-
-    assert.equal(back.length, 1, "the flip back is narrated exactly once");
-
-    // A repeat of the same reading is not a transition, so it says nothing further.
-    h.controller.applyFacts({ facts: makeV2Facts({ online: true }), fetchedAt: now() });
-    assert.equal(h.entries.filter(line => line.message.includes("back online")).length, 1, "an unchanged reading narrates nothing further");
-
-    h.controller.applyFacts({ facts: makeV2Facts({ online: null }), fetchedAt: now() });
-    assert.equal(h.entries.filter(line => line.message.includes("controller is")).length, 1, "and neither does a refresh that could not tell");
+    // A repeat of the same reading is not a transition, and neither is a refresh that could not tell.
+    h.controller.applyFacts({ facts: makeV2Facts({ online: true }), fetchedAt: now });
+    h.controller.applyFacts({ facts: makeV2Facts({ online: null }), fetchedAt: now });
+    assert.equal(logCount(h.entries, "info", "The controller is"), 2, "an unchanged reading and an unknown one narrate nothing further");
   });
 });

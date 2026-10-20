@@ -21,9 +21,10 @@ import { buildPlatform, installMockDispatcher, installV2Client, makeTestV2Client
   waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeCustomerDetails, normalSchedule } from "./api.helpers.ts";
+import { logCount, loggedAt, waitUntil } from "homebridge-plugin-utils/testing";
+import type { TestLogEntry } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
 import { syntheticController } from "./api.fixtures.ts";
-import { waitUntil } from "homebridge-plugin-utils/testing";
 import { zoneAccessoryId } from "./types.ts";
 
 const DID_FINISH_LAUNCHING = "didFinishLaunching";
@@ -45,6 +46,13 @@ const SECOND_HARDWARE: HydrawiseControllerHardware = { firmware: "2.11", model: 
 const ACCOUNT_CONTROLLER_NAME = "Backyard Irrigation System";
 
 const STANDALONE_RELAY_ID = 700001;
+
+// Whether a line containing the text was logged at any level, for the claims that nothing of a kind was said at all. Each level is searched through the library's
+// rendering finder, so a value that arrived as a format parameter is matched as the user would read it.
+function loggedAnywhere(entries: readonly TestLogEntry[], text: string): boolean {
+
+  return ([ "debug", "error", "info", "warn" ] as const).some(level => loggedAt(entries, level, text));
+}
 
 // One accessory's information characteristic, which is what HomeKit shows the user for it. Every assertion below reads through here, so no test body has to
 // re-derive where a model or a firmware version lives.
@@ -104,8 +112,7 @@ describe("HydrawisePlatform hardware enrichment gate", () => {
 
     assert.equal(platform.hasV2Client, true, "a complete login builds the client");
     assert.equal(v2BudgetOf(platform).capacity, HYDRAWISE_V2_BUDGET_CALLS, "the account-credentialed budget carries its own ceiling");
-    assert.ok(entries.some(line => (line.level === "info") && line.message.includes("Enhanced features are enabled")),
-      "turning on an off-by-default capability is reported at startup");
+    assert.ok(loggedAt(entries, "info", "Enhanced features are enabled"), "turning on an off-by-default capability is reported at startup");
   });
 });
 
@@ -229,10 +236,10 @@ describe("HydrawisePlatform hardware distribution", () => {
      * second refresh loop running forever beside the first, doubling this account's spend against a ceiling measured in single digits. The count is EXACT rather
      * than a lower bound: the loop's own next tick is a quarter hour away and cannot reach this assertion, so any second fetch here is a second loop.
      */
-    const connections = entries.filter(line => line.message.includes("Successfully connected")).length;
+    const connections = logCount(entries, "info", "Successfully connected");
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => entries.filter(line => line.message.includes("Successfully connected")).length > connections, { description: "another connection line" });
+    await waitUntil(() => logCount(entries, "info", "Successfully connected") > connections, { description: "another connection line" });
 
     assert.equal(fetches(), 1, "a re-entered discovery pass should start no second loop and spend no second fetch");
   });
@@ -293,8 +300,7 @@ describe("HydrawisePlatform hardware distribution", () => {
     await waitUntil(() => true, { description: "the shutdown to reach the loop" });
 
     assert.equal(fetches(), spent, "no further tick runs after shutdown");
-    assert.ok(!entries.some(line => (line.level === "error") && line.message.includes("stopped unexpectedly")),
-      "a shutdown unwinds the loop quietly rather than reporting a fault");
+    assert.ok(!loggedAt(entries, "error", "stopped unexpectedly"), "a shutdown unwinds the loop quietly rather than reporting a fault");
   });
 
   test("no loop starts, no call is spent, and nothing is logged without credentials", async (t) => {
@@ -320,8 +326,8 @@ describe("HydrawisePlatform hardware distribution", () => {
       "the firmware is the unknown marker Homebridge itself uses");
 
     // Silence is part of the contract, not incidental: a user who configured nothing but an API key should see no trace of a capability they never turned on.
-    assert.ok(!entries.some(line => line.message.includes("Enhanced features")), "no enhanced-features line appears at all");
-    assert.ok(!entries.some(line => line.message.includes("enhanced features refresh")), "and no refresh loop reports itself");
+    assert.ok(!loggedAnywhere(entries, "Enhanced features"), "no enhanced-features line appears at all");
+    assert.ok(!loggedAnywhere(entries, "enhanced features refresh"), "and no refresh loop reports itself");
   });
 });
 
@@ -344,13 +350,12 @@ describe("HydrawisePlatform connection reporting", () => {
     emit(DID_FINISH_LAUNCHING);
     await waitUntil(() => fetches() >= 1, { description: "the first account fetch" });
 
-    const connected = (): number => entries.filter(line => line.message.includes("connected to the Hydrawise account API")).length;
+    const connected = (): number => logCount(entries, "info", "connected to the Hydrawise account API");
 
     await waitUntil(() => connected() >= 1, { description: "the first account connection" });
 
     // The two tiers are delineated: the key-based line names the API key, and the account line names the enhanced features it unlocks.
-    assert.ok(entries.some(line => line.message.includes("Successfully connected to the Hydrawise API using your API key.")),
-      "the key-based tier names how it connected");
+    assert.ok(loggedAt(entries, "info", "Successfully connected to the Hydrawise API using your API key."), "the key-based tier names how it connected");
     assert.equal(connected(), 1, "the account tier reports itself connected exactly once");
 
     /* A second successful refresh is not a second connection. Without the latch every refresh tick would republish the same line every quarter hour for the life
@@ -381,7 +386,7 @@ describe("HydrawisePlatform connection reporting", () => {
     emit(DID_FINISH_LAUNCHING);
     await waitUntil(() => fetches() >= 1, { description: "the first account fetch" });
 
-    const connected = (): number => entries.filter(line => line.message.includes("connected to the Hydrawise account API")).length;
+    const connected = (): number => logCount(entries, "info", "connected to the Hydrawise account API");
 
     assert.equal(connected(), 0, "a failed tick claims no connection - the client already reported the failure in its own words");
 
@@ -404,7 +409,7 @@ describe("HydrawisePlatform connection reporting", () => {
     emit(DID_FINISH_LAUNCHING);
     await waitUntil(() => registered[0] !== undefined, { description: "the first accessory registration" });
 
-    assert.ok(entries.some(line => line.message.includes("Successfully connected to the Hydrawise API using your API key.")), "the key-based line still reports");
-    assert.equal(entries.filter(line => line.message.includes("account API")).length, 0, "and nothing claims an account connection that was never made");
+    assert.ok(loggedAt(entries, "info", "Successfully connected to the Hydrawise API using your API key."), "the key-based line still reports");
+    assert.ok(!loggedAnywhere(entries, "account API"), "and nothing claims an account connection that was never made");
   });
 });

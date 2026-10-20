@@ -3,12 +3,14 @@
  * settings.test.ts: The plugin constants. Small honest assertions so a change to a rate-limit-sensitive timing value or a platform identity is a deliberate,
  * visible edit.
  */
-import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_BUDGET_CALLS, HYDRAWISE_API_BUDGET_WINDOW, HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL,
-  HYDRAWISE_API_TIMEOUT, HYDRAWISE_COMMAND_BUDGET_CALLS, HYDRAWISE_COMMAND_BUDGET_WINDOW, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_MQTT_TOPIC,
-  HYDRAWISE_SUSPEND_DURATION, HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_V2_FACTS_TTL, HYDRAWISE_V2_MUTATION_BUDGET_CALLS,
-  HYDRAWISE_V2_MUTATION_BUDGET_WINDOW, HYDRAWISE_V2_REFRESH_INTERVAL, PLATFORM_NAME, PLUGIN_NAME } from "./settings.ts";
+import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_BUDGET_CALLS, HYDRAWISE_API_BUDGET_WINDOW, HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_ATTEMPTS,
+  HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_RETRY_STATUS_CODES, HYDRAWISE_API_TIMEOUT, HYDRAWISE_COMMAND_BUDGET_CALLS, HYDRAWISE_COMMAND_BUDGET_WINDOW,
+  HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_MQTT_TOPIC, HYDRAWISE_SUSPEND_DURATION, HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_V2_FACTS_TTL,
+  HYDRAWISE_V2_MUTATION_BUDGET_CALLS, HYDRAWISE_V2_MUTATION_BUDGET_WINDOW, HYDRAWISE_V2_REFRESH_INTERVAL, PLATFORM_NAME, PLUGIN_NAME } from "./settings.ts";
 import { describe, test } from "node:test";
+import { apiRetryOptions } from "homebridge-plugin-utils";
 import assert from "node:assert/strict";
+import { present } from "homebridge-plugin-utils/testing";
 
 describe("settings", () => {
 
@@ -19,6 +21,29 @@ describe("settings", () => {
     assert.equal(HYDRAWISE_API_JITTER, 0.2, "the poll jitter is 0.2 seconds");
     assert.equal(HYDRAWISE_ACTIVE_ZONE_INDICATOR, 3600, "a zone within 3600 seconds of running is marked active");
     assert.equal(HYDRAWISE_SUSPEND_DURATION, 31556926, "the suspend-all offset is one year in seconds");
+  });
+
+  test("the connection pool's retries settle inside the request timeout", () => {
+
+    /* The relation is the receipt, not the literals. The ladder's waits come from the library's own merge of the plugin's policy over its defaults, each retry
+     * waiting the seed grown by the factor for every retry before it and capped at the ceiling, so a change to the retry count or to the library's ladder that
+     * pushes the waits past the timeout fails here rather than turning every server error into a report that the API was taking too long.
+     */
+    const ladder = present(apiRetryOptions({ maxRetries: HYDRAWISE_API_RETRY_ATTEMPTS }), "the merged retry policy");
+    const minTimeout = present(ladder.minTimeout, "the ladder's first wait");
+    const timeoutFactor = present(ladder.timeoutFactor, "the ladder's growth factor");
+    const maxTimeout = present(ladder.maxTimeout, "the ladder's ceiling");
+    const waits = Array.from({ length: HYDRAWISE_API_RETRY_ATTEMPTS }, (_, retry) => Math.min(minTimeout * (timeoutFactor ** retry), maxTimeout));
+
+    assert.equal(ladder.maxRetries, HYDRAWISE_API_RETRY_ATTEMPTS, "the merged policy carries the plugin's own retry count");
+    assert.ok(waits.reduce((total, wait) => total + wait, 0) < (HYDRAWISE_API_TIMEOUT * 1000), "the ladder's waits together fit inside the request timeout");
+  });
+
+  test("the retried statuses leave out the ones that carry their own meaning", () => {
+
+    // An invalid key and a reached rate limit are answers the caller reports at once, so neither may be retried into a different sentence.
+    assert.ok(!HYDRAWISE_API_RETRY_STATUS_CODES.includes(404), "an invalid API key is not retried");
+    assert.ok(!HYDRAWISE_API_RETRY_STATUS_CODES.includes(429), "a reached rate limit is not retried");
   });
 
   test("locks in the documented Hydrawise rate ceilings and the command endpoint", () => {

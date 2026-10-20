@@ -2,31 +2,27 @@
  *
  * platform.ts: homebridge-hunter-hydrawise platform class.
  */
-import type { API, DynamicPlatformPlugin, HAP, Logging, PlatformAccessory, PlatformConfig } from "homebridge";
-import { APIEvent, API_RETRY_STATUS_CODES, FeatureOptions, RateBudget, TimerRegistry, classifyTransportError, composeSignals, createApiDispatcher,
-  createMqttClient, debugGatedLog, loopFaultReporter, retry, sanitizeName, superviseLoop, systemClock } from "homebridge-plugin-utils";
+import type { API, Characteristic, DynamicPlatformPlugin, HAP, Logging, PlatformAccessory, PlatformConfig } from "homebridge";
+import { APIEvent, FeatureOptions, MQTT_AVAILABILITY_OFFLINE, RateBudget, TimerRegistry, classifyTransportError, composeSignals, createApiDispatcher,
+  createMqttClient, debugGatedLog, loopFaultReporter, mqttTopic, notResponding, retry, sanitizeName, superviseLoop, systemClock } from "homebridge-plugin-utils";
 import type { Categories, Clock, HomebridgePluginLogging, MqttClient, Nullable } from "homebridge-plugin-utils";
 import type { CustomerDetailsResponse, HydrawiseAccessory, HydrawiseAccessoryContext, HydrawiseControllerAccessory, HydrawiseControllerConfig,
   HydrawiseControllerIdentity, HydrawiseEndpoint, HydrawiseZoneIdentity, HydrawiseZoneSuspensionResult } from "./types.ts";
-import { HYDRAWISE_API_BASE_URL, HYDRAWISE_API_BUDGET_CALLS, HYDRAWISE_API_BUDGET_WINDOW, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_TIMEOUT,
-  HYDRAWISE_COMMAND_BUDGET_CALLS, HYDRAWISE_COMMAND_BUDGET_WINDOW, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_TRANSPORT_FAULT_SENTENCES,
-  HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_V2_MUTATION_BUDGET_CALLS, HYDRAWISE_V2_MUTATION_BUDGET_WINDOW,
-  HYDRAWISE_V2_REFRESH_INTERVAL, HYDRAWISE_ZONE_ACCESSORY_CATEGORY, HYDRAWISE_ZONE_ACCESSORY_GRACE_POLLS, PLATFORM_NAME, PLUGIN_NAME } from "./settings.ts";
+import { HYDRAWISE_API_BASE_URL, HYDRAWISE_API_BUDGET_CALLS, HYDRAWISE_API_BUDGET_WINDOW, HYDRAWISE_API_RETRY_ATTEMPTS, HYDRAWISE_API_RETRY_INTERVAL,
+  HYDRAWISE_API_RETRY_STATUS_CODES, HYDRAWISE_API_TIMEOUT, HYDRAWISE_COMMAND_BUDGET_CALLS, HYDRAWISE_COMMAND_BUDGET_WINDOW, HYDRAWISE_COMMAND_ENDPOINT,
+  HYDRAWISE_REVERT_DELAY, HYDRAWISE_TRANSPORT_FAULT_SENTENCES, HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_V2_MUTATION_BUDGET_CALLS,
+  HYDRAWISE_V2_MUTATION_BUDGET_WINDOW, HYDRAWISE_V2_REFRESH_INTERVAL, HYDRAWISE_ZONE_ACCESSORY_CATEGORY, HYDRAWISE_ZONE_ACCESSORY_GRACE_POLLS, PLATFORM_NAME,
+  PLUGIN_NAME } from "./settings.ts";
 import type { HydrawiseGlobalFlagOption, HydrawiseGlobalValueOption, HydrawiseOptions } from "./options.ts";
-import { controllerIdentity, isZoneAccessoryContext, sameControllerIdentity, sameZoneIdentity, zoneAccessoryId } from "./types.ts";
+import { controllerIdentity, isControllerIdentity, isZoneAccessoryContext, sameControllerIdentity, sameZoneIdentity, zoneAccessoryId } from "./types.ts";
 import { featureOptionCategories, featureOptions } from "./options.ts";
 import { request, setGlobalDispatcher } from "undici";
 import type { Dispatcher } from "undici";
 import { HydrawiseController } from "./controller.ts";
 import { HydrawiseV2Client } from "./v2.ts";
 import { STATUS_CODES } from "node:http";
+import { mqttTopics } from "./mqtt.ts";
 import util from "node:util";
-
-/* The statuses that share the temporarily-unavailable sentence in retrieve(), derived from the list the transport itself retries so the two can never disagree: a
- * status the transport retries is, by definition, one this plugin describes as transient once the retries run out. 404 and 429 are members for that reason but never
- * reach that classification, because each returns from its own dedicated branch first.
- */
-const RETRYABLE_STATUSES: ReadonlySet<number> = new Set(API_RETRY_STATUS_CODES);
 
 export class HydrawisePlatform implements DynamicPlatformPlugin {
 
@@ -64,6 +60,12 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
    * platform global, which the entry point's polyfill import guarantees exists on every runtime this package supports.
    */
   private readonly teardown = new DisposableStack();
+
+  /* The serial of every controller accessory Homebridge restored from its cache this run, the set the unconfigured availability statement is drawn from. It is a
+   * record of what was restored rather than a read of the tracked array, because discovery removes a disabled or orphaned controller's accessory from that array
+   * while its retained word still has to be stated on every broker session for the rest of the run.
+   */
+  private readonly restoredSerials = new Set<string>();
 
   /* Whether the recurring account-credentialed refresh loop has been started. Discovery is re-enterable - a second DID_FINISH_LAUNCHING runs it again, and the
    * supervisor can re-enter it - while the loop it starts runs for the life of the plugin, so exactly one is ever wanted. The flag is raised before the loop is
@@ -188,6 +190,10 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
      */
     this.mqtt = createMqttClient({ brokerUrl: this.config.mqttUrl, log: this.log, topicPrefix: this.config.mqttTopic }, { signal: this.signal });
 
+    // On every broker session, state each restored controller this run has not built as unreachable. The client's lifetime is the platform's, so the registration
+    // carries no signal of its own.
+    this.mqtt?.onConnect(() => this.publishUnconfiguredAvailability());
+
     this.log.debug("Debug logging on. Expect a lot of data.");
 
     // Fire up the Hydrawise API once Homebridge has loaded all the cached accessories it knows about and called configureAccessory() on each. We supervise the
@@ -213,11 +219,131 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     this.teardown.defer(() => this.shutdownController.abort("shutdown"));
   }
 
-  // This gets called when homebridge restores cached accessories at startup. We intentionally avoid doing anything significant here, and save all that logic for
-  // Hydrawise API enumeration.
+  /* This gets called when homebridge restores cached accessories at startup. Every restored accessory is tracked for discovery to claim, a controller accessory's
+   * serial is recorded for the availability statement below, and the accessory's primary characteristics refuse at once: nothing in this run has reached Hydrawise
+   * yet, so the values the cache restored are ones the plugin cannot vouch for. Everything else waits for Hydrawise API enumeration.
+   */
   public configureAccessory(accessory: HydrawiseAccessory): void {
 
     this.accessories.push(accessory);
+
+    const context = accessory.context;
+
+    if(!isZoneAccessoryContext(context) && isControllerIdentity(context.controller)) {
+
+      this.restoredSerials.add(context.controller.serialNumber);
+    }
+
+    this.bindPrimary(accessory);
+  }
+
+  /** The Not Responding rule for one cached accessory, as its restore-time handlers read it: the accessory refuses while the controller that owns it cannot vouch
+   * for it, and while no controller has claimed it at all. The owner's UUID is derived once, here, from the accessory's cached identity - its own UUID for a
+   * controller accessory, and its owner's for a zone accessory, as configuredController derives it - so a read never hashes an identity again.
+   *
+   * @param accessory - The cached accessory whose handlers the rule wraps.
+   *
+   * @returns The wrapper the accessory's handlers are bound through.
+   */
+  public answeringFor(accessory: HydrawiseAccessory): ReturnType<typeof notResponding> {
+
+    const context = accessory.context;
+    const owner = isZoneAccessoryContext(context) ? this.hap.uuid.generate(context.ownerController.controllerId.toString()) : accessory.UUID;
+
+    return notResponding({ errorClass: this.hap.HapStatusError, unavailable: () => this.isUnavailable({ accessory, owner }) });
+  }
+
+  /* Whether a cached accessory refuses: whatever the controller built under its owner's UUID answers for it, and unavailable when none is built there. That covers
+   * the window before discovery, a revoked key that keeps discovery from completing, and a context that names no controller this run builds, a malformed one
+   * included, since its own UUID is no controller's.
+   */
+  private isUnavailable({ accessory, owner }: { accessory: HydrawiseAccessory; owner: string }): boolean {
+
+    return this.configuredDevices[owner]?.unavailableFor(accessory) ?? true;
+  }
+
+  /* Bind the refusal on a cached accessory's primary characteristics, the moment Homebridge restores it. HomeKit renders a whole accessory as not responding when
+   * one characteristic refuses, so a controller accessory answers through its irrigation system's Active and a zone accessory through its valve's. Every cached
+   * valve and every cached suspension switch is bound for writes as well, so a run or a suspension HomeKit asks of a cached service before its controller has
+   * reached Hydrawise is refused rather than accepted and lost. Each service is located by type and skipped when the cache holds none.
+   *
+   * The controller binds its own handlers over these as it configures each service, and HAP keeps only the latest binding, so these stand only until then. The
+   * platform touches nothing else on a service: what exists on an accessory stays the controller's business.
+   */
+  private bindPrimary(accessory: HydrawiseAccessory): void {
+
+    const answering = this.answeringFor(accessory);
+    const valves = accessory.services.filter(service => service.UUID === this.hap.Service.Valve.UUID);
+    const switches = accessory.services.filter(service => service.UUID === this.hap.Service.Switch.UUID);
+
+    for(const zoneSwitch of switches) {
+
+      this.bindStoredValue({ answering, characteristic: zoneSwitch.getCharacteristic(this.hap.Characteristic.On), read: false });
+    }
+
+    if(isZoneAccessoryContext(accessory.context)) {
+
+      for(const valve of valves) {
+
+        this.bindStoredValue({ answering, characteristic: valve.getCharacteristic(this.hap.Characteristic.Active), read: true });
+      }
+
+      return;
+    }
+
+    const irrigation = accessory.getService(this.hap.Service.IrrigationSystem);
+
+    if(irrigation) {
+
+      this.bindStoredValue({ answering, characteristic: irrigation.getCharacteristic(this.hap.Characteristic.Active), read: true });
+    }
+
+    for(const valve of valves) {
+
+      this.bindStoredValue({ answering, characteristic: valve.getCharacteristic(this.hap.Characteristic.Active), read: false });
+    }
+  }
+
+  /* Bind one characteristic's restore-time handlers through its accessory's rule. While the rule answers available - a claimed accessory whose controller vouches
+   * for it, before the controller has bound its own handlers - a read answers the stored value, and a write is accepted and the stored value put back after a beat
+   * through the platform's registry, because nothing here can carry a command to Hydrawise.
+   *
+   * @param options                - The binding.
+   * @param options.answering      - The accessory's Not Responding rule.
+   * @param options.characteristic - The characteristic to bind.
+   * @param options.read           - Whether reads are bound too, which they are on the characteristic HomeKit reads the accessory's availability from.
+   */
+  private bindStoredValue({ answering, characteristic, read }: { answering: ReturnType<typeof notResponding>; characteristic: Characteristic;
+    read: boolean; }): void {
+
+    if(read) {
+
+      characteristic.onGet(answering(() => characteristic.value));
+    }
+
+    characteristic.onSet(answering((): void => {
+
+      const stored = characteristic.value;
+
+      this.timers.schedule(() => characteristic.updateValue(stored), HYDRAWISE_REVERT_DELAY);
+    }));
+  }
+
+  /* The platform's only availability statement: a retained offline for every controller restored from the cache this run that the platform has not built. A
+   * controller this run has not built cannot be reached, and nothing else speaks for it...a built controller states its own availability, so no serial is stated
+   * twice. It runs on every broker session and once more when discovery has settled which controllers it builds.
+   */
+  private publishUnconfiguredAvailability(): void {
+
+    const built = new Set(Object.values(this.configuredDevices).map(controller => controller?.controller.serial_number));
+
+    for(const serial of this.restoredSerials) {
+
+      if(!built.has(serial)) {
+
+        this.mqtt?.publishGuarded(mqttTopic(serial, mqttTopics.availability.topic), MQTT_AVAILABILITY_OFFLINE, { retain: true });
+      }
+    }
   }
 
   // Configure and connect to the Hydrawise API.
@@ -283,6 +409,10 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       this.zoneAccessoryGrace.delete(accessory.UUID);
       this.removeAccessory(accessory);
     }
+
+    // Discovery has settled which controllers this run builds, so state every restored controller it left unbuilt - a disabled one, and one the account has
+    // dropped - as unreachable on the session already held, rather than waiting for the next one.
+    this.publishUnconfiguredAvailability();
   }
 
   /* Start the endless loop that refreshes every controller's account-credentialed facts, once, and only for an install that configured the credentials making it
@@ -692,11 +822,16 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     // onto the fresh pool through their own retry loops, where a graceful drain would instead wait on the very wedge the re-arm is clearing.
     void this.dispatcher?.destroy();
 
-    /* The family's vetted transport - the pool, the retry policy over the statuses RETRYABLE_STATUSES reads, and this plugin's name as the user agent - built against
-     * the origin derived from the one base URL every request is assembled on. Re-arming after a wedge is another call through the same factory, so the pool the
-     * constructor built and the pool a timeout rebuilds can never differ.
+    /* The family's vetted transport - the pool, the retry policy, and this plugin's name as the user agent - built against the origin derived from the one base URL
+     * every request is assembled on. Re-arming after a wedge is another call through the same factory, so the pool the constructor built and the pool a timeout
+     * rebuilds can never differ.
+     *
+     * The retry policy is the plugin's own on the fields named here and the library's on the rest. The retried statuses are the server errors alone, so an invalid key, a
+     * reached rate limit, and a request the server refused reach retrieve() as themselves. The retry count keeps the backoff ladder inside the request timeout, so
+     * a server that keeps failing, or a host that refuses the connection, reports as itself rather than as the timeout overtaking a retry.
      */
-    this.dispatcher = createApiDispatcher({ origin: new URL(HYDRAWISE_API_BASE_URL).origin, userAgent: PLUGIN_NAME });
+    this.dispatcher = createApiDispatcher({ origin: new URL(HYDRAWISE_API_BASE_URL).origin,
+      retry: { maxRetries: HYDRAWISE_API_RETRY_ATTEMPTS, statusCodes: [...HYDRAWISE_API_RETRY_STATUS_CODES] }, userAgent: PLUGIN_NAME });
 
     setGlobalDispatcher(this.dispatcher);
   }
@@ -751,28 +886,37 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
       response = await request(url, { signal });
 
-      // Invalid API key.
+      /* Invalid API key. The pool does not retry this status, so it reaches this branch on the first answer.
+       *
+       * Every arm that refuses a response drains its body first. The pool holds a single connection, and a body nobody reads holds that connection until it is
+       * consumed, so an unread error body would stall every request queued behind it.
+       */
       if(response.statusCode === 404) {
+
+        await response.body.dump();
 
         this.log.error("Invalid API key. Please check your Hydrawise API key.");
 
         return null;
       }
 
-      // API rate limit exceeded.
+      // API rate limit exceeded. The pool does not retry this status, so the limit is reported the moment Hydrawise says so.
       if(response.statusCode === 429) {
+
+        await response.body.dump();
 
         this.log.error("Hydrawise API rate limit has been exceeded.");
 
         return null;
       }
 
-      // Any response outside the 2xx success range is an error. A status the retry interceptor treats as a server-side failure shares the temporarily-unavailable
-      // message once it has survived retries; every other non-2xx status reports its raw code and reason phrase.
+      // Any other response outside the 2xx success range is an error, reported with its status code and reason phrase. A server error never arrives here: the pool
+      // retries it, and one that survives every retry is thrown as an exhausted retry, which the classification below names.
       if((response.statusCode < 200) || (response.statusCode >= 300)) {
 
-        this.log.error(RETRYABLE_STATUSES.has(response.statusCode) ? "Hydrawise API is temporarily unavailable." : response.statusCode.toString() + ": " +
-          (STATUS_CODES[response.statusCode] ?? ""));
+        await response.body.dump();
+
+        this.log.error("The Hydrawise API answered a request with an unexpected status of %s %s.", response.statusCode, STATUS_CODES[response.statusCode] ?? "");
 
         return null;
       }
