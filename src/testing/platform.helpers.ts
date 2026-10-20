@@ -14,8 +14,8 @@
 // the sunset deletes.
 import "homebridge-plugin-utils/polyfills";
 import { Characteristic, Service, TestAccessory, makeTestAccessory } from "./hap.helpers.ts";
-import { FeatureOptions, TimerRegistry, sanitizeName } from "homebridge-plugin-utils";
-import type { HomebridgePluginLogging, Nullable, RateBudget } from "homebridge-plugin-utils";
+import type { Clock, HomebridgePluginLogging, Nullable, RateBudget } from "homebridge-plugin-utils";
+import { FeatureOptions, TimerRegistry, sanitizeName, systemClock } from "homebridge-plugin-utils";
 import type { HydrawiseAccessory, HydrawiseControllerConfig, HydrawiseControllerHardware, HydrawiseControllerIdentity, HydrawiseControllerV2Facts,
   HydrawiseV2MutationResult, HydrawiseZoneSuspensionResult, HydrawiseZoneV2Facts } from "../types.ts";
 import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
@@ -137,6 +137,10 @@ export type RecordedReconcileCall = Parameters<HydrawisePlatform["reconcileZoneA
 export interface TestPlatform {
 
   api: { hap: TestHap; updatePlatformAccessories: (accessories: TestAccessory[]) => void };
+
+  // The time source every wait and stamp a controller takes reads, standing in for the production platform's own clock. Typed as the production Clock because that is
+  // the whole of what a controller consumes; a test that drives time holds its own TestClock handle.
+  clock: Clock;
   config: HydrawiseOptions;
   featureOptions: FeatureOptions;
   hap: TestHap;
@@ -159,6 +163,10 @@ export type RecordedSuspensionCall = Parameters<HydrawisePlatform["setZoneSuspen
 // lets a controller construct fully while its polling loop exits silently), and the feature-option strings.
 export interface MakeTestPlatformOptions {
 
+  /* The clock the platform double publishes, defaulting to the system clock. The suites' polling rows run on real time through the fast cadence, so a virtual clock
+   * as the default would hold every one of them at its first sleep; a row that drives time itself passes a TestClock and advances it.
+   */
+  clock?: Clock;
   config?: Partial<HydrawiseOptions>;
   hasV2Client?: boolean;
   mqtt?: boolean;
@@ -183,6 +191,9 @@ export interface MakeTestPlatformOptions {
 export interface MakeTestPlatformResult {
 
   abort: (reason?: string) => void;
+
+  // The clock the platform double publishes: the caller's own when it passed one, and the system clock otherwise.
+  clock: Clock;
 
   // Every line the platform double logged, read live: the array grows as the code under test logs, so a read always sees everything logged so far.
   entries: readonly TestLogEntry[];
@@ -219,12 +230,14 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
   }
 
   const mqtt = options.mqtt ? new TestMqttClient({ log }) : null;
+  const clock = options.clock ?? systemClock;
 
   /* The REAL timer registry, not a double. A double stands in for an I/O surface - the recording MQTT client for a network client, the retrieve recorder for the
    * wire - while a pure in-memory, signal-scoped mechanism runs its production self here, exactly as the FeatureOptions engine and the platform's rate budgets do.
-   * It takes the double's own signal, so a pre-aborted platform double carries a registry born disposed, which is the state production reaches at shutdown.
+   * It takes the double's own signal, so a pre-aborted platform double carries a registry born disposed, which is the state production reaches at shutdown, and the
+   * double's own clock, so a revert a row drives on a virtual timeline fires when that row advances it.
    */
-  const timers = new TimerRegistry({ signal: signalController.signal });
+  const timers = new TimerRegistry({ clock, signal: signalController.signal });
   const retrieve = new RetrieveRecorder();
   const flushes: TestAccessory[][] = [];
   const reconciles: RecordedReconcileCall[] = [];
@@ -305,6 +318,7 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
   const platform: TestPlatform = {
 
     api: { hap: testHap, updatePlatformAccessories: (accessories: TestAccessory[]): void => { flushes.push(accessories); } },
+    clock,
     config,
     featureOptions: featureOpts,
     hap: testHap,
@@ -328,7 +342,7 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
     mqtt?.abort();
   };
 
-  return { abort, entries: log.entries, flushes, mqtt, platform, reconciles, retrieve, signalController, suspensions, zoneAccessories };
+  return { abort, clock, entries: log.entries, flushes, mqtt, platform, reconciles, retrieve, signalController, suspensions, zoneAccessories };
 }
 
 // Options for buildController: the controller-config overrides, an optional program hook, and everything makeTestPlatform accepts.
@@ -607,10 +621,10 @@ export function installV2Client(platform: HydrawisePlatform, client: TestV2Clien
 /**
  * Run ONE refresh tick against the platform's installed client, exactly as the recurring loop's body runs it.
  *
- * This exists because the loop sleeps a quarter hour between ticks on a promisified timer, and Node's own test-runner timer mocking cannot advance that shape at
- * all - the same gap this package's Clock utility documents. Driving the tick directly is what lets a test observe the SECOND tick's behavior, above all that a
- * failed fetch ends only its own tick and leaves the loop able to distribute on the next one. It is the production method, not a reimplementation of it: what the
- * loop adds around this call is the sleep, which is what these tests deliberately do not wait on.
+ * This exists because the loop sleeps a quarter hour between ticks, and the real platform runs on the system clock and takes no other, so nothing a suite holds can
+ * advance that sleep. Driving the tick directly is what lets a test observe the SECOND tick's behavior, above all that a failed fetch ends only its own tick and
+ * leaves the loop able to distribute on the next one. It is the production method, not a reimplementation of it: what the loop adds around this call is the sleep,
+ * which is what these tests deliberately do not wait on.
  *
  * The cast is confined here for the same reason every other private reach in this module is.
  *

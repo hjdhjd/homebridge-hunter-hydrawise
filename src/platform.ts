@@ -4,8 +4,8 @@
  */
 import type { API, DynamicPlatformPlugin, HAP, Logging, PlatformAccessory, PlatformConfig } from "homebridge";
 import { APIEvent, API_RETRY_STATUS_CODES, FeatureOptions, RateBudget, TimerRegistry, classifyTransportError, composeSignals, createApiDispatcher,
-  createMqttClient, debugGatedLog, loopFaultReporter, retry, sanitizeName, superviseLoop } from "homebridge-plugin-utils";
-import type { Categories, HomebridgePluginLogging, MqttClient, Nullable } from "homebridge-plugin-utils";
+  createMqttClient, debugGatedLog, loopFaultReporter, retry, sanitizeName, superviseLoop, systemClock } from "homebridge-plugin-utils";
+import type { Categories, Clock, HomebridgePluginLogging, MqttClient, Nullable } from "homebridge-plugin-utils";
 import type { CustomerDetailsResponse, HydrawiseAccessory, HydrawiseAccessoryContext, HydrawiseControllerAccessory, HydrawiseControllerConfig,
   HydrawiseControllerIdentity, HydrawiseEndpoint, HydrawiseZoneIdentity, HydrawiseZoneSuspensionResult } from "./types.ts";
 import { HYDRAWISE_API_BASE_URL, HYDRAWISE_API_BUDGET_CALLS, HYDRAWISE_API_BUDGET_WINDOW, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_TIMEOUT,
@@ -20,7 +20,6 @@ import type { Dispatcher } from "undici";
 import { HydrawiseController } from "./controller.ts";
 import { HydrawiseV2Client } from "./v2.ts";
 import { STATUS_CODES } from "node:http";
-import { setTimeout as setTimeoutAsync } from "node:timers/promises";
 import util from "node:util";
 
 /* The statuses that share the temporarily-unavailable sentence in retrieve(), derived from the list the transport itself retries so the two can never disagree: a
@@ -35,6 +34,12 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   private account: CustomerDetailsResponse;
   private readonly accountBudget: RateBudget;
   public readonly api: API;
+
+  /* The one time source every wait this plugin schedules reads, and the clock every controller stamps its account facts and its commands against. It is the
+   * production clock in the field and a controllable one under the platform double, so a suite drives a controller's cadence on a virtual timeline instead of
+   * serving it out in real seconds.
+   */
+  public readonly clock: Clock;
   private readonly commandBudget: RateBudget;
   private dispatcher?: Dispatcher;
   public readonly featureOptions: FeatureOptions;
@@ -87,6 +92,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     this.accessories = [];
     this.account = {} as CustomerDetailsResponse;
     this.api = api;
+    this.clock = systemClock;
     this.configuredDevices = {};
     this.featureOptions = new FeatureOptions(featureOptionCategories, featureOptions, options);
     this.hap = api.hap;
@@ -113,16 +119,18 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
      * envelopes instead, because that API publishes no ceiling at all and throttles hard, and they are separate from each other because the traffic they pace is:
      * the scheduled reads and the token grants they carry draw one, while the per-zone commands a user is standing at a switch waiting for draw the other.
      */
-    this.accountBudget = new RateBudget({ capacity: HYDRAWISE_API_BUDGET_CALLS, signal: this.signal, window: HYDRAWISE_API_BUDGET_WINDOW * 1000 });
-    this.commandBudget = new RateBudget({ capacity: HYDRAWISE_COMMAND_BUDGET_CALLS, signal: this.signal, window: HYDRAWISE_COMMAND_BUDGET_WINDOW * 1000 });
-    this.v2Budget = new RateBudget({ capacity: HYDRAWISE_V2_BUDGET_CALLS, signal: this.signal, window: HYDRAWISE_V2_BUDGET_WINDOW * 1000 });
-    this.v2MutationBudget = new RateBudget({ capacity: HYDRAWISE_V2_MUTATION_BUDGET_CALLS, signal: this.signal,
+    this.accountBudget = new RateBudget({ capacity: HYDRAWISE_API_BUDGET_CALLS, clock: this.clock, signal: this.signal,
+      window: HYDRAWISE_API_BUDGET_WINDOW * 1000 });
+    this.commandBudget = new RateBudget({ capacity: HYDRAWISE_COMMAND_BUDGET_CALLS, clock: this.clock, signal: this.signal,
+      window: HYDRAWISE_COMMAND_BUDGET_WINDOW * 1000 });
+    this.v2Budget = new RateBudget({ capacity: HYDRAWISE_V2_BUDGET_CALLS, clock: this.clock, signal: this.signal, window: HYDRAWISE_V2_BUDGET_WINDOW * 1000 });
+    this.v2MutationBudget = new RateBudget({ capacity: HYDRAWISE_V2_MUTATION_BUDGET_CALLS, clock: this.clock, signal: this.signal,
       window: HYDRAWISE_V2_MUTATION_BUDGET_WINDOW * 1000 });
 
     // The one home for every deferred HomeKit write this plugin arms, shared by every controller the platform builds. Construction schedules nothing, so it is
     // built here beside the budgets, ahead of the missing-API-key return below. Its lifetime IS the shutdown signal - the abort drains whatever is pending and
     // leaves every later registration inert - so it takes no teardown-stack registration of its own, on the same terms as the MQTT client below.
-    this.timers = new TimerRegistry({ signal: this.signal });
+    this.timers = new TimerRegistry({ clock: this.clock, signal: this.signal });
 
     /* Assemble the effective configuration. This is the one place a raw configuration property and a configured feature option meet: every consolidated setting
      * resolves through the engine's one precedence here - an explicitly configured option rules in every state it can be in, a legacy configuration property
@@ -243,7 +251,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
         throw error;
       }
-    }, { attempts: Infinity, backoff: (): number => HYDRAWISE_API_RETRY_INTERVAL * 1000, signal: this.signal });
+    }, { attempts: Infinity, backoff: (): number => HYDRAWISE_API_RETRY_INTERVAL * 1000, clock: this.clock, signal: this.signal });
 
     this.log.info("Successfully connected to the Hydrawise API using your API key.");
 
@@ -308,7 +316,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
         await this.refreshV2Facts(client);
 
         // eslint-disable-next-line no-await-in-loop
-        await setTimeoutAsync(HYDRAWISE_V2_REFRESH_INTERVAL * 1000, undefined, { signal: this.signal });
+        await this.clock.delay(HYDRAWISE_V2_REFRESH_INTERVAL * 1000, { signal: this.signal });
       }
     }, onError: loopFaultReporter(this.log, "enhanced features refresh"), signal: this.signal });
   }
@@ -326,7 +334,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
    */
   private async refreshV2Facts(client: HydrawiseV2Client): Promise<void> {
 
-    const fetchedAt = Math.floor(Date.now() / 1000);
+    const fetchedAt = Math.floor(this.clock.now() / 1000);
     const facts = await client.fetchAccountFacts();
 
     if(!facts) {
@@ -732,9 +740,13 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
       url = HYDRAWISE_API_BASE_URL + endpoint + "?" + queryParams.toString();
 
-      // Compose a per-request timeout with the platform's shutdown signal, so a slow request aborts on the timeout and an in-flight request aborts on shutdown, all
-      // through one signal handed to undici. The timeout is armed only now, after the budgets have admitted the call, so a wait for a rate-limit slot never eats
-      // into the time the request itself is allowed.
+      /* Compose a per-request timeout with the platform's shutdown signal, so a slow request aborts on the timeout and an in-flight request aborts on shutdown, all
+       * through one signal handed to undici. The timeout is armed only now, after the budgets have admitted the call, so a wait for a rate-limit slot never eats
+       * into the time the request itself is allowed.
+       *
+       * The deadline is the platform's own timeout signal rather than one armed on the plugin's clock, because it bounds the request and the caller's read of the
+       * response body - time spent on the network, not a wait this plugin schedules.
+       */
       const signal = composeSignals(AbortSignal.timeout(HYDRAWISE_API_TIMEOUT * 1000), this.signal);
 
       response = await request(url, { signal });

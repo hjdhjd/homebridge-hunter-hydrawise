@@ -18,7 +18,6 @@ import { acquireService, getServiceName, loopFaultReporter, mqttTopic, prefixedL
 import type { Dispatcher } from "undici";
 import type { HydrawisePlatform } from "./platform.ts";
 import { mqttTopics } from "./mqtt.ts";
-import { setTimeout as setTimeoutAsync } from "node:timers/promises";
 import util from "node:util";
 
 // Device-specific options and settings.
@@ -551,7 +550,7 @@ export class HydrawiseController {
       return null;
     }
 
-    return ((Math.floor(Date.now() / 1000) - this.v2Facts.fetchedAt) <= HYDRAWISE_V2_FACTS_TTL) ? this.v2Facts : null;
+    return ((Math.floor(this.platform.clock.now() / 1000) - this.v2Facts.fetchedAt) <= HYDRAWISE_V2_FACTS_TTL) ? this.v2Facts : null;
   }
 
   /* Re-derive everything that follows from the classified projection, and report whether that projection moved. Every cadence that can change a zone's
@@ -1012,7 +1011,8 @@ export class HydrawiseController {
     service.getCharacteristic(this.hap.Characteristic.On).onSet(async (value: CharacteristicValue): Promise<void> => {
 
       // We either set the timestamp to the current time, to resume irrigation, or to a year from now to suspend irrigation. Both floor to a whole second so the
-      // command carries the integer seconds the API expects rather than a fractional millisecond remainder.
+      // command carries the integer seconds the API expects rather than a fractional millisecond remainder. The instant is sent to Hydrawise, which reads it as
+      // wall-clock time, so it comes from the host's own clock rather than the platform's.
       const timestamp = Math.floor(Date.now() / 1000) + (value ? HYDRAWISE_SUSPEND_DURATION : 0);
 
       const response = await this.sendCommand("suspendall", timestamp);
@@ -1051,7 +1051,7 @@ export class HydrawiseController {
        * ignores such a snapshot in this command's favor until a refresh that postdates it lands - which is what stops a fetch already in flight when the user
        * pressed the switch from flipping it straight back. A resume records too, for the same reason in the other direction.
        */
-      const at = Math.floor(Date.now() / 1000);
+      const at = Math.floor(this.platform.clock.now() / 1000);
 
       this.suspendAllCommand = { at, commandedUntil: value ? timestamp : null };
 
@@ -1093,7 +1093,7 @@ export class HydrawiseController {
       // eslint-disable-next-line no-await-in-loop
       await retry(() => this.getStatus(), { attempts: Infinity,
         backoff: (): number => (isFirstRun ? HYDRAWISE_API_RETRY_INTERVAL : Math.min(this.status.nextpoll + HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL * 2)) *
-          1000, signal });
+          1000, clock: this.platform.clock, signal });
 
       // Trim whitespace on zone names.
       this.status.relays = this.status.relays.map(x => ({ ...x, name: x.name.trim() }));
@@ -1104,7 +1104,7 @@ export class HydrawiseController {
 
       // Sleep until our next polling interval due to the Hydrawise API being rate-limited. A shutdown abort interrupts the wait and unwinds the loop.
       // eslint-disable-next-line no-await-in-loop
-      await setTimeoutAsync((this.status.nextpoll + HYDRAWISE_API_JITTER) * 1000, undefined, { signal });
+      await this.platform.clock.delay((this.status.nextpoll + HYDRAWISE_API_JITTER) * 1000, { signal });
     }
   }
 
@@ -1554,6 +1554,8 @@ export class HydrawiseController {
    */
   private async commandZoneSuspension(zone: HydrawiseZoneConfig, service: Service, value: CharacteristicValue): Promise<void> {
 
+    // The instant the suspension lifts is sent to the account API, which reads it as wall-clock time, so it comes from the host's own clock rather than the
+    // platform's.
     const until = value ? (Math.floor(Date.now() / 1000) + HYDRAWISE_SUSPEND_DURATION) : null;
     const result = await this.platform.setZoneSuspension({ until, zoneId: zone.relay_id });
 
@@ -1562,7 +1564,7 @@ export class HydrawiseController {
       /* Stamp the command so a snapshot fetched before it cannot answer for this zone, on exactly the terms the account-wide stamp above works on. The direction
        * is stored with the instant, because while the command stands it is the command itself that says what to show.
        */
-      this.zoneSuspendCommands.set(zone.relay_id, { at: Math.floor(Date.now() / 1000), commandedUntil: until });
+      this.zoneSuspendCommands.set(zone.relay_id, { at: Math.floor(this.platform.clock.now() / 1000), commandedUntil: until });
 
       /* Re-derive right here, so the projection every other surface reads carries this command at once rather than waiting on the next account refresh. The
        * webUI, the MQTT payload, and the log sentence all answer to that projection, and a quarter of an hour of them contradicting the switch the user just

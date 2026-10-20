@@ -7,9 +7,9 @@
  * decides which controller receives which facts, and it answers to the correlation id that v1 and the account API agree about. A test that conflated them could pass
  * with the wrong controller enriched.
  *
- * What these tests deliberately do NOT wait on is the loop's quarter-hour sleep. Node's test-runner timer mocking cannot advance a promisified timer at all - the
- * gap this package's own Clock utility documents - so the second tick is driven through the production refresh method directly, and the sleep between ticks is
- * covered by the constants receipt in the settings suite rather than by a test that would have to wait it out.
+ * What these tests deliberately do NOT wait on is the loop's quarter-hour sleep. The real platform runs on the system clock and takes no other, so the second tick
+ * is driven through the production refresh method directly, and the sleep between ticks is covered by the constants receipt in the settings suite rather than by a
+ * test that would have to wait it out.
  */
 // The Hydrawise API wire shapes use snake_case keys such as controller_id, so camelcase is disabled here to let the controller fixture mirror the wire verbatim.
 /* eslint-disable camelcase */

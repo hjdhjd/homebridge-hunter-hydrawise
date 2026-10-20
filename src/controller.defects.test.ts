@@ -8,9 +8,10 @@
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
 /* eslint-disable camelcase */
 import { Characteristic, Service } from "./testing/hap.helpers.ts";
+import { HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL } from "./settings.ts";
 import type { HydrawiseControllerV2Facts, HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
+import { TestClock, advanceThroughSchedule, assertNoUnhandledRejections, expectAt, loggedAt, waitUntil } from "homebridge-plugin-utils/testing";
 import { allSuspended, fastPolling, makeStatusSchedule, makeZone, rainStopped } from "./api.helpers.ts";
-import { assertNoUnhandledRejections, expectAt, loggedAt, waitUntil } from "homebridge-plugin-utils/testing";
 import { bareSensors, sentinelZoneMatrix } from "./api.fixtures.ts";
 import { buildController, makeV2Facts, makeZoneV2Facts } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
@@ -244,6 +245,40 @@ describe("HydrawiseController updateState defect assertions", () => {
     }, { description: "the valve for zone 700001 to read inactive" });
 
     assert.ok(h.retrieve.callsTo("statusschedule.php").length >= 3, "the loop should recover with a further poll after the failure");
+  });
+
+  test("a steady-state poll failure waits out its sleep and its backoff on the platform's clock, at the wire's own cadence", async (t) => {
+
+    /* Every wait the loop takes reads the platform's clock: the sleep between polls and the backoff after a failed one alike. The cadence here is the wire's own
+     * minute rather than the suite's fast one, so a wait left on real time would hold the next poll a minute away and the count below would never move. Each wait
+     * is derived from the fixture's own cadence and the production constants, so the assertions read the numbers the loop chose rather than restating them.
+     */
+    const clock = new TestClock();
+    const status = makeStatusSchedule();
+    const sleep = (status.nextpoll + HYDRAWISE_API_JITTER) * 1000;
+    const backoff = Math.min(status.nextpoll + HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL * 2) * 1000;
+
+    const h = buildController({ clock, program: (recorder) => {
+
+      recorder.program("statusschedule.php", { body: status, kind: "response" });
+      recorder.program("statusschedule.php", { kind: "null" });
+      recorder.programDefault("statusschedule.php", { body: status, kind: "response" });
+    }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    const polls = (): number => h.retrieve.callsTo("statusschedule.php").length;
+
+    await advanceThroughSchedule(clock, []);
+    assert.equal(polls(), 1, "the first poll runs at construction, with no wait ahead of it");
+
+    await advanceThroughSchedule(clock, [sleep]);
+    assert.equal(polls(), 2, "the sleep between polls elapses on the clock, and the poll that fails follows it");
+
+    await advanceThroughSchedule(clock, [backoff]);
+    assert.equal(polls(), 3, "the backoff after the failure elapses on the clock too, and the poll that recovers follows it");
+
+    assert.deepEqual(clock.requested, [ sleep, backoff, sleep ], "the clock carried the sleep, the backoff, and the sleep after the recovery, in that order");
   });
 
   test("a first-poll failure runs the fixed backoff arm and ends quietly on abort", async () => {
