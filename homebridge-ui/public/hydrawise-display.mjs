@@ -1,12 +1,12 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * hydrawise-display.mjs: Pure derivations of the Hydrawise schedule display.
+ * hydrawise-display.mjs: Pure derivations of the Hydrawise schedule display and the device panel's stat strips.
  */
 "use strict";
 
-/* The pure schedule-display tier: every export derives presentation from the persisted schedule facts and an instant the caller supplies, with no I/O, no DOM,
- * no global reach, and no imports. That is what lets a plain test import this module directly, while ui.mjs renders every schedule surface from these same
- * derivations rather than deriving anything of its own.
+/* The pure display tier: every export derives presentation from what the caller hands it - the persisted schedule facts and an instant, a serialized cached
+ * accessory, or a device row's identity - with no I/O, no DOM, no global reach, and no imports. That is what lets a plain test import this module directly, while
+ * ui.mjs renders every schedule surface and every stat strip from these same derivations rather than deriving anything of its own.
  */
 
 /* The word each zone schedule state is shown as, in one place. The sidebar dot's tooltip, the zone panel's Status row, and the controller fold's own status all read
@@ -224,3 +224,84 @@ export const deriveControllerDisplay = (schedule, zoneNames, nowSeconds) => {
   return { detail, stale: schedule.zones.some((zone) => ((zone.state === "running") && ((nowSeconds - zone.endsAt) > STALE_GRACE)) ||
     ((zone.state === "scheduled") && ((nowSeconds - zone.nextRunAt) > STALE_GRACE))), status };
 };
+
+/* One non-empty string characteristic value off a serialized cached service, located by the constructor name Homebridge serializes alongside it. Every reader of
+ * the accessory cache goes through here, so what counts as a usable value - present, a string, and not empty - is decided once rather than at each site.
+ */
+export const cachedCharacteristic = (service, constructorName) => {
+
+  if(!Array.isArray(service?.characteristics)) {
+
+    return undefined;
+  }
+
+  const value = service.characteristics.find((characteristic) => characteristic?.constructorName === constructorName)?.value;
+
+  return ((typeof value === "string") && value.length) ? value : undefined;
+};
+
+/* The firmware value Homebridge stamps on an accessory whose real version nothing has ever written. The runtime writes this same marker back whenever the account
+ * credentials are absent, which is what makes it the honest signal that no hardware facts have landed - mirrored here as a literal because this browser module
+ * cannot import the runtime's constants.
+ */
+const UNKNOWN_FIRMWARE = "0";
+
+/* The controller hardware HomeKit last showed, read from the cached AccessoryInformation service, or undefined when no real facts have landed.
+ *
+ * The pair is all-or-nothing on purpose. An unenriched controller still carries a model - the runtime stamps a product-line placeholder so the Home app never
+ * shows a library-internal string - so the model alone cannot say whether anything was learned. The firmware can: it holds the unknown marker until a real
+ * account answer replaces it. So the firmware decides, and the two render together or not at all, which is what keeps the strip from pairing a real model with an
+ * empty firmware cell.
+ */
+export const cachedControllerHardware = (accessory) => {
+
+  const service = accessory?.services?.find((entry) => entry?.constructorName === "AccessoryInformation");
+  const firmware = cachedCharacteristic(service, "FirmwareRevision");
+  const model = cachedCharacteristic(service, "Model");
+
+  if(!firmware || (firmware === UNKNOWN_FIRMWARE) || !model) {
+
+    return undefined;
+  }
+
+  return { firmware, model };
+};
+
+/* The cells of a controller's stat strip, in the order the panel shows them, each as its label, its value, and whether the value reads in the monospace face. The
+ * hardware cells lead when real facts have landed and are absent otherwise, so an install running on the API key alone shows a shorter strip rather than
+ * placeholder cells that would claim knowledge the plugin does not have. The zone count is shown only when it is known, because a zero would read as a controller
+ * with no zones, and the status word only when the fold has one to report. The identifiers - the serial and the firmware - read in the monospace face.
+ */
+export const deriveControllerStrip = ({ hardware, serialNumber, status, zoneCount }) => {
+
+  const rows = [];
+
+  if(hardware) {
+
+    rows.push({ label: "Model", monospace: false, value: hardware.model });
+  }
+
+  rows.push({ label: "Serial Number", monospace: true, value: serialNumber });
+
+  if(hardware) {
+
+    rows.push({ label: "Firmware", monospace: true, value: hardware.firmware });
+  }
+
+  if(zoneCount !== undefined) {
+
+    rows.push({ label: "Zones", monospace: false, value: zoneCount.toString() });
+  }
+
+  if(status !== null) {
+
+    rows.push({ label: "Status", monospace: false, value: status });
+  }
+
+  return rows;
+};
+
+// The cells of a zone's stat strip, in the same row shape as the controller's: its display relay number, then its relay id, an identifier read in the monospace
+// face. A value the row does not carry renders as an empty cell rather than as the word "undefined".
+export const deriveZoneStrip = ({ relay, relayId }) => [ { label: "Zone", monospace: false, value: (relay ?? "").toString() },
+  { label: "Relay ID", monospace: true, value: (relayId ?? "").toString() } ];

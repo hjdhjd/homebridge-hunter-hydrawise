@@ -1,6 +1,6 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * hydrawise-display.d.mts: Type declarations for the pure Hydrawise schedule-display derivations.
+ * hydrawise-display.d.mts: Type declarations for the pure Hydrawise schedule-display derivations and the device panel's stat strips.
  */
 
 /**
@@ -51,6 +51,44 @@ export interface HydrawiseScheduleProjection extends HydrawiseScheduleMeta {
  * One rendered row, as its label and the value shown beside it.
  */
 export type HydrawiseDisplayRow = [ label: string, value: string ];
+
+/**
+ * One cell of a stat strip, as its label, its value, and whether the value reads in the monospace face. The controller's strip and the zone's strip share this
+ * one shape, so the renderer maps every strip to its elements the same way.
+ */
+export interface HydrawiseStripRow {
+
+  label: string;
+  monospace: boolean;
+  value: string;
+}
+
+/**
+ * The controller hardware HomeKit last showed: the model and the firmware, which are present together or not at all.
+ */
+export interface HydrawiseControllerHardware {
+
+  firmware: string;
+  model: string;
+}
+
+/**
+ * A serialized cached service as the accessory cache carries it, reduced to the fields the cache readers consult.
+ */
+export interface HydrawiseCachedService {
+
+  characteristics?: { constructorName?: string; value?: unknown }[];
+  constructorName?: string;
+  subtype?: string;
+}
+
+/**
+ * A serialized cached accessory as the accessory cache carries it, reduced to its services.
+ */
+export interface HydrawiseCachedAccessory {
+
+  services?: HydrawiseCachedService[];
+}
 
 /**
  * What one derivation renders: the rows to show, and whether the facts behind them are old enough that the display says so.
@@ -136,3 +174,47 @@ export declare const deriveZoneDisplay: (entry: HydrawiseZoneScheduleEntry | und
  */
 export declare const deriveControllerDisplay: (schedule: HydrawiseScheduleProjection | undefined, zoneNames: Record<string, string> | undefined,
   nowSeconds: number) => HydrawiseControllerRendering;
+
+/**
+ * Read one non-empty string characteristic value off a serialized cached service, located by the constructor name Homebridge serializes alongside it.
+ *
+ * @param service         - The cached service, or `undefined` when the accessory carries none of the kind asked for.
+ * @param constructorName - The characteristic's constructor name.
+ *
+ * @returns The value, or `undefined` when it is absent, not a string, or empty.
+ */
+export declare const cachedCharacteristic: (service: HydrawiseCachedService | undefined, constructorName: string) => string | undefined;
+
+/**
+ * Read the controller hardware HomeKit last showed off a cached accessory's information service.
+ *
+ * @param accessory - The cached controller accessory, or `undefined` when none is cached.
+ *
+ * @returns The hardware, or `undefined` when no real facts have landed.
+ */
+export declare const cachedControllerHardware: (accessory: HydrawiseCachedAccessory | undefined) => HydrawiseControllerHardware | undefined;
+
+/**
+ * Derive the cells of a controller's stat strip, in the order the panel shows them.
+ *
+ * @param options              - The controller row's identity and state.
+ * @param options.hardware     - The hardware HomeKit last showed, or `undefined` when no real facts have landed.
+ * @param options.serialNumber - The controller's serial number.
+ * @param options.status       - The fold's status word, or `null` when it has none to report.
+ * @param options.zoneCount    - The number of zones, or `undefined` when it is not known.
+ *
+ * @returns The strip's rows.
+ */
+export declare const deriveControllerStrip: (options: { hardware: HydrawiseControllerHardware | undefined; serialNumber: string; status: string | null;
+  zoneCount: number | undefined; }) => HydrawiseStripRow[];
+
+/**
+ * Derive the cells of a zone's stat strip, in the same row shape as the controller's.
+ *
+ * @param options         - The zone row's identity.
+ * @param options.relay   - The zone's display relay number, or `undefined` when the row carries none.
+ * @param options.relayId - The zone's relay id, or `undefined` when the row carries none.
+ *
+ * @returns The strip's rows.
+ */
+export declare const deriveZoneStrip: (options: { relay: number | undefined; relayId: number | undefined }) => HydrawiseStripRow[];

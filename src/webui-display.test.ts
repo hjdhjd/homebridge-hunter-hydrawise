@@ -1,15 +1,17 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
  * webui-display.test.ts: The webUI's pure schedule-display derivations, exercised against the very module ui.mjs renders from. Covers the zone classification
- * and the imminent-run window it splits on, the zone and controller row folds with their staleness verdicts and the status precedence, and the formatters.
+ * and the imminent-run window it splits on, the zone and controller row folds with their staleness verdicts and the status precedence, the formatters, and the
+ * device panel's stat strips with the cached-hardware gate that decides whether the hardware cells appear.
  *
  * This suite holds to disciplines that keep it deterministic: every instant is derived from one fixed anchor rather than a live clock, so a run of this suite
  * means the same thing at any hour, and every expected string a formatter produces is computed through the identical Intl call the formatter itself makes, so a
  * host whose locale or timezone differs moves both sides together rather than reddening a correct implementation.
  */
-import type { HydrawiseScheduleMeta, HydrawiseScheduleProjection, HydrawiseZoneScheduleEntry } from "../homebridge-ui/public/hydrawise-display.mjs";
-import { STALE_GRACE, ZONE_STATE_LABELS, deriveControllerDisplay, deriveZoneDisplay, formatMinutes, formatRunTime, zoneScheduleState }
+import type { HydrawiseCachedAccessory, HydrawiseScheduleMeta, HydrawiseScheduleProjection, HydrawiseZoneScheduleEntry }
   from "../homebridge-ui/public/hydrawise-display.mjs";
+import { STALE_GRACE, ZONE_STATE_LABELS, cachedControllerHardware, deriveControllerDisplay, deriveControllerStrip, deriveZoneDisplay, deriveZoneStrip, formatMinutes,
+  formatRunTime, zoneScheduleState } from "../homebridge-ui/public/hydrawise-display.mjs";
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 
@@ -331,7 +333,7 @@ describe("hydrawise webUI controller strip composition", () => {
     assert.ok(!derived.detail.some(([label]) => label === "Status"), "no Status row remains among the detail");
   });
 
-  test("a controller with detail but no schedule facts still reports its status word alone", () => {
+  test("a controller whose zones are all idle reports its status word with no detail beneath it", () => {
 
     // An account whose zones are all idle has a word to show and nothing to detail, so the strip renders and the second line does not.
     const derived = deriveControllerDisplay(projection([{ relayId: 1, state: "unscheduled" }]), {}, NOW);
@@ -345,5 +347,62 @@ describe("hydrawise webUI controller strip composition", () => {
     // The verdict is the third fact and answers to the zones' own instants, so separating the word from the rows must not have moved it.
     assert.equal(deriveControllerDisplay(projection([runningEntry(1, (NOW - STALE_GRACE) - 1)]), {}, NOW).stale, true, "a long-passed instant still reads stale");
     assert.equal(deriveControllerDisplay(projection([runningEntry(1, NOW + 600)]), {}, NOW).stale, false, "and a live one still does not");
+  });
+});
+
+describe("hydrawise webUI stat strips", () => {
+
+  // The hardware a real account answer stamps on the information service, kept distinct from every placeholder so a strip reading it cannot pass by coincidence.
+  const HARDWARE = { firmware: "4.76", model: "HCC 38 Zones" };
+
+  // A cached controller accessory as the accessory cache serializes it, carrying whichever information characteristics a scenario names.
+  function cachedAccessory(characteristics: Record<string, string>): HydrawiseCachedAccessory {
+
+    return { services: [{ characteristics: Object.entries(characteristics).map(([ constructorName, value ]) => ({ constructorName, value })),
+      constructorName: "AccessoryInformation" }] };
+  }
+
+  test("the hardware gate refuses every reading that has not learned real facts", () => {
+
+    assert.equal(cachedControllerHardware(cachedAccessory({ FirmwareRevision: "0", Model: HARDWARE.model })), undefined,
+      "the unknown-firmware marker means nothing was learned, whatever the model says");
+    assert.equal(cachedControllerHardware(cachedAccessory({ Model: HARDWARE.model })), undefined, "an absent firmware refuses");
+    assert.equal(cachedControllerHardware(cachedAccessory({ FirmwareRevision: HARDWARE.firmware })), undefined, "an absent model refuses");
+    assert.equal(cachedControllerHardware({ services: [] }), undefined, "an accessory with no information service refuses");
+  });
+
+  test("the hardware gate answers the model and the firmware once real facts have landed", () => {
+
+    assert.deepEqual(cachedControllerHardware(cachedAccessory({ FirmwareRevision: HARDWARE.firmware, Model: HARDWARE.model })), HARDWARE,
+      "a real firmware beside a model answers the model and the firmware together");
+  });
+
+  test("the controller strip leads with the hardware when it is known, and shows the identity and state whatever the hardware", () => {
+
+    const enriched = deriveControllerStrip({ hardware: HARDWARE, serialNumber: "SN0A1B2C3D4", status: "Watering", zoneCount: 19 });
+    const keyOnly = deriveControllerStrip({ hardware: undefined, serialNumber: "SN0A1B2C3D4", status: "Watering", zoneCount: 19 });
+
+    assert.deepEqual(enriched.map((row) => [ row.label, row.value ]), [ [ "Model", HARDWARE.model ], [ "Serial Number", "SN0A1B2C3D4" ],
+      [ "Firmware", HARDWARE.firmware ], [ "Zones", "19" ], [ "Status", "Watering" ] ], "an enriched controller shows every cell in the panel's order");
+    assert.deepEqual(keyOnly.map((row) => row.label), [ "Serial Number", "Zones", "Status" ], "an install on the API key alone shows a shorter strip");
+    assert.deepEqual(deriveControllerStrip({ hardware: undefined, serialNumber: "SN0A1B2C3D4", status: null, zoneCount: undefined }).map((row) => row.label),
+      ["Serial Number"], "an unknown zone count and a missing status word leave their cells out");
+  });
+
+  test("the identifiers, and only the identifiers, read in the monospace face", () => {
+
+    const rows = [ ...deriveControllerStrip({ hardware: HARDWARE, serialNumber: "SN0A1B2C3D4", status: "Watering", zoneCount: 19 }),
+      ...deriveZoneStrip({ relay: 1, relayId: 700001 }) ];
+
+    assert.deepEqual(rows.filter((row) => row.monospace).map((row) => row.label), [ "Serial Number", "Firmware", "Relay ID" ],
+      "the serial, the firmware, and the relay id are the monospace cells");
+  });
+
+  test("the zone strip shows the display relay number, then the relay id, in the controller strip's row shape", () => {
+
+    assert.deepEqual(deriveZoneStrip({ relay: 1, relayId: 700001 }), [ { label: "Zone", monospace: false, value: "1" },
+      { label: "Relay ID", monospace: true, value: "700001" } ], "the zone's identity, as the panel shows it");
+    assert.deepEqual(deriveZoneStrip({ relay: undefined, relayId: undefined }).map((row) => row.value), [ "", "" ],
+      "a row carrying no identity renders empty cells rather than a word");
   });
 });
