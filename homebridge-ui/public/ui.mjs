@@ -69,20 +69,19 @@ const sessionZones = new Map();
  */
 let catalogMemo = null;
 
-/* The schedule ticker's module state, all of it scoped to one mount and reset when that mount aborts. The ticker serves every schedule-bearing surface from one
- * read - the sidebar's zone dots and the details panel among them - and only the panel needs tracking here, because the dots are found by query at the moment
- * they are painted:
+/* The schedule ticker's module state, all of it scoped to one page cycle and reset when that cycle's signal aborts. The ticker serves every schedule-bearing surface
+ * from one read - the sidebar's zone dots and the details panel among them - and only the panel needs tracking here, because the dots are found by query at the
+ * moment they are painted:
  *
  *   - renderContext: a fresh { device, panel } object minted on every render of the details panel. Its OBJECT IDENTITY is what a tick's read compares against on
  *     resolution, which is how a read dispatched for a view the user has since left repaints no panel.
- *   - scheduleTimer: the interval handle, and the arm-once guard for this mount.
- *   - scheduleMountSignal: the mount signal the resume subscription was registered against, so one mount registers exactly one subscriber.
+ *   - tickerSignal: the page cycle's signal the ticker armed against, or null while it is unarmed, and the ticker's one guard: a cycle arms one interval and
+ *     registers one resume subscriber, however many renders it makes.
  *   - tickSequence / inFlightTick: the dispatch counter and the sequence number of the read currently in flight, which is how a slow read is superseded rather
  *     than allowed to latch the ticker shut.
  */
 let renderContext = null;
-let scheduleTimer;
-let scheduleMountSignal;
+let tickerSignal = null;
 let tickSequence = 0;
 let inFlightTick = null;
 
@@ -870,7 +869,7 @@ const buildNotice = (text) => {
 const ownerSerialOf = (device) => (isController(device) ? device.serialNumber : device.ownerSerial);
 
 // Whether a device row carries schedule surface at all - the field its own kind carries it on. A zone answers on its listing's projection metadata rather than on
-// its own entry, so a zone momentarily missing from the projection still refreshes rather than going quiet for the rest of the mount.
+// its own entry, so a zone momentarily missing from the projection still refreshes rather than going quiet for the rest of the page cycle.
 const scheduleSurface = (device) => (isController(device) ? device.schedule !== undefined : device.scheduleMeta !== undefined);
 
 // The instant a device row's projection was last CHANGED, read from whichever field its kind carries it on. This is what the staleness notice dates itself by.
@@ -1072,8 +1071,8 @@ const scheduleTick = async () => {
   const dots = document.querySelectorAll("#devicesContainer .hbhh-zone-dot[data-relay-id]");
   const wantsPanel = Boolean(context?.device) && scheduleSurface(context.device);
 
-  // Neither surface reads a schedule, so there is nothing to refresh and the cache is left alone. The interval itself keeps running until the mount aborts, which a
-  // no-op this cheap makes entirely acceptable.
+  // Neither surface reads a schedule, so there is nothing to refresh and the cache is left alone. The interval itself keeps running until the page cycle ends,
+  // which a no-op this cheap makes entirely acceptable.
   if(!wantsPanel && !dots.length) {
 
     return;
@@ -1082,7 +1081,7 @@ const scheduleTick = async () => {
   const sequence = ++tickSequence;
 
   /* Supersede rather than latch. The plugin-ui bridge's RPC carries no timeout of its own, so a read can hang forever and a boolean busy flag would latch the
-   * ticker shut for the rest of the mount; bounding an in-flight read at two ticks lets a later tick proceed while the checks below keep the older read's late
+   * ticker shut for the rest of the page cycle; bounding an in-flight read at two ticks lets a later tick proceed while the checks below keep the older read's late
    * resolution harmless.
    */
   if((inFlightTick !== null) && ((sequence - inFlightTick) < 2)) {
@@ -1157,8 +1156,8 @@ const scheduleTick = async () => {
 };
 
 /* Show the details for the selected sidebar entry. The framework invokes this with a single options bag carrying the selected device, the panel element to render
- * into, and the mount's lifecycle signal, and this hook consumes all three: it paints through the internal renderer above and arms the schedule ticker against the
- * mount.
+ * into, and the page cycle's signal, and this hook consumes all three: it paints through the internal renderer above and arms the schedule ticker against the
+ * page cycle.
  *
  * The render-context bookkeeping runs UNCONDITIONALLY on every invocation - a fresh object per render, schedule-bearing or not and an undefined device included -
  * so the tick guards always describe the view actually on screen. A fresh object per render is exactly what gives the ticker's same-object discard its meaning.
@@ -1175,37 +1174,36 @@ const showDeviceDetails = ({ device, panel, signal }) => {
     return;
   }
 
-  /* Arm the ticker once for this mount. The framework hands every render within one mount the SAME signal object - switching between zones, the controller entry,
-   * and back mints no new one and fires no abort - so the signal is the mount's identity, and keying the arm on the interval handle is what keeps a panel switch
-   * from stacking a second interval. The teardown is registered BEFORE the interval, because the handle is this block's own re-entry guard: arming first and then
-   * throwing on the registration would leave an interval nothing can stop behind a guard that never re-enters.
+  /* Arm the ticker once for this page cycle. The framework hands every render within one cycle the SAME signal object - switching between zones, the controller
+   * entry, and back mints no new one and fires no abort - so the signal is the cycle's identity, and keying the arm on it is what keeps a panel switch from
+   * stacking a second interval or a second resume subscriber. The teardown is registered BEFORE the interval is armed, so no interval runs without the abort that
+   * stops it, and the signal is recorded only once the teardown and the interval are in place, because the recorded signal is this block's own re-entry guard: a
+   * throw ahead of the record leaves it unrecorded, so the next render of the cycle arms again rather than finding the cycle armed with nothing running.
    *
-   * The MOUNT signal is the deliberate lifetime. This data is per-selected-device and its read is a cheap local call, so the ticker dies with the view and re-arms
-   * on the next mount; nothing here is worth keeping warm across a navigation the way an expensive cloud fetch would be.
+   * The page cycle is the deliberate lifetime. This data is per-selected-device and its read is a cheap local call, so the ticker dies with the cycle and re-arms
+   * on the next one; nothing here is worth keeping warm across a navigation the way an expensive cloud fetch would be.
    */
-  if(scheduleTimer === undefined) {
+  if(tickerSignal !== signal) {
 
     signal.addEventListener("abort", () => {
 
-      clearInterval(scheduleTimer);
-      scheduleTimer = undefined;
+      clearInterval(timer);
+      tickerSignal = null;
       renderContext = null;
       inFlightTick = null;
     }, { once: true });
 
-    scheduleTimer = setInterval(() => void scheduleTick(), SCHEDULE_TICK_MS);
-  }
+    const timer = setInterval(() => void scheduleTick(), SCHEDULE_TICK_MS);
 
-  // A wake from an OS-level freeze should not have to wait out the remainder of a tick, so the page's resume detector runs one the moment it notices. It is bound to
-  // the same mount signal the interval is, and the mount-identity guard registers it exactly once per mount.
-  if(scheduleMountSignal !== signal) {
+    tickerSignal = signal;
 
-    scheduleMountSignal = signal;
+    // A wake from an OS-level freeze should not have to wait out the remainder of a tick, so the page's resume detector runs one the moment it notices. It is
+    // bound to the same cycle signal the interval is, and registered under the same guard, so each cycle registers it exactly once.
     ui.liveness.onResume(() => void scheduleTick(), { signal });
   }
 
   /* One tick immediately, rather than leaving the panel to wait out the first interval. The paint above renders from the device row the SIDEBAR LISTING carried,
-   * whose schedule snapshot dates from the moment the panel session mounted, so a panel opened some way into a session can show state up to a tick behind the very
+   * whose schedule snapshot dates from the listing's own read in this page cycle, so a panel opened some way into a session can show state up to a tick behind the very
    * dots beside it - which the ticker has been refreshing all along. This heals it within one local cache read.
    *
    * It costs nothing to run alongside the interval: the read is getCachedAccessories, a local call that leaves the zero-automatic-cloud-call property intact, and
@@ -1238,7 +1236,7 @@ const featureOptionsParams = {
      * declines to re-enter, so a refresh that learned nothing cannot present as one that did. The partial failures after the roster is seeded resolve instead, and
      * report through a toast of their own - the fresh roster is real by then, and rejecting would withhold the very re-entry that puts it on screen.
      *
-     * Resolving on a dead mount is inert, since the re-entry that follows answers to that mount's own aborted signal.
+     * Resolving on an ended page cycle is inert, since the re-entry that follows answers to that cycle's own aborted signal.
      */
     refresh: {
 

@@ -109,8 +109,7 @@ export interface HydrawiseNames {
  *
  * @returns The page's names.
  */
-export declare const makeHydrawiseNames: ({ displayedName, sanitizeName }: { displayedName: typeof displayedName; sanitizeName: typeof sanitizeName }) =>
-  HydrawiseNames;
+export declare const makeHydrawiseNames: (injected: { displayedName: typeof displayedName; sanitizeName: typeof sanitizeName }) => HydrawiseNames;
 
 /**
  * Build the interpreter over an injected feature-option engine class and the served option catalog.
@@ -120,8 +119,7 @@ export declare const makeHydrawiseNames: ({ displayedName, sanitizeName }: { dis
  *
  * @returns The interpreter.
  */
-export declare const makeHydrawiseConfig: ({ FeatureOptions, catalog }: { FeatureOptions: typeof FeatureOptions; catalog: HydrawiseConfigCatalog }) =>
-  HydrawiseConfigInterpreter;
+export declare const makeHydrawiseConfig: (injected: { FeatureOptions: typeof FeatureOptions; catalog: HydrawiseConfigCatalog }) => HydrawiseConfigInterpreter;
 
 /**
  * Build the degraded-mode interpreter.
