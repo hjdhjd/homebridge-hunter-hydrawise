@@ -3,7 +3,6 @@
  * testing.helpers.ts: Barrel re-export for the cross-cutting testing helper modules under src/testing/. Test files import from this single entry to keep
  * import paths stable as the implementation modules evolve. The thematic submodules under src/testing/ each own one concern:
  *
- *   - fs.helpers.ts           TMPDIR_PREFIX, withTempDir
  *   - parity.helpers.ts       assertSameShape, declareKeysOf
  *
  * The testing surface the plugin family shares - the logger doubles and the finders that read them, indexed access with a named failure, the
@@ -19,4 +18,3 @@
  * src/testing/platform.helpers.ts, which is imported directly rather than through this canonical barrel.
  */
 export { assertSameShape, declareKeysOf } from "./testing/parity.helpers.ts";
-export { TMPDIR_PREFIX, withTempDir } from "./testing/fs.helpers.ts";

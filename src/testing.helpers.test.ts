@@ -11,28 +11,20 @@
  *   2. No undocumented runtime exports exist (catches accidental additions - a submodule export that flowed through without being documented).
  *   3. Cardinality matches (catches same-size swap - one removed, one added would pass the first and second checks by accident).
  *
- * When the barrel grows or shrinks, update the EXPECTED_*_EXPORTS lists below to match.
+ * When the barrel grows or shrinks, update EXPECTED_FUNCTION_EXPORTS below to match.
  */
 import * as barrel from "./testing.helpers.ts";
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 
 /* The complete list of function runtime symbols the barrel is documented to re-export. A type-only re-export is erased at runtime and therefore not part of this
- * surface. Value-typed runtime exports (constants like TMPDIR_PREFIX) are listed separately in EXPECTED_VALUE_EXPORTS so the function-typeof check stays clean.
+ * surface.
  */
 const EXPECTED_FUNCTION_EXPORTS = [
 
   "assertSameShape",
-  "declareKeysOf",
-  "withTempDir"
+  "declareKeysOf"
 ] as const;
-
-/* Value-typed runtime exports (constants, not functions). Kept separate from EXPECTED_FUNCTION_EXPORTS so each list's typeof check is uniform.
- */
-const EXPECTED_VALUE_EXPORTS: Readonly<Record<string, "boolean" | "number" | "string">> = {
-
-  TMPDIR_PREFIX: "string"
-};
 
 describe("testing.helpers barrel", () => {
 
@@ -47,32 +39,19 @@ describe("testing.helpers barrel", () => {
     }
   });
 
-  test("re-exports every documented value symbol with the expected primitive type", () => {
-
-    // Value exports check the primitive type rather than identity so TMPDIR_PREFIX's actual content can vary per project without breaking this test.
-    const exports = barrel as unknown as Record<string, unknown>;
-
-    for(const [ name, expectedType ] of Object.entries(EXPECTED_VALUE_EXPORTS)) {
-
-      assert.equal(typeof exports[name], expectedType,
-        "Expected " + name + " to be re-exported as a " + expectedType + " from the testing.helpers barrel.");
-    }
-  });
-
   test("does not leak unexpected runtime exports beyond the documented list", () => {
 
-    /* Drift catch in the other direction: an addition to a submodule that propagates to the barrel without being added to the EXPECTED lists would survive the
-     * previous tests silently. Walking the actual runtime keys and asserting each one is documented closes that gap. The barrel has no `default` export, so no
+    /* Drift catch in the other direction: an addition to a submodule that propagates to the barrel without being added to EXPECTED_FUNCTION_EXPORTS would survive
+     * the previous test silently. Walking the actual runtime keys and asserting each one is documented closes that gap. The barrel has no `default` export, so no
      * filtering is needed.
      */
-    const allowed = new Set<string>([ ...EXPECTED_FUNCTION_EXPORTS, ...Object.keys(EXPECTED_VALUE_EXPORTS) ]);
+    const allowed = new Set<string>(EXPECTED_FUNCTION_EXPORTS);
     const actual = Object.keys(barrel);
 
     for(const name of actual) {
 
       assert.ok(allowed.has(name),
-        "Unexpected runtime export from the testing.helpers barrel: " + name +
-          ". Add it to EXPECTED_FUNCTION_EXPORTS or EXPECTED_VALUE_EXPORTS, or remove it from the barrel.");
+        "Unexpected runtime export from the testing.helpers barrel: " + name + ". Add it to EXPECTED_FUNCTION_EXPORTS, or remove it from the barrel.");
     }
   });
 
@@ -81,9 +60,8 @@ describe("testing.helpers barrel", () => {
     // Symmetric assertion: the previous tests catch missing or extra exports individually; this one asserts the cardinality matches so a same-size swap (one
     // removed, one added) cannot pass the missing-export and extra-export tests by accident.
     const actual = new Set(Object.keys(barrel));
-    const expected = EXPECTED_FUNCTION_EXPORTS.length + Object.keys(EXPECTED_VALUE_EXPORTS).length;
 
-    assert.equal(actual.size, expected,
-      "Runtime export count mismatch: barrel has " + String(actual.size) + " keys, EXPECTED lists total " + String(expected) + ".");
+    assert.equal(actual.size, EXPECTED_FUNCTION_EXPORTS.length, "Runtime export count mismatch: barrel has " + String(actual.size) + " keys, " +
+      "EXPECTED_FUNCTION_EXPORTS lists " + String(EXPECTED_FUNCTION_EXPORTS.length) + ".");
   });
 });

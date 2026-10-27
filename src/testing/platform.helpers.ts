@@ -26,8 +26,8 @@ import { HYDRAWISE_API_BASE_URL, PLATFORM_NAME, PLUGIN_NAME } from "../settings.
 import type { HydrawiseAccessory, HydrawiseControllerConfig, HydrawiseControllerHardware, HydrawiseControllerIdentity, HydrawiseControllerV2Facts,
   HydrawiseV2MutationResult, HydrawiseZoneConfig, HydrawiseZoneSuspensionResult, HydrawiseZoneV2Facts } from "../types.ts";
 import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
-import { TestClock, TestHomebridgeApi, TestMqttClient, capturingLog, loadHomebridge, present, waitUntil } from "homebridge-plugin-utils/testing";
-import type { TestHomebridgeApiCall, TestLogEntry, TestPlatformAccessory } from "homebridge-plugin-utils/testing";
+import { TestClock, TestMqttClient, capturingLog, loadHomebridge, present, waitUntil, watchServerWarnings } from "homebridge-plugin-utils/testing";
+import type { TestHomebridgeApi, TestHomebridgeApiCall, TestLogEntry, TestPlatformAccessory } from "homebridge-plugin-utils/testing";
 import { featureOptionCategories, featureOptions } from "../options.ts";
 import type { Dispatcher } from "undici";
 import { HydrawiseController } from "../controller.ts";
@@ -41,6 +41,13 @@ import { zoneAccessoryId } from "../types.ts";
  * every workhorse below synchronous, so a suite builds a controller or a platform in one call however it is shaped.
  */
 const runtime = await loadHomebridge(import.meta.url);
+
+/* The builder every Homebridge API double the suites run on comes from. HBPU's warnings check covers each double it makes: after every test, once the test's own
+ * cleanups have run, a warning or an error Homebridge logged on any of them that the test did not take fails that test. The check lives here, at the one place
+ * every double is built, so no suite's double can escape it, and it is registered as this module evaluates, at the top level of each suite that imports it,
+ * so it covers every test in that suite; running after a test's own cleanups is what lets a warning a teardown draws fail the test whose teardown drew it.
+ */
+const buildApi = watchServerWarnings(runtime);
 
 // The runtime's HAP Service and Characteristic namespaces, the one source every suite reads HAP's service and characteristic classes and their constants from.
 export const { Characteristic, Service } = runtime.hap;
@@ -257,7 +264,7 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
 
   // HBPU's Homebridge API double, one per platform double, because its accessory cache, its bridge and its record of accessory calls belong to the one platform
   // a row builds.
-  const api = new TestHomebridgeApi(runtime);
+  const api = buildApi();
 
   /* The REAL save path, on the same terms as the timer registry above, over the API double the controller reaches. Its window runs on a clock of its own that
    * nothing advances, so no save leaves on a timer: the window closes where production's poll interval closes it, at the next status fetch below, and where a
@@ -787,7 +794,7 @@ function rejectNamed(failUuids: ReadonlySet<string>, accessories: readonly Platf
 export function buildPlatform(options: BuildPlatformOptions = {}): BuildPlatformResult {
 
   const log = capturingLog();
-  const api = new TestHomebridgeApi(runtime);
+  const api = buildApi();
   const failRegistrationUuids = new Set<string>();
   const register = api.registerPlatformAccessories.bind(api);
 
