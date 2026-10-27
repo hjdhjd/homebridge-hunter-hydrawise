@@ -33,6 +33,13 @@ export const HYDRAWISE_POLL_LOSS_THRESHOLD = 3;
 // How much, in seconds, jitter should we inject into the API polling interval. This helps ensure we stay clear of the Hydrawise API rate limits.
 export const HYDRAWISE_API_JITTER = 0.2;
 
+/* The longest polling interval, in seconds, a status body's nextpoll hint may ask for: one day. The trade runs both ways. A hint up to it is honored, so the loop
+ * sleeps that long and the projection it last adopted stands for the whole wait with no No Response, since nothing fails while the loop sleeps. A hint above it
+ * takes the failed-poll path instead - the error line, the clamped retry, and a count toward the loss verdict - so a run of them reads as No Response. The
+ * ceiling sits far above any pacing Hydrawise asks for, because refusing a hint it really sent fails the poll, and a run of refusals costs the user a No Response.
+ */
+export const HYDRAWISE_API_NEXTPOLL_MAX = 86400;
+
 // The account-wide Hydrawise API ceiling, as a COUNT OF CALLS rather than a duration: Hydrawise documents at most this many API calls of any kind against an
 // account inside the trailing window below.
 export const HYDRAWISE_API_BUDGET_CALLS = 30;
@@ -72,7 +79,8 @@ export const HYDRAWISE_TRANSPORT_FAULT_SENTENCES = Object.freeze({
   "dns": "Hostname or IP address not found. Please ensure you're connected to the Internet.",
   "refused": "Connection refused.",
   "reset": "Connection has been reset.",
-  "retries-exhausted": "Unable to connect to the Hydrawise API. This is usually temporary and will retry automatically."
+  "retries-exhausted": "Unable to connect to the Hydrawise API. This is usually temporary and will retry automatically.",
+  "unreachable": "The Hydrawise API could not be reached. Please ensure you're connected to the Internet."
 } satisfies Record<HydrawiseTransportFault, string>);
 
 /* The Hydrawise v2 API. This group states endpoints and credentials, which is a different kind of constant from the durations and call counts the rest of this

@@ -6,7 +6,7 @@
  *
  * Covers the persistence-critical UUID seed, the accessory category and sanitized name, the exclusive context key set, the field-wise refresh comparison, the
  * demotion split between configuration intent and wire absence with its poll-count grace, per-controller isolation, the per-zone promotion-failure
- * containment, and the save Homebridge's shutdown signal carries.
+ * containment and its report, once at error and each repeat at debug, and the save Homebridge's shutdown signal carries.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let the fixtures mirror the wire verbatim.
@@ -16,12 +16,13 @@ import type { HydrawiseControllerConfig, HydrawiseZoneConfig, HydrawiseZoneIdent
 import { buildPlatform, installMockDispatcher, programJsonReply, seedAccessory } from "./testing/platform.helpers.ts";
 import { controllerIdentity, zoneAccessoryId, zoneIdentity } from "./types.ts";
 import { describe, test } from "node:test";
-import { loggedAt, waitUntil } from "homebridge-plugin-utils/testing";
+import { formatLogEntry, logCount, loggedAt, waitUntil } from "homebridge-plugin-utils/testing";
 import { makeCustomerDetails, makeZone, normalSchedule } from "./api.helpers.ts";
 import type { HydrawisePlatform } from "./platform.ts";
 import type { PlatformAccessory } from "homebridge";
 import assert from "node:assert/strict";
 import { sanitizeName } from "homebridge-plugin-utils";
+import { stripVTControlCharacters } from "node:util";
 import { syntheticController } from "./api.fixtures.ts";
 
 const DID_FINISH_LAUNCHING = "didFinishLaunching";
@@ -299,12 +300,65 @@ describe("HydrawisePlatform zone accessories (reconcile)", () => {
     assert.equal(unregistered().length, 0, "the throw preceded the registration, so there is nothing to undo");
     assert.ok(loggedAt(entries, "error", "Unable to establish a standalone accessory"), "the fault is reported against the zone it belongs to");
 
+    const failure = entries.find(entry => (entry.level === "error") && formatLogEntry(entry).includes("Unable to establish a standalone accessory"));
+
+    assert.ok(failure, "the fault's report");
+    assert.ok(!stripVTControlCharacters(formatLogEntry(failure)).includes("\n    at "), "as one sentence, with no stack frame");
+
     failRegistrationUuids.clear();
 
     // A ghost entry left in the tracked array would satisfy the find-by-UUID lookup and short-circuit this retry.
     platform.reconcileZoneAccessories({ controller: syntheticController, presentRelayIds: present, zones: [ zoneRequest(failing), zoneRequest(healthy) ] });
 
     assert.equal(registered().length, 2, "the faulted zone leaves no residue behind, so the next reconcile retries its registration");
+  });
+
+  test("a zone's setup failure is reported at error and its repeat at debug, a healthy zone beside it leaves that episode alone, and a demotion ends it", (t) => {
+
+    // Debug is on so a demoted repeat reaches the capture, through the warn channel the platform's debug gate emits on.
+    const failing = zoneFixture();
+    const healthy = zoneFixture({ name: "Side Yard", relay: 2, relay_id: SECOND_RELAY_ID });
+    const { entries, failRegistrationUuids, platform } = buildPlatform({ debug: true });
+    const failingUuid = zoneUuid(platform, syntheticController.controller_id, ZONE_RELAY_ID);
+    const reported = (level: "error" | "warn"): number => logCount(entries, level, "Unable to establish a standalone accessory");
+    const reconcile = (zones: ReturnType<typeof zoneRequest>[]): ReturnType<HydrawisePlatform["reconcileZoneAccessories"]> => {
+
+      return platform.reconcileZoneAccessories({ controller: syntheticController, presentRelayIds: new Set([ ZONE_RELAY_ID, SECOND_RELAY_ID ]), zones });
+    };
+
+    // Each of these reconciles requests the failing zone and the healthy one, and refuses only the failing zone's registration. The healthy zone is established
+    // after the failing zone's first attempt, so an episode the zones shared would read that success as the reset that reports the repeat in full.
+    failRegistrationUuids.add(failingUuid);
+    reconcile([ zoneRequest(failing), zoneRequest(healthy) ]);
+    reconcile([ zoneRequest(failing), zoneRequest(healthy) ]);
+
+    assert.equal(reported("error"), 1, "the failing zone's first failure is reported at error");
+    assert.equal(reported("warn"), 1, "and its repeat at debug, the healthy zone established beside it leaving the episode alone");
+
+    /* A zone whose registration fails holds no accessory to demote, so the zone is established, and then its save is refused on a rename: the reconcile before
+     * its demotion leaves the zone's episode holding a failure, so the error after the demotion is the demotion's fresh episode rather than a success's reset.
+     */
+    failRegistrationUuids.clear();
+    reconcile([ zoneRequest(failing), zoneRequest(healthy) ]);
+
+    const refusal = t.mock.method(platform.persistence, "persist", (): void => {
+
+      throw new Error("The accessory cache refused the save.");
+    });
+    const renamed = reconcile([ zoneRequest(zoneFixture({ name: "Renamed Lawn" })), zoneRequest(healthy) ]);
+
+    refusal.mock.restore();
+
+    assert.equal(renamed.has(ZONE_RELAY_ID), false, "a zone whose setup failed goes unhosted for that reconcile");
+    assert.equal(reported("error"), 2, "and the refused save, after the success before it, is reported at error");
+
+    // The wire still reports the zone and the request leaves it out, which demotes it at once. Its next promotion is refused again.
+    reconcile([zoneRequest(healthy)]);
+    failRegistrationUuids.add(failingUuid);
+    reconcile([ zoneRequest(failing), zoneRequest(healthy) ]);
+
+    assert.equal(reported("error"), 3, "the zone demoted and then failing again is reported at error again");
+    assert.equal(reported("warn"), 1, "rather than at debug as a repeat of the failure before its demotion");
   });
 
   test("a promotion's mark is saved synchronously inside Homebridge's shutdown signal", () => {

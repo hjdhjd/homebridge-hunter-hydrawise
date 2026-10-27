@@ -4,18 +4,19 @@
  */
 import type { API, CharacteristicValue, HAP, Service } from "homebridge";
 import { HAP_DEFAULT_MODEL, HAP_DURATION_CEILING, HOMEBRIDGE_UNKNOWN_FIRMWARE, HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER,
-  HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_POLL_LOSS_THRESHOLD, HYDRAWISE_REVERT_DELAY, HYDRAWISE_SUSPEND_DURATION,
-  HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
+  HYDRAWISE_API_NEXTPOLL_MAX, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_POLL_LOSS_THRESHOLD, HYDRAWISE_REVERT_DELAY,
+  HYDRAWISE_SUSPEND_DURATION, HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
 import { HYDRAWISE_UNSCHEDULED_SENTINEL, HydrawiseReservedNames, controllerIdentity, isControllerIdentity, isScheduleStatus, isSuspendZoneSubtype,
   isZoneIdentity, isZoneStoppedBySensor, sameControllerIdentity, sameScheduleStatus, sameZoneIdentity, scheduleStatus, suspendZoneSubtype,
   zoneIdentity, zoneScheduleStatus } from "./types.ts";
-import type { HomebridgePluginLogging, MqttAvailabilityPayload, Nullable } from "homebridge-plugin-utils";
+import type { HomebridgePluginLogging, MqttAvailabilityPayload, Nullable, RepeatDemotedLog } from "homebridge-plugin-utils";
 import type { HydrawiseAccessory, HydrawiseControllerAccessory, HydrawiseControllerConfig, HydrawiseControllerHardware, HydrawiseControllerIdentity,
   HydrawiseControllerV2Facts, HydrawiseScheduleStatus, HydrawiseZoneConfig, HydrawiseZoneIdentity, HydrawiseZoneScheduleStatus, HydrawiseZoneSuspensionResult,
   SetZoneResponse, StatusScheduleResponse } from "./types.ts";
 import type { HydrawiseControllerOption, HydrawiseControllerValueOption, HydrawiseZoneOption, HydrawiseZoneValueOption } from "./options.ts";
-import { MQTT_AVAILABILITY_OFFLINE, MQTT_AVAILABILITY_ONLINE, acquireService, getServiceName, loopFaultReporter, mqttTopic, notResponding, prefixedLog,
-  presenceChanged, retry, sameEntries, sanitizeName, setAccessoryName, setServiceName, superviseLoop, validCharacteristic, validService } from "homebridge-plugin-utils";
+import { MQTT_AVAILABILITY_OFFLINE, MQTT_AVAILABILITY_ONLINE, acquireService, formatErrorMessage, getServiceName, loopFaultReporter, mqttTopic, notResponding,
+  prefixedLog, presenceChanged, repeatDemotedLog, retry, sameEntries, sanitizeName, setAccessoryName, setServiceName, superviseLoop, validCharacteristic,
+  validService } from "homebridge-plugin-utils";
 import type { Dispatcher } from "undici";
 import type { HydrawisePlatform } from "./platform.ts";
 import { mqttTopics } from "./mqtt.ts";
@@ -36,6 +37,16 @@ interface HydrawisePollUpdate {
 
   readonly status: StatusScheduleResponse;
 }
+
+/* Why one status fetch failed, the tag the status log compares with the reason it remembers: a request retrieve() could not answer, a body that could not be
+ * parsed, or one that parsed into the wrong shape.
+ */
+type HydrawiseStatusFailure = "mis-shaped" | "unanswered" | "unreadable";
+
+/* What one status fetch came to: a body adopted as the controller's status, a shutdown abort mid-read carrying the read's own error, which is no failure, or the
+ * tag of the reason it failed. The status log classifies the fetch from it before it releases the fetch's lines, and getStatus() answers the retry from it.
+ */
+type HydrawiseStatusOutcome = { status: "adopted" } | { error: unknown; status: "aborted" } | { status: HydrawiseStatusFailure };
 
 /* The polling loop's verdict on whether Hydrawise answers for this controller. Pending until the first poll lands, reachable once one has, and lost after a run of
  * consecutive failed polls, or when the loop itself has ended; a lost controller keeps polling, and its next good poll makes it reachable again.
@@ -256,6 +267,14 @@ export class HydrawiseController {
   private pollFailures = 0;
   private status: StatusScheduleResponse;
 
+  /* The status log: how this controller's poll reports a body it fetched and could not adopt. The adapter lives and dies with the controller, so a failure is
+   * reported in full the first time, at debug for as long as the same reason holds, and in full again once an adopted poll, a different reason, or a shutdown
+   * abort ends the episode, and a restart opens a fresh one. Each controller holds its own because each polls on its own, so one controller's adopted poll never
+   * resets another's episode, and the controller polls one request at a time, so its attempts never overlap on it. A request retrieve() could not answer is
+   * not reported here, since retrieve() has already reported it through the platform's own request log.
+   */
+  private readonly statusFailures: RepeatDemotedLog<HydrawiseStatusFailure>;
+
   // The most recent account-credentialed facts this controller was handed, or null when none have ever arrived. Every reader goes through the freshness
   // chokepoint below rather than touching this directly, so "never arrived", "gone stale", and "no credentials configured" are one answer at every consumer.
   private v2Facts: Nullable<HydrawiseControllerFactsSnapshot> = null;
@@ -305,6 +324,9 @@ export class HydrawiseController {
     // Prefix every log line with this controller's live name. The platform's logger already gates debug routing through the user's debug setting, so debug lines
     // prefixed here route intact.
     this.log = prefixedLog(platform.log, (): string => this.name);
+
+    // The status log is built over the prefixed logger, so a demoted repeat carries the controller's name and meets the user's debug setting as every debug line does.
+    this.statusFailures = repeatDemotedLog<HydrawiseStatusFailure>(this.log);
 
     this.configureDevice(roster);
   }
@@ -1898,8 +1920,44 @@ export class HydrawiseController {
     return when.toLocaleDateString();
   }
 
-  // Retrieve the current status from the Hydrawise API.
+  /* Retrieve the current status from the Hydrawise API. The fetch, the parse and the shape check run as one attempt of the status log, which classifies what the
+   * fetch came to before it releases the fetch's lines, and the failure is thrown after the attempt rather than inside it, because a throw inside an attempt leaves
+   * it unclassified and its lines at their own levels on every repeat. What is thrown is the error every failed poll throws, so pollOnce counts it and the retry
+   * waits and re-polls on the same terms; the stale status is never republished as fresh.
+   */
   private async getStatus(): Promise<void> {
+
+    const outcome = await this.statusFailures.attempt(async (log): Promise<HydrawiseStatusOutcome> => this.attemptStatus(log),
+      (result): HydrawiseStatusFailure | undefined => (((result.status === "adopted") || (result.status === "aborted")) ? undefined : result.status));
+
+    switch(outcome.status) {
+
+      case "adopted":
+
+        return;
+
+      // A shutdown abort mid-read is orderly teardown, so the read's own error is rethrown quietly and the retry loop unwinds through its own signal.
+      case "aborted":
+
+        throw outcome.error;
+
+      case "mis-shaped":
+      case "unanswered":
+      case "unreadable":
+
+        throw new Error("Unable to retrieve the current status of the irrigation controller.");
+
+      // Compile-time exhaustiveness: a status the fetch's outcome learns fails to type-check here until the poll says what it does with it.
+      default:
+
+        outcome satisfies never;
+    }
+  }
+
+  /* One status fetch, as the status log runs it: the request, the parse, and the shape check, answering what the fetch came to. Every line it writes goes through
+   * the logger the attempt hands in, and the body becomes the controller's status here only once it has passed the check.
+   */
+  private async attemptStatus(log: HomebridgePluginLogging): Promise<HydrawiseStatusOutcome> {
 
     // Get our schedule for this controller.
     const params: Record<string, string> = {};
@@ -1908,45 +1966,60 @@ export class HydrawiseController {
 
     const response = await this.platform.retrieve("statusschedule.php", params);
 
-    // A null response is a recoverable API error (or a shutdown abort) that retrieve() already classified and logged. Throw so the retry loop waits and tries again;
-    // on shutdown the loop unwinds through its own signal.
+    // A null response is a recoverable API error, or a shutdown abort, that retrieve() already classified and reported through its own request log, so nothing is
+    // said about it here.
     if(!response) {
 
-      throw new Error("Unable to retrieve the current status of the irrigation controller.");
+      return { status: "unanswered" };
     }
+
+    // Parse the body into a local and validate its shape before adopting it as our status. A valid-JSON body with the wrong shape would otherwise pass the cast
+    // and crash applyStatus outside every try/catch, tripping superviseLoop's terminal fault and stopping this controller's polling until a restart.
+    let parsed: unknown;
 
     try {
 
-      // Parse the body into a local and validate its shape before adopting it as our status. A valid-JSON body with the wrong shape would otherwise pass the cast
-      // and crash applyStatus outside every try/catch, tripping superviseLoop's terminal fault and stopping this controller's polling until a restart.
-      const parsed = await response.body.json();
-
-      if(!this.isStatusSchedule(parsed)) {
-
-        throw new Error("The Hydrawise API returned a status body with an unexpected shape.");
-      }
-
-      this.status = parsed;
-
-      this.log.debug("Status updated.");
-      this.log.debug(util.inspect(this.status, { colors: true, depth: null, sorted: true }));
+      parsed = await response.body.json();
     } catch(error) {
 
-      // A shutdown abort mid-read is orderly teardown - rethrow quietly so the retry loop unwinds without manufacturing a parse-failure error. A genuine parse or
-      // shape failure throws so the retry loop waits and re-polls; the stale status is never republished as fresh.
-      if(this.platform.signal.aborted) {
-
-        throw error;
-      }
-
-      this.log.error("Unable to retrieve the current status of the irrigation controller: --%s--", util.inspect(error, { colors: true, depth: null, sorted: true }));
-
-      throw new Error("Unable to retrieve the current status of the irrigation controller.");
+      return this.refuseStatus({ error, log, status: "unreadable" });
     }
+
+    if(!this.isStatusSchedule(parsed)) {
+
+      return this.refuseStatus({ error: new Error("The Hydrawise API returned a status body with an unexpected shape."), log, status: "mis-shaped" });
+    }
+
+    this.status = parsed;
+
+    log.debug("Status updated.");
+    log.debug(util.inspect(this.status, { colors: true, depth: null, sorted: true }));
+
+    return { status: "adopted" };
   }
 
-  // Guard that a parsed status body carries the shape applyStatus relies on: relays and sensors arrays and a numeric nextpoll. A body that fails this check is
-  // treated as a failed poll rather than being adopted as our status.
+  /* Answer a status body the poll cannot adopt. A shutdown abort mid-read is orderly teardown, so it answers the abort without a word rather than manufacturing a
+   * failure report; anything else is reported as one sentence carrying the failure's own detail, and answers its tag.
+   */
+  private refuseStatus({ error, log, status }: { error: unknown; log: HomebridgePluginLogging; status: "mis-shaped" | "unreadable" }): HydrawiseStatusOutcome {
+
+    if(this.platform.signal.aborted) {
+
+      return { error, status: "aborted" };
+    }
+
+    log.error("Unable to retrieve the current status of the irrigation controller: %s.", formatErrorMessage(error));
+
+    return { status };
+  }
+
+  /* Guard that a parsed status body carries the shape applyStatus relies on: relays and sensors arrays, and a nextpoll from zero to the ceiling the plugin
+   * honors. A body that fails this check is treated as a failed poll rather than being adopted as our status.
+   *
+   * The lower bound keeps the wire from passing as the first-run placeholder, whose nextpoll of -1 is what the loop reads as a first run. The range comparison
+   * refuses NaN and both infinities, which pass a type check - the infinities being what an overflowing JSON literal parses to - and the type check ahead of it
+   * refuses null, which a range comparison alone would read as zero.
+   */
   private isStatusSchedule(value: unknown): value is StatusScheduleResponse {
 
     if((typeof value !== "object") || (value === null)) {
@@ -1956,7 +2029,8 @@ export class HydrawiseController {
 
     const candidate = value as Partial<StatusScheduleResponse>;
 
-    return Array.isArray(candidate.relays) && Array.isArray(candidate.sensors) && (typeof candidate.nextpoll === "number");
+    return Array.isArray(candidate.relays) && Array.isArray(candidate.sensors) && (typeof candidate.nextpoll === "number") && (candidate.nextpoll >= 0) &&
+      (candidate.nextpoll <= HYDRAWISE_API_NEXTPOLL_MAX);
   }
 
   /* Write the reported zone roster to the accessory context when it changed since the last poll, marking the accessory for the save window as it writes. We project

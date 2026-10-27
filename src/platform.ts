@@ -31,12 +31,27 @@ import util from "node:util";
  * rule the exhaustive switch in the request holds.
  */
 type HydrawiseRequestFailure = "certificate" | "connect-timeout" | "destroyed" | "dns" | "invalid-key" | "rate-limit" | "refused" | "reset" | "retries-exhausted" |
-  "timeout" | "transport" | "unexpected-status";
+  "timeout" | "transport" | "unexpected-status" | "unreachable";
 
 /* What one request through retrieve() came to: the response it was answered with, a shutdown, which is no failure, or the tag of the reason it failed. The request
  * log classifies the request from it before it releases the request's lines, and retrieve() answers its caller from it.
  */
 type HydrawiseRequestOutcome = { response: Dispatcher.ResponseData<unknown>; status: "answered" } | { status: "aborted" } | { status: HydrawiseRequestFailure };
+
+// Why one fetch of the account's controller list failed, the tag discovery's list log compares with the reason it remembers: a request retrieve() could not
+// answer, or a body that could not be parsed.
+type HydrawiseListFailure = "unanswered" | "unreadable";
+
+/* What one fetch of the account's controller list came to: the account it listed, a shutdown abort mid-read, which is no failure, or the tag of the reason it
+ * failed. An abort and an unreadable body carry the read's own error, which the retry is handed.
+ */
+type HydrawiseListOutcome = { account: CustomerDetailsResponse; status: "listed" } | { error: unknown; status: "aborted" | "unreadable" } | { status: "unanswered" };
+
+// Why one zone's promotion failed, the tag a zone's setup log compares with the reason it remembers: a fault anywhere in establishing the zone's accessory.
+type HydrawiseZoneSetupFailure = "failed";
+
+// What one zone's promotion came to: the accessory it established, or the tag of the reason it failed.
+type HydrawiseZoneSetupOutcome = { accessory: HydrawiseAccessory; status: "established" } | { status: HydrawiseZoneSetupFailure };
 
 export class HydrawisePlatform implements DynamicPlatformPlugin {
 
@@ -117,6 +132,15 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
    * placed in a room rather than toward destroying one, and the count rebuilds from the next few polls at no cost.
    */
   private readonly zoneAccessoryGrace = new Map<string, number>();
+
+  /* The setup log of each standalone zone accessory, keyed by zone-accessory UUID beside the grace state above: how a zone's promotion reports the fault that kept
+   * it from being established. Each zone holds its own, so a failure is reported in full the first time, at debug for as long as that zone keeps failing, and in
+   * full again after a successful attempt, which closes the episode, and a healthy zone established beside a failing one never resets that zone's episode. An
+   * entry lives as long as its accessory: wherever a zone accessory goes away, its entry is cleared with its grace entry through clearZoneAccessoryState(), so a
+   * zone removed and promoted again starts a fresh episode, while the entry of a zone whose promotion never succeeds stays until a restart. Like the grace state
+   * it lives in memory only, so a restart begins every episode fresh. The reconcile walks its zones in sequence, so a zone's attempts never overlap on its adapter.
+   */
+  private readonly zoneSetupFailures = new Map<string, RepeatDemotedLog<HydrawiseZoneSetupFailure>>();
 
   constructor(log: Logging, config: PlatformConfig | undefined, api: API) {
 
@@ -447,33 +471,38 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   // Configure and connect to the Hydrawise API.
   private async configureHydrawise(): Promise<void> {
 
-    // Retrieve the account's controllers, retrying forever at a fixed 60-second cadence against the rate-limited API. The retried operation covers only the network
-    // truth - the request and the JSON parse - and throws on any failure so retry loops; a resolved value is a successful fetch. Everything downstream runs once,
-    // outside the retry, so a genuine configuration fault escapes to the supervisor's reporter rather than becoming a silent 60-second retry.
+    /* Retrieve the account's controllers, retrying forever at a fixed 60-second cadence against the rate-limited API. The retried operation covers only the
+     * network truth - the request and the JSON parse - and throws on any failure so retry loops; a resolved value is a successful fetch. Everything downstream
+     * runs once, outside the retry, so a genuine configuration fault escapes to the supervisor's reporter rather than becoming a silent 60-second retry.
+     *
+     * Each fetch runs as one attempt of discovery's list log, which this pass builds and its retries share, so an unreadable list is reported in full the first
+     * time and at debug for as long as it repeats. The adapter lives for this one pass, and the pass's attempts run in sequence, so none overlap. The failure
+     * is thrown after the attempt rather than inside it, because a throw inside an attempt leaves it unclassified and its lines at their own levels.
+     */
+    const listFailures = repeatDemotedLog<HydrawiseListFailure>(this.log);
+
     this.account = await retry(async (): Promise<CustomerDetailsResponse> => {
 
-      const response = await this.retrieve("customerdetails.php");
+      const outcome = await listFailures.attempt(async (log): Promise<HydrawiseListOutcome> => this.attemptControllerList(log),
+        (result): HydrawiseListFailure | undefined => (((result.status === "aborted") || (result.status === "listed")) ? undefined : result.status));
 
-      // A null response is either a recoverable API error retrieve() already logged, or a shutdown abort it left silent. Throw so retry waits and tries again.
-      if(!response) {
+      switch(outcome.status) {
 
-        throw new Error("Unable to retrieve the list of controllers.");
-      }
+        case "listed":
 
-      try {
+          return outcome.account;
 
-        return await response.body.json() as CustomerDetailsResponse;
-      } catch(error) {
+        // A null response is either a recoverable API error retrieve() already logged, or a shutdown abort it left silent. Throw so retry waits and tries again.
+        case "unanswered":
 
-        // A shutdown abort mid-read is orderly teardown - rethrow quietly so the retry loop unwinds through its own signal without logging a spurious parse failure.
-        if(this.signal.aborted) {
+          throw new Error("Unable to retrieve the list of controllers.");
 
-          throw error;
-        }
+        // The read's own error, rethrown: quietly for a shutdown abort mid-read, so the retry loop unwinds through its own signal, and once reported for an
+        // unreadable list, so retry waits and tries again.
+        case "aborted":
+        case "unreadable":
 
-        this.log.error("Unable to retrieve the list of controllers: %s", util.inspect(error, { colors: true, depth: null, sorted: true }));
-
-        throw error;
+          throw outcome.error;
       }
     }, { attempts: Infinity, backoff: (): number => HYDRAWISE_API_RETRY_INTERVAL * 1000, clock: this.clock, signal: this.signal });
 
@@ -500,17 +529,46 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     // point, so the loop's first tick has somewhere to deliver every controller's facts.
     this.startV2Refresh();
 
-    // Find all the orphaned accessories this account does not claim and remove them, clearing any grace state a removed accessory carried. We walk a filtered
-    // SNAPSHOT of the tracked array so the removal splice never races the walk that drives it.
+    // Find all the orphaned accessories this account does not claim and remove them, clearing whatever state the reconcile kept for a removed accessory. We walk
+    // a filtered SNAPSHOT of the tracked array so the removal splice never races the walk that drives it.
     for(const accessory of this.accessories.filter(entry => this.isOrphanedAccessory(entry))) {
 
-      this.zoneAccessoryGrace.delete(accessory.UUID);
+      this.clearZoneAccessoryState(accessory.UUID);
       this.removeAccessory(accessory);
     }
 
     // Discovery has settled which controllers this run builds, so state every restored controller it left unbuilt - a disabled one, and one the account has
     // dropped - as unreachable on the session already held, rather than waiting for the next one.
     this.publishUnconfiguredAvailability();
+  }
+
+  /* One fetch of the account's controller list, as discovery's list log runs it: the request and the parse, answering what the fetch came to. Every line it writes
+   * goes through the logger the attempt hands in.
+   */
+  private async attemptControllerList(log: HomebridgePluginLogging): Promise<HydrawiseListOutcome> {
+
+    const response = await this.retrieve("customerdetails.php");
+
+    if(!response) {
+
+      return { status: "unanswered" };
+    }
+
+    try {
+
+      return { account: await response.body.json() as CustomerDetailsResponse, status: "listed" };
+    } catch(error) {
+
+      // A shutdown abort mid-read is orderly teardown - answer it quietly so the retry loop unwinds through its own signal without logging a spurious parse failure.
+      if(this.signal.aborted) {
+
+        return { error, status: "aborted" };
+      }
+
+      log.error("Unable to retrieve the list of controllers: %s.", formatErrorMessage(error));
+
+      return { error, status: "unreadable" };
+    }
   }
 
   /* Start the endless loop that refreshes every controller's account-credentialed facts, once, and only for an install that configured the credentials making it
@@ -810,7 +868,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     // neither.
     for(const { accessory, relayId } of owned) {
 
-      // REQUESTED: the zone is still standalone and still reported. Clearing its counter here - in the arm every healthy zone visits - is what makes a
+      // REQUESTED: the zone is still standalone and still reported. Clearing its grace count here - in the arm every healthy zone visits - is what makes a
       // reappearance reset the grace window, so a later absence always counts from zero.
       if(requestedIds.has(relayId)) {
 
@@ -842,64 +900,99 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       this.demoteZoneAccessory(accessory);
     }
 
-    // Promote each requested zone, establishing its accessory when it has none and keeping its persisted identity current.
+    // Promote each requested zone, establishing its accessory when it has none and keeping its persisted identity current. Each zone's promotion runs as one
+    // attempt of that zone's own setup log, and a zone whose promotion failed is left out of the hosting map for this poll.
     for(const zone of zones) {
 
       const uuid = this.hap.uuid.generate(zoneAccessoryId(controller.controller_id, zone.identity.relayId));
-      let accessory = this.accessories.find(entry => entry.UUID === uuid);
+      let failures = this.zoneSetupFailures.get(uuid);
 
-      /* The whole per-zone sequence sits in one try. A fault establishing one zone must never end the controller's polling loop: we log it, omit the zone from the
-       * returned map - which sends the controller's hosting back to the controller accessory for this poll - and carry on with the remaining zones. A registration
-       * that throws leaves no ghost behind, because addAccessory tracks an accessory only once Homebridge has taken it, and the next poll retries.
-       */
-      try {
+      if(!failures) {
 
-        if(!accessory) {
+        failures = repeatDemotedLog<HydrawiseZoneSetupFailure>(this.log);
+        this.zoneSetupFailures.set(uuid, failures);
+      }
 
-          accessory = this.addAccessory(sanitizeName(zone.displayName), uuid, HYDRAWISE_ZONE_ACCESSORY_CATEGORY);
+      const outcome = failures.attempt((log): HydrawiseZoneSetupOutcome => this.establishZoneAccessory({ controller, log, uuid, zone }),
+        (result): HydrawiseZoneSetupFailure | undefined => ((result.status === "established") ? undefined : result.status));
 
-          // A fresh accessory starts with a fresh grace window even when an earlier accessory at this UUID was removed for sustained absence, so an inherited
-          // count can never truncate the new one.
-          this.zoneAccessoryGrace.delete(uuid);
+      if(outcome.status === "established") {
 
-          this.log.info("%s: Added a standalone HomeKit accessory for this zone so it can be assigned to a room. Automations, scenes, and room assignments " +
-            "that referenced this zone on the controller accessory must be set up again in the Home app.", zone.displayName);
-        }
-
-        /* Seed or refresh the persisted identity pair. The comparison is field-wise because both halves are freshly built projections, so a reference check would
-         * differ every poll and save every poll. On any difference - or on a context that fails the kind predicate, which is how an ambiguous or corrupt cache
-         * entry heals - we assign a COMPLETE fresh object rather than individual fields, which re-asserts the kinds' mutual exclusivity at every write, and then
-         * mark the accessory. The mark merges nothing, because a field merge onto an ambiguous context would keep the stray fields that made it ambiguous.
-         */
-        // The owner stamp reads the controller's own identity where this plugin built one, so a zone accessory names its owner exactly as that owner names itself
-        // - the account's full name included. The wire projection is the floor for a controller no runtime object answers for.
-        const ownerController = this.configuredController(controller)?.identity ?? controllerIdentity(controller);
-        const context = accessory.context;
-
-        if(!isZoneAccessoryContext(context) || !sameControllerIdentity(context.ownerController, ownerController) ||
-          !sameZoneIdentity(context.zone, zone.identity)) {
-
-          accessory.context = { ownerController, zone: zone.identity };
-          this.persistence.persist(accessory);
-        }
-
-        hosts.set(zone.identity.relayId, accessory);
-      } catch(error) {
-
-        this.log.error("%s: Unable to establish a standalone accessory for this zone: %s", zone.displayName,
-          util.inspect(error, { colors: true, depth: null, sorted: true }));
+        hosts.set(zone.identity.relayId, outcome.accessory);
       }
     }
 
     return hosts;
   }
 
-  // Remove one standalone zone accessory and clear the grace state it carried, so the counter map never holds an entry for an accessory that is gone. The removal
+  /* Establish one requested zone's accessory, as the zone's setup log runs it: find or register the accessory and keep its persisted identity current, answering
+   * the accessory established or the failure. Every line it writes goes through the logger the attempt hands in.
+   *
+   * The whole per-zone sequence sits in one try. A fault establishing one zone must never end the controller's polling loop: we report it and answer the failure,
+   * which leaves the zone out of the hosting map - sending the controller's hosting back to the controller accessory for this poll - and the reconcile carries on
+   * with the remaining zones. A registration that throws leaves no ghost behind, because addAccessory tracks an accessory only once Homebridge has taken it, and
+   * the next poll retries. The fault is answered rather than thrown, because a throw inside the setup log's attempt leaves it unclassified.
+   */
+  private establishZoneAccessory({ controller, log, uuid, zone }: { controller: HydrawiseControllerConfig; log: HomebridgePluginLogging; uuid: string;
+    zone: { displayName: string; identity: HydrawiseZoneIdentity }; }): HydrawiseZoneSetupOutcome {
+
+    let accessory = this.accessories.find(entry => entry.UUID === uuid);
+
+    try {
+
+      if(!accessory) {
+
+        accessory = this.addAccessory(sanitizeName(zone.displayName), uuid, HYDRAWISE_ZONE_ACCESSORY_CATEGORY);
+
+        // A fresh accessory starts with a fresh grace window even when an earlier accessory at this UUID was removed for sustained absence, so an inherited
+        // count can never truncate the new one.
+        this.zoneAccessoryGrace.delete(uuid);
+
+        log.info("%s: Added a standalone HomeKit accessory for this zone so it can be assigned to a room. Automations, scenes, and room assignments " +
+          "that referenced this zone on the controller accessory must be set up again in the Home app.", zone.displayName);
+      }
+
+      /* Seed or refresh the persisted identity pair. The comparison is field-wise because both halves are freshly built projections, so a reference check would
+       * differ every poll and save every poll. On any difference - or on a context that fails the kind predicate, which is how an ambiguous or corrupt cache entry
+       * heals - we assign a COMPLETE fresh object rather than individual fields, which re-asserts the kinds' mutual exclusivity at every write, and then mark the
+       * accessory. The mark merges nothing, because a field merge onto an ambiguous context would keep the stray fields that made it ambiguous.
+       */
+      // The owner stamp reads the controller's own identity where this plugin built one, so a zone accessory names its owner exactly as that owner names itself -
+      // the account's full name included. The wire projection is the floor for a controller no runtime object answers for.
+      const ownerController = this.configuredController(controller)?.identity ?? controllerIdentity(controller);
+      const context = accessory.context;
+
+      if(!isZoneAccessoryContext(context) || !sameControllerIdentity(context.ownerController, ownerController) ||
+        !sameZoneIdentity(context.zone, zone.identity)) {
+
+        accessory.context = { ownerController, zone: zone.identity };
+        this.persistence.persist(accessory);
+      }
+
+      return { accessory, status: "established" };
+    } catch(error) {
+
+      log.error("%s: Unable to establish a standalone accessory for this zone: %s.", zone.displayName, formatErrorMessage(error));
+
+      return { status: "failed" };
+    }
+  }
+
+  // Clear what the reconcile keeps for one zone accessory: its wire-absence count and its setup log. Every site where a zone accessory goes away clears its
+  // entries there, through here, so no zone accessory that goes away leaves an entry behind, and a zone removed and promoted again starts a fresh grace window
+  // and setup episode.
+  private clearZoneAccessoryState(uuid: string): void {
+
+    this.zoneAccessoryGrace.delete(uuid);
+    this.zoneSetupFailures.delete(uuid);
+  }
+
+  // Remove one standalone zone accessory and clear the state the reconcile kept for it, so neither map holds an entry for an accessory that is gone. The removal
   // itself narrates through removeAccessory; the line here carries what the user has to act on, since a HomeKit identity is going away.
   private demoteZoneAccessory(accessory: HydrawiseAccessory): void {
 
     this.removeAccessory(accessory);
-    this.zoneAccessoryGrace.delete(accessory.UUID);
+    this.clearZoneAccessoryState(accessory.UUID);
 
     this.log.info("%s: Automations, scenes, and room assignments that referenced this zone's standalone accessory must be set up again in the Home app.",
       accessory.displayName);
@@ -1063,6 +1156,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
         case "refused":
         case "reset":
         case "retries-exhausted":
+        case "unreachable":
 
           log.error(HYDRAWISE_TRANSPORT_FAULT_SENTENCES[failure.kind]);
 

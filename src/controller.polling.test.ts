@@ -51,8 +51,9 @@ function scheduledZone(): HydrawiseZoneConfig {
 }
 
 /* A poll body that PASSES the shape guard and then breaks the loop's WIRE half. The guard is deliberately shallow - relays and sensors are arrays, nextpoll is a
- * number - so a relay entry carrying no name at all passes straight through it and fails at the name trim, the first thing the wire half does with the entry it
- * fetched. The cast is what lets the fixture express a body the wire could plausibly return but the wire types cannot describe.
+ * number from zero to the ceiling the plugin honors - so a relay entry carrying no name at all passes straight through it and fails at the name trim, the
+ * first thing the wire half does with the entry it fetched. The cast is what lets the fixture express a body the wire could plausibly return but the wire types
+ * cannot describe.
  */
 function wireCrashingSchedule(): StatusScheduleResponse {
 

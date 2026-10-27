@@ -549,6 +549,7 @@ export class HydrawiseV2Client {
       case "refused":
       case "reset":
       case "retries-exhausted":
+      case "unreachable":
 
         return { joiner: ".", reason: HYDRAWISE_TRANSPORT_FAULT_SENTENCES[failure.kind] };
 

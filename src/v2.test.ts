@@ -1371,6 +1371,7 @@ describe("HydrawiseV2Client dispatcher", () => {
       { code: "CERT_HAS_EXPIRED", kind: "certificate" },
       { code: "ECONNREFUSED", kind: "refused" },
       { code: "ECONNRESET", kind: "reset" },
+      { code: "EHOSTUNREACH", kind: "unreachable" },
       { code: "ENOTFOUND", kind: "dns" },
       { code: "UND_ERR_CONNECT_TIMEOUT", kind: "connect-timeout" },
       { code: "UND_ERR_DESTROYED", kind: "destroyed" },

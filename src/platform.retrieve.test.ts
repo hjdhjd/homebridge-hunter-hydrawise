@@ -255,6 +255,24 @@ describe("HydrawisePlatform retrieve", () => {
     assert.ok(loggedAt(entries, "error", "Hostname or IP address not found"), "EAI_AGAIN should log the not-found message");
   });
 
+  test("classifies a host no route reaches as an API that could not be reached", async (t) => {
+
+    const { emit, entries, platform } = buildPlatform();
+
+    t.after(() => emit(SHUTDOWN_EVENT));
+    await using dispatcher = installMockDispatcher();
+
+    // EHOSTUNREACH is the platform saying no route leads to the host, which is a peer out of reach rather than one that refused, so it reads as its own sentence
+    // rather than as the raw dump or the refused one.
+    dispatcher.agent.get(HYDRAWISE_ORIGIN).intercept({ method: "GET", path: (path: string): boolean => path.includes("customerdetails.php") })
+      .replyWithError(errnoError("connect EHOSTUNREACH", "EHOSTUNREACH"));
+
+    const response = await platform.retrieve("customerdetails.php");
+
+    assert.equal(response, null, "an unreachable host should return null");
+    assert.ok(loggedAt(entries, "error", "The Hydrawise API could not be reached"), "EHOSTUNREACH should log the unreachable message");
+  });
+
   test("reports a request dispatched against a destroyed connection pool", async (t) => {
 
     const { emit, entries, platform } = buildPlatform();

@@ -3,8 +3,9 @@
  * platform.configure.test.ts: Discovery and lifecycle behavior of the HydrawisePlatform, driven by firing the captured DID_FINISH_LAUNCHING handler to
  * run the private configureHydrawise against a MockAgent-backed wire. Covers the discovery happy path, the short-circuiting second pass and cached-accessory reuse,
  * orphan pruning, the bug-16 device gate in both directions, the no-API-key early return, the bug-2 debug routing, the MQTT construction arms, the discovery
- * retry failure paths, the shutdown teardown and the retained offline it states first for each built controller, the refusal a restored accessory answers with
- * until its controller vouches for it, and the retained offline the platform states for a restored controller this run does not build.
+ * retry failure paths and the report of a repeating one, the shutdown teardown and the retained offline it states first for each built controller, the refusal a
+ * restored accessory answers with until its controller vouches for it, and the retained offline the platform states for a restored controller this run does not
+ * build.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as controller_id, so camelcase is disabled here to let the controller fixture mirror the wire verbatim.
@@ -12,14 +13,16 @@
 import { Characteristic, Service, TestMqttClient, buildPlatform, dispatcherOf, installMockDispatcher, programJsonReply, programStatusReply, seedAccessory,
   v2DispatcherOf } from "./testing/platform.helpers.ts";
 import { HAPStatus, MqttClient, onAbort } from "homebridge-plugin-utils";
+import { HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_SHUTDOWN_GRACE } from "./settings.ts";
 import type { Characteristic as HapCharacteristic, PlatformAccessory } from "homebridge";
 import { HydrawiseReservedNames, suspendZoneSubtype, zoneAccessoryId } from "./types.ts";
 import { describe, test } from "node:test";
-import { hapStatus, logCount, loggedAt, present, settle, triggerGet, triggerSet, waitUntil } from "homebridge-plugin-utils/testing";
+import { formatLogEntry, hapStatus, logCount, loggedAt, present, settle, settleUntil, triggerGet, triggerSet, waitUntil } from "homebridge-plugin-utils/testing";
 import { makeCustomerDetails, normalSchedule } from "./api.helpers.ts";
-import { HYDRAWISE_SHUTDOWN_GRACE } from "./settings.ts";
 import type { MqttConnectHandler } from "homebridge-plugin-utils";
+import type { TestLogEntry } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
+import { stripVTControlCharacters } from "node:util";
 import { syntheticController } from "./api.fixtures.ts";
 
 // The subtype the suspend-all switch carries on a controller accessory, as the controller composes it.
@@ -309,6 +312,32 @@ describe("HydrawisePlatform configure", () => {
       { description: "an error line containing \"Unable to retrieve the list of controllers\"" });
 
     assert.equal(registered().length, 0, "a discovery parse failure should configure no controller while it retries");
+  });
+
+  test("an unreadable controller list that repeats is reported once at error and once at debug, each as one sentence", async (t) => {
+
+    // Debug is on so the demoted repeat reaches the capture, through the warn channel the platform's debug gate emits on.
+    const { emit, entries } = buildPlatform({ debug: true });
+    const failures = (): TestLogEntry[] => entries.filter(entry => formatLogEntry(entry).includes("Unable to retrieve the list of controllers"));
+
+    t.after(() => emit(SHUTDOWN));
+    await using dispatcher = installMockDispatcher();
+
+    // Each status reply answers one request, in the order it was programmed.
+    programStatusReply(dispatcher.agent, "customerdetails.php", 200, "this is not valid json");
+    programStatusReply(dispatcher.agent, "customerdetails.php", 200, "this is not valid json");
+
+    // Discovery waits out its retry on the production clock, which arms the global timers, so the mock replaces them before discovery starts and the row crosses
+    // the retry interval in virtual time rather than waiting it out.
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    emit(DID_FINISH_LAUNCHING);
+    await settleUntil(() => failures().length === 1, { description: "the first unreadable list's report" });
+
+    t.mock.timers.tick(HYDRAWISE_API_RETRY_INTERVAL * 1000);
+    await settleUntil(() => failures().length === 2, { description: "the repeat's report" });
+
+    assert.deepEqual(failures().map(entry => entry.level), [ "error", "warn" ], "the first unreadable list is reported at error and its repeat at debug");
+    assert.ok(failures().every(entry => !stripVTControlCharacters(formatLogEntry(entry)).includes("\n    at ")), "and neither report carries a stack frame");
   });
 
   test("aborts the shutdown signal when Homebridge shuts down", async () => {

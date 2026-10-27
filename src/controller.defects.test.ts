@@ -1,21 +1,25 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
  * controller.defects.test.ts: Characterization assertions for the HydrawiseController polling loop that fix current behavior with a distinguishing input,
- * including the preserved defects labeled with their bug-ledger numbers. Also covers the all-suspended versus rain-stopped program-mode distinction and the
- * getStatus-failure backoff arms.
+ * including the preserved defects labeled with their bug-ledger numbers. Also covers the all-suspended versus rain-stopped program-mode distinction, the
+ * getStatus-failure backoff arms, the nextpoll range the status shape check admits, and the report a refused poll body is given, once at error and each repeat
+ * at debug.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
 /* eslint-disable camelcase */
 import { Characteristic, Service, buildController, makeV2Facts, makeZoneV2Facts } from "./testing/platform.helpers.ts";
-import { HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL } from "./settings.ts";
+import { HYDRAWISE_API_JITTER, HYDRAWISE_API_NEXTPOLL_MAX, HYDRAWISE_API_RETRY_INTERVAL } from "./settings.ts";
 import type { HydrawiseControllerV2Facts, HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
-import { TestClock, advanceThroughSchedule, assertNoUnhandledRejections, expectAt, loggedAt, triggerSet, waitUntil } from "homebridge-plugin-utils/testing";
+import { TestClock, advanceThroughSchedule, assertNoUnhandledRejections, expectAt, formatLogEntry, loggedAt, present, triggerSet,
+  waitUntil } from "homebridge-plugin-utils/testing";
 import { allSuspended, fastPolling, makeStatusSchedule, makeZone, rainStopped } from "./api.helpers.ts";
 import { bareSensors, sentinelZoneMatrix } from "./api.fixtures.ts";
 import { describe, test } from "node:test";
 import type { BuildControllerResult } from "./testing/platform.helpers.ts";
+import type { TestLogEntry } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
+import { stripVTControlCharacters } from "node:util";
 
 // Compose a fast-cadence single-zone schedule.
 function schedule(zones: HydrawiseZoneConfig[], sensors: StatusScheduleResponse["sensors"] = bareSensors): StatusScheduleResponse {
@@ -157,6 +161,142 @@ describe("HydrawiseController updateState defect assertions", () => {
       assert.ok(h.retrieve.callsTo("statusschedule.php").length >= 3, "poll 1, the mis-shaped attempt, and the recovering retry all precede the second publish");
       assert.ok(loggedAt(h.entries, "error", "Unable to retrieve the current status"), "a mis-shaped body should log the failure");
     });
+  });
+
+  /* Each nextpoll the shape check refuses, as the body of a poll that is otherwise well formed. The refused body repeats the first poll's relays, so a loop that
+   * adopted it would republish the first poll's status as its next publish, ahead of any recovering retry, which is the stale republish each row tells apart
+   * from the retry. An overflowing JSON literal is what parses to an infinity; NaN reaches the check from no JSON body at all, so its row stands for the range
+   * comparison alone.
+   */
+  const refusedNextpolls: { name: string; nextpoll: unknown }[] = [
+
+    { name: "below zero", nextpoll: -1 },
+    { name: "past the ceiling", nextpoll: HYDRAWISE_API_NEXTPOLL_MAX + 1 },
+    { name: "an infinity", nextpoll: Infinity },
+    { name: "NaN", nextpoll: NaN },
+    { name: "null", nextpoll: null }
+  ];
+
+  for(const { name, nextpoll } of refusedNextpolls) {
+
+    test("a poll body whose nextpoll is " + name + " fails the shape check, so the loop retries rather than republishing the stale status", async (t) => {
+
+      await assertNoUnhandledRejections(async () => {
+
+        const h = buildController({ mqtt: true, program: (recorder) => {
+
+          recorder.program("statusschedule.php", { body: schedule([runningZone()]), kind: "response" });
+          recorder.program("statusschedule.php", { body: { ...schedule([runningZone()]), nextpoll }, kind: "response" });
+          recorder.programDefault("statusschedule.php", { body: schedule([scheduledZone()]), kind: "response" });
+        }, signalAborted: false });
+
+        t.after(() => h.abort());
+
+        const mqtt = present(h.mqtt, "the MQTT recorder");
+
+        await waitUntil(() => mqtt.publishedTo("controller").length >= 2, { description: "the second MQTT publish" });
+
+        assert.notEqual(mqtt.publishedTo("controller")[1]?.payload, expectAt(mqtt.publishedTo("controller"), 0, "MQTT publish").payload,
+          "the refused poll retries; the second publish is the recovered status, not the stale prior poll");
+        assert.ok(h.retrieve.callsTo("statusschedule.php").length >= 3, "poll 1, the refused attempt, and the recovering retry all precede the second publish");
+        assert.ok(loggedAt(h.entries, "error", "Unable to retrieve the current status"), "a refused nextpoll should log the failure");
+      });
+    });
+  }
+
+  // Each edge of the range the shape check admits, as the body of the first poll. Every poll after it answers nothing, so the one publish a row waits for can
+  // only come from the body at the edge being adopted.
+  const admittedNextpolls: { name: string; nextpoll: number }[] = [
+
+    { name: "zero", nextpoll: 0 },
+    { name: "the ceiling", nextpoll: HYDRAWISE_API_NEXTPOLL_MAX }
+  ];
+
+  for(const { name, nextpoll } of admittedNextpolls) {
+
+    test("a poll body whose nextpoll is " + name + " passes the shape check and is adopted", async (t) => {
+
+      const h = buildController({ mqtt: true, program: (recorder) => {
+
+        recorder.program("statusschedule.php", { body: { ...schedule([scheduledZone()]), nextpoll }, kind: "response" });
+        recorder.programDefault("statusschedule.php", { kind: "null" });
+      }, signalAborted: false });
+
+      t.after(() => h.abort());
+
+      const mqtt = present(h.mqtt, "the MQTT recorder");
+
+      await waitUntil(() => mqtt.publishedTo("controller").length >= 1, { description: "the first MQTT publish" });
+
+      assert.ok(h.accessory.getServiceById(Service.Valve, "700001"), "the adopted body's zone is projected");
+      assert.ok(!loggedAt(h.entries, "error", "Unable to retrieve the current status"), "and the body at the edge logged no failure");
+    });
+  }
+
+  // The lines a refused poll body is reported on, at whatever level each went out. A request retrieve() could not answer is reported by retrieve() alone, so
+  // every line here is the controller's own report of a body it fetched.
+  function statusFailures(h: BuildControllerResult): TestLogEntry[] {
+
+    return h.entries.filter(entry => formatLogEntry(entry).includes("Unable to retrieve the current status"));
+  }
+
+  test("two unreadable poll bodies in a row are reported once at error and once at debug, each as one sentence", async (t) => {
+
+    const h = buildController({ program: (recorder) => {
+
+      recorder.program("statusschedule.php", { body: schedule([runningZone()]), kind: "response" });
+      recorder.program("statusschedule.php", { kind: "malformed" });
+      recorder.program("statusschedule.php", { kind: "malformed" });
+      recorder.programDefault("statusschedule.php", { body: schedule([scheduledZone()]), kind: "response" });
+    }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    // The recovering poll is the fourth fetch, so its start guarantees every refused attempt has settled and released its lines.
+    await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 4, { description: "the recovering poll", timeoutMs: 3000 });
+
+    assert.deepEqual(statusFailures(h).map(entry => entry.level), [ "error", "debug" ], "the first unreadable body is reported at error and its repeat at debug");
+
+    for(const entry of statusFailures(h)) {
+
+      assert.ok(!stripVTControlCharacters(formatLogEntry(entry)).includes("\n    at "), "a refused body's report carries no stack frame");
+      assert.ok(!formatLogEntry(entry).includes("\u001b["), "and no terminal escape");
+    }
+  });
+
+  test("an unreadable poll body and then a mis-shaped one are each reported at error, since the reason changed", async (t) => {
+
+    const h = buildController({ program: (recorder) => {
+
+      recorder.program("statusschedule.php", { body: schedule([runningZone()]), kind: "response" });
+      recorder.program("statusschedule.php", { kind: "malformed" });
+      recorder.program("statusschedule.php", { body: { nextpoll: 5, sensors: [] }, kind: "response" });
+      recorder.programDefault("statusschedule.php", { body: schedule([scheduledZone()]), kind: "response" });
+    }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 4, { description: "the recovering poll", timeoutMs: 3000 });
+
+    assert.deepEqual(statusFailures(h).map(entry => entry.level), [ "error", "error" ], "a mis-shaped body after an unreadable one is a new reason, reported in full");
+  });
+
+  test("an unreadable poll body, a good poll, and an unreadable body again are each reported at error, since the good poll ended the episode", async (t) => {
+
+    const h = buildController({ program: (recorder) => {
+
+      recorder.program("statusschedule.php", { body: schedule([runningZone()]), kind: "response" });
+      recorder.program("statusschedule.php", { kind: "malformed" });
+      recorder.program("statusschedule.php", { body: schedule([runningZone()]), kind: "response" });
+      recorder.program("statusschedule.php", { kind: "malformed" });
+      recorder.programDefault("statusschedule.php", { body: schedule([scheduledZone()]), kind: "response" });
+    }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 5, { description: "the recovering poll", timeoutMs: 3000 });
+
+    assert.deepEqual(statusFailures(h).map(entry => entry.level), [ "error", "error" ], "an adopted poll between unreadable bodies reports the later one in full");
   });
 
   test("all zones suspended aggregates to program-scheduled with the suspend switch on", async (t) => {
