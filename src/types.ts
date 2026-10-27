@@ -2,9 +2,9 @@
  *
  * types.ts: Interface and type definitions for Hydrawise.
  */
+import { resolveNameOverride, sameEntries, sanitizeName } from "homebridge-plugin-utils";
 import type { Nullable } from "homebridge-plugin-utils";
 import type { PlatformAccessory } from "homebridge";
-import { sameEntries } from "homebridge-plugin-utils";
 
 // HBHH reserved names.
 export const HydrawiseReservedNames = {
@@ -483,6 +483,73 @@ export function sameControllerIdentity(a: HydrawiseControllerIdentity, b: Hydraw
 export function sameZoneIdentity(a: HydrawiseZoneIdentity, b: HydrawiseZoneIdentity): boolean {
 
   return (a.relayId === b.relayId) && (a.relay === b.relay) && (a.name === b.name);
+}
+
+/* The words a controller and a zone are named by where HomeKit can carry nothing of any name they could take. HomeKit refuses an accessory minted under a name
+ * its naming rules empty, so a controller or zone Hydrawise names in emoji or punctuation alone would fail its mint, and its kind is the one thing the plugin can
+ * always call it. A zone's word is followed by its relay number, so the zones of one controller that take it stay told apart.
+ */
+export const HYDRAWISE_CONTROLLER_FALLBACK_NAME = "Controller";
+export const HYDRAWISE_ZONE_FALLBACK_NAME = "Zone";
+
+// Where a composed name came from: the kind's word, the user's Name option, or the name Hydrawise reports. A reader asking whether the kind's word applies reads
+// this tag rather than comparing the name with the word, because a controller or zone its owner named "Controller" or "Zone 3" carries the word on its own.
+export type HydrawiseNameSource = "fallback" | "override" | "reported";
+
+// A composed name and the source it came from.
+export interface HydrawiseComposedName {
+
+  readonly name: string;
+  readonly source: HydrawiseNameSource;
+}
+
+/* The rule every composer below shares, short of the kind's word: the user's Name option where HomeKit can carry it, through HBPU's override resolution, then the
+ * reported name where HomeKit can carry that, and null where it can carry neither, which is the caller's cue to answer its kind's word. The name answered is the
+ * chosen text as it stands, unsanitized, because every HomeKit write sanitizes the name it applies.
+ */
+function chooseName(override: Nullable<string> | undefined, reported: string): Nullable<HydrawiseComposedName> {
+
+  const resolved = resolveNameOverride(override);
+
+  if(resolved !== null) {
+
+    return { name: resolved, source: "override" };
+  }
+
+  return sanitizeName(reported).length ? { name: reported, source: "reported" } : null;
+}
+
+/**
+ * The name a controller carries in HomeKit: the user's Name option where HomeKit can carry it, the name reported for the controller where HomeKit can carry that,
+ * and the controller word otherwise, so every name it answers is one HomeKit accepts. Every site that names a controller, the mint, its services' creation and the
+ * rename pass, composes through here, and the settings page mirrors it in its own naming module.
+ *
+ * @param options          - The controller's names.
+ * @param options.override - The raw value of the controller's Name option, as the option engine answers it.
+ * @param options.reported - The name the controller is known by: Hydrawise's own, or the name HomeKit already carries for it.
+ *
+ * @returns The composed name and the source it came from.
+ */
+export function controllerDisplayName({ override, reported }: { override?: Nullable<string>; reported: string }): HydrawiseComposedName {
+
+  return chooseName(override, reported) ?? { name: HYDRAWISE_CONTROLLER_FALLBACK_NAME, source: "fallback" };
+}
+
+/**
+ * The name a zone carries in HomeKit, on the terms {@link controllerDisplayName} states, the zone word followed by its relay number answering where HomeKit can
+ * carry nothing of the Name option or the reported name. Every site that names a zone, its standalone accessory, its valve and its companion switch, composes
+ * through here.
+ *
+ * @param options          - The zone's names.
+ * @param options.override - The raw value of the zone's Name option, as the option engine answers it.
+ * @param options.relay    - The zone's relay number, the one the controller itself displays.
+ * @param options.reported - The name the zone is known by.
+ *
+ * @returns The composed name and the source it came from.
+ */
+export function zoneDisplayName({ override, relay, reported }: { override?: Nullable<string>; relay: number; reported: string }): HydrawiseComposedName {
+
+  return chooseName(override, reported) ?? { name: HYDRAWISE_ZONE_FALLBACK_NAME + " " + relay.toString(), source: "fallback" };
 }
 
 /* The persisted schedule state of a single irrigation zone, as a discriminated union on `state`: each arm carries exactly the facts that exist in that state, so a

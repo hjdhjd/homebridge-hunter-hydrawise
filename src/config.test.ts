@@ -2,17 +2,18 @@
  *
  * config.test.ts: The webUI's pure platform-configuration interpreters, exercised against the REAL feature-option engine and the REAL option catalog
  * so the pins bind to the same grammar the plugin's runtime resolves against. Covers the effective-key precedence, every arm of the legacy-settings migration -
- * what migrates, what deletes without migrating, and what declines entirely - the first-run write, the degraded-mode interpreter, and a round trip proving a
- * migrated configuration runs the platform on the same effective values the legacy one did.
+ * what migrates, what deletes without migrating, and what declines entirely - the first-run write, the degraded-mode interpreter, a round trip proving a
+ * migrated configuration runs the platform on the same effective values the legacy one did, and the page's naming rule held to the runtime's composers.
  *
  * One discipline binds every claim about a deleted property: a patch carries a deletion as a PRESENT key whose value is undefined, and carries a non-deletion by
  * omitting the key. An equality read cannot tell those apart, and the session's shallow-merge commit treats them oppositely, so presence is asserted with
  * Object.hasOwn and absence with its negation - never with a comparison against undefined.
  */
-import { API_KEY_LENGTH, makeHydrawiseConfig, makeLegacyHydrawiseConfig } from "../homebridge-ui/public/hydrawise-config.mjs";
+import { API_KEY_LENGTH, makeHydrawiseConfig, makeHydrawiseNames, makeLegacyHydrawiseConfig } from "../homebridge-ui/public/hydrawise-config.mjs";
+import { FeatureOptions, displayedName, sanitizeName } from "homebridge-plugin-utils";
+import { controllerDisplayName, zoneDisplayName } from "./types.ts";
 import { describe, test } from "node:test";
 import { featureOptionCategories, featureOptions } from "./options.ts";
-import { FeatureOptions } from "homebridge-plugin-utils";
 import assert from "node:assert/strict";
 import { buildPlatform } from "./testing/platform.helpers.ts";
 
@@ -516,6 +517,38 @@ describe("hydrawise webUI retired-option rename migration", () => {
 
       assert.equal(config.migrate({ options: [ "Enable." + key, "Disable." + key + "." + SERIAL ] }), null,
         "an entry addressing the current option " + key + " is never rewritten");
+    }
+  });
+});
+
+describe("hydrawise webUI names", () => {
+
+  // The page's naming rule, built the way the webUI builds it, over HBPU's own naming functions.
+  const names = makeHydrawiseNames({ displayedName, sanitizeName });
+
+  test("the page names every controller and zone as the runtime's composers name it in HomeKit", () => {
+
+    /* The parity row. The page's naming module is import-free and carries its own copies of the kind's words, so this holds its answer to the runtime's composers,
+     * sanitized as every HomeKit write sanitizes them, over every source a name can come from. The table carries a Name that sanitizing rewrites, so a page that
+     * showed a name unsanitized fails it, reported names HomeKit can carry nothing of, so a page that named them by another word or dropped a zone's number fails
+     * it, reported names that are the kind's word, which read as themselves, and more than one relay, so a zone's number cannot come from anywhere but its own.
+     */
+    const overrides = [ undefined, null, "   ", "\u{1F331}\u{1F331}", "Front/Back Lawn", "\u{1F331} Front Lawn", "Garden Controller" ];
+
+    for(const relay of [ 1, 3 ]) {
+
+      for(const reported of [ "\u{1F331}", "***", "Side Yard", "Controller", "Zone " + relay.toString() ]) {
+
+        for(const override of overrides) {
+
+          const label = "the Name " + JSON.stringify(override) + " over the reported name " + JSON.stringify(reported);
+
+          assert.equal(names.controllerName({ override, reported }), sanitizeName(controllerDisplayName({ override, reported }).name),
+            "a controller with " + label + " reads as HomeKit carries it");
+          assert.equal(names.zoneName({ override, relay, reported }), sanitizeName(zoneDisplayName({ override, relay, reported }).name),
+            "a zone at relay " + relay.toString() + " with " + label + " reads as HomeKit carries it");
+        }
+      }
     }
   });
 });

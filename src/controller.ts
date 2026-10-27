@@ -6,16 +6,16 @@ import type { API, CharacteristicValue, HAP, Service } from "homebridge";
 import { HAP_DEFAULT_MODEL, HAP_DURATION_CEILING, HOMEBRIDGE_UNKNOWN_FIRMWARE, HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER,
   HYDRAWISE_API_NEXTPOLL_MAX, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_POLL_LOSS_THRESHOLD, HYDRAWISE_REVERT_DELAY,
   HYDRAWISE_SUSPEND_DURATION, HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
-import { HYDRAWISE_UNSCHEDULED_SENTINEL, HydrawiseReservedNames, controllerIdentity, isControllerIdentity, isScheduleStatus, isSuspendZoneSubtype,
-  isZoneIdentity, isZoneStoppedBySensor, sameControllerIdentity, sameScheduleStatus, sameZoneIdentity, scheduleStatus, suspendZoneSubtype,
-  zoneIdentity, zoneScheduleStatus } from "./types.ts";
+import { HYDRAWISE_UNSCHEDULED_SENTINEL, HydrawiseReservedNames, controllerDisplayName, controllerIdentity, isControllerIdentity, isScheduleStatus,
+  isSuspendZoneSubtype, isZoneIdentity, isZoneStoppedBySensor, sameControllerIdentity, sameScheduleStatus, sameZoneIdentity, scheduleStatus, suspendZoneSubtype,
+  zoneDisplayName, zoneIdentity, zoneScheduleStatus } from "./types.ts";
 import type { HomebridgePluginLogging, MqttAvailabilityPayload, Nullable, RepeatDemotedLog } from "homebridge-plugin-utils";
-import type { HydrawiseAccessory, HydrawiseControllerAccessory, HydrawiseControllerConfig, HydrawiseControllerHardware, HydrawiseControllerIdentity,
-  HydrawiseControllerV2Facts, HydrawiseScheduleStatus, HydrawiseZoneConfig, HydrawiseZoneIdentity, HydrawiseZoneScheduleStatus, HydrawiseZoneSuspensionResult,
-  SetZoneResponse, StatusScheduleResponse } from "./types.ts";
+import type { HydrawiseAccessory, HydrawiseComposedName, HydrawiseControllerAccessory, HydrawiseControllerConfig, HydrawiseControllerHardware,
+  HydrawiseControllerIdentity, HydrawiseControllerV2Facts, HydrawiseScheduleStatus, HydrawiseZoneConfig, HydrawiseZoneIdentity, HydrawiseZoneScheduleStatus,
+  HydrawiseZoneSuspensionResult, SetZoneResponse, StatusScheduleResponse } from "./types.ts";
 import type { HydrawiseControllerOption, HydrawiseControllerValueOption, HydrawiseZoneOption, HydrawiseZoneValueOption } from "./options.ts";
 import { MQTT_AVAILABILITY_OFFLINE, MQTT_AVAILABILITY_ONLINE, acquireService, formatErrorMessage, getServiceName, loopFaultReporter, mqttTopic, notResponding,
-  prefixedLog, presenceChanged, repeatDemotedLog, retry, sameEntries, sanitizeName, setAccessoryName, setServiceName, superviseLoop, validCharacteristic,
+  prefixedLog, presenceChanged, repeatDemotedLog, retry, sameEntries, setAccessoryName, setServiceName, superviseLoop, validCharacteristic,
   validService } from "homebridge-plugin-utils";
 import type { Dispatcher } from "undici";
 import type { HydrawisePlatform } from "./platform.ts";
@@ -52,6 +52,9 @@ type HydrawiseStatusOutcome = { status: "adopted" } | { error: unknown; status: 
  * consecutive failed polls, or when the loop itself has ended; a lost controller keeps polling, and its next good poll makes it reachable again.
  */
 type HydrawiseContact = "lost" | "pending" | "reachable";
+
+// One tile a controller names in HomeKit, as its fallback warning tracks it: the controller itself, or one of its zones by relay id.
+type HydrawiseNameTile = "controller" | number;
 
 // Per-zone state we track across polling cycles so we can detect and report start, stop, rain-sensor, and suspension transitions.
 interface HydrawiseZoneHints {
@@ -239,6 +242,14 @@ export class HydrawiseController {
   private readonly controllerTopic: string;
 
   private enabledZones: HydrawiseZoneConfig[];
+
+  /* The tiles this run has warned about for being named by their kind's word, so each warning is said once while the word applies. A pass that decides a tile
+   * adds it when the composer answers the word and removes it when the composer answers anything else, and the walk drops a zone the poll's enabled projection
+   * leaves out, so a tile that leaves the word, or the wire, and returns to it is warned about again. It lives in memory and dies with the process, so a restart
+   * warns once more for every tile its first deciding pass still names by the word.
+   */
+  private readonly fallbackWarned = new Set<HydrawiseNameTile>();
+
   private readonly hap: HAP;
   private readonly hints: HydrawiseHints;
 
@@ -841,9 +852,9 @@ export class HydrawiseController {
     return facts?.name ?? this.carriedName(this.accessory.context.controller?.name, this.controller.name) ?? this.controller.name;
   }
 
-  /* Bring every name this controller shows in HomeKit into line with its effective name - the user's Name option when set, otherwise the name resolved above.
-   * One cadence carries every rename this plugin performs: this runs on the poll, exactly where the zone walk applies its own, so a controller and its zones
-   * adopt a Hydrawise-side rename together rather than one of them lagging a refresh behind.
+  /* Bring every name this controller shows in HomeKit into line with its effective name - the controller composer's answer over the user's Name option and the
+   * name resolved above, which is always one HomeKit can carry. One cadence carries every rename this plugin performs: this runs on the poll, exactly where the
+   * zone walk applies its own, so a controller and its zones adopt a Hydrawise-side rename together rather than one of them lagging a refresh behind.
    *
    * Each surface compares itself. The irrigation system service, the service label enumerating its zones, the accessory's own display pair and information
    * service, and the suspend-all switch are each handed their name through HBPU's name helpers, which sanitize it, write only what differs, and answer whether
@@ -852,27 +863,22 @@ export class HydrawiseController {
    * controller name - is brought back into line on its own terms. Any write marks the accessory for the save window, because the accessory's display name and
    * its services' names live in Homebridge's cache, and a rename that never reached it would come back under its old label at the next restart.
    *
-   * A name with nothing left after sanitization skips every write this step performs, at every surface it touches. The helpers refuse an empty name themselves,
-   * but the suspend-all switch's composed name keeps its bare suffix through sanitizing, so without this gate an unusable name would relabel the switch with a
-   * name that names no controller at all.
+   * A pass past the name gate is one of the passes that decide the controller's fallback warning, so a controller this pass names by its kind's word is warned
+   * about once while the word applies.
    *
    * @param facts - The account-credentialed facts this pass resolved, or null when there are none to trust.
    */
   private applyControllerName(facts: Nullable<HydrawiseControllerFactsSnapshot>): void {
 
     const irrigationService = this.accessory.getService(this.hap.Service.IrrigationSystem);
+    const composed = controllerDisplayName({ override: this.controllerNameOverride("Device.Name"), reported: this.controllerName(facts) });
 
-    /* With synchronization disabled the names are established at creation and never touched again - the zone contract at the controller grain. A rename made in
-     * the Home app then stands, and the Name option remains the sanctioned way to correct what Hydrawise reports.
+    /* A Name option the user set applies on every pass, whatever synchronization says, so a rename made in the Home app yields to it - the family's naming rule,
+     * the same at the zone grain. A Name counts as set only where HomeKit can carry it, which is the composer's override source. With none, synchronization
+     * decides: enabled, the name Hydrawise reports is kept current; disabled, each name is set once when its service is created and never touched again, so a
+     * rename made in the Home app stands.
      */
-    if(!irrigationService || !this.hasFeature("Device.SyncName")) {
-
-      return;
-    }
-
-    const effectiveName = this.controllerNameOverride("Device.Name") ?? this.controllerName(facts);
-
-    if(!sanitizeName(effectiveName).length) {
+    if(!irrigationService || ((composed.source !== "override") && !this.hasFeature("Device.SyncName"))) {
 
       return;
     }
@@ -881,12 +887,47 @@ export class HydrawiseController {
     // each is handed the name it was created from.
     const labelService = this.accessory.getService(this.hap.Service.ServiceLabel);
     const suspendService = this.accessory.getServiceById(this.hap.Service.Switch, HydrawiseReservedNames.SWITCH_SUSPEND_ALL);
-    const writes = [ setServiceName(irrigationService, effectiveName), (labelService !== undefined) && setServiceName(labelService, effectiveName),
-      setAccessoryName(this.accessory, effectiveName), (suspendService !== undefined) && setServiceName(suspendService, effectiveName + " Suspend All Zones") ];
+    const writes = [ setServiceName(irrigationService, composed.name), (labelService !== undefined) && setServiceName(labelService, composed.name),
+      setAccessoryName(this.accessory, composed.name), (suspendService !== undefined) && setServiceName(suspendService, composed.name + " Suspend All Zones") ];
 
     if(writes.includes(true)) {
 
       this.platform.persistence.persist(this.accessory);
+    }
+
+    this.decideControllerFallback(composed);
+  }
+
+  /* Decide one tile's fallback warning from the name a deciding pass composed for it, answering whether this pass is the one that warns. The answer reads the
+   * composer's source rather than the name, because a tile its owner named "Controller" or "Zone 3" carries the word without the fallback having named it.
+   */
+  private decideFallbackWarning(tile: HydrawiseNameTile, composed: HydrawiseComposedName): boolean {
+
+    if(composed.source !== "fallback") {
+
+      this.fallbackWarned.delete(tile);
+
+      return false;
+    }
+
+    if(this.fallbackWarned.has(tile)) {
+
+      return false;
+    }
+
+    this.fallbackWarned.add(tile);
+
+    return true;
+  }
+
+  // Decide the controller's own fallback warning, from its services' creation or from a rename pass, and say it when this pass is the one that warns. The serial
+  // names the controller, since the name the log prefix carries is then the word itself.
+  private decideControllerFallback(composed: HydrawiseComposedName): void {
+
+    if(this.decideFallbackWarning("controller", composed)) {
+
+      this.log.warn("HomeKit cannot use the name of this controller (serial: %s), so HomeKit shows it as %s. Set a Name for it in the plugin's settings, using " +
+        "letters or numbers, to choose another.", this.controller.serial_number, composed.name);
     }
   }
 
@@ -1058,20 +1099,26 @@ export class HydrawiseController {
 
   /* Configure the irrigation system service for HomeKit.
    *
-   * Creation consults the user's Name option, which is what makes a synchronization opt-out mean the same thing at both grains: the name is established from the
-   * configured truth and never touched again. Without the consult a fresh accessory on an opted-out install would be born under the wire's name and stay there,
-   * with the option the user set to correct it unreachable for the life of that accessory.
+   * Creation consults the user's Name option through the controller composer, so a fresh service is born under the configured truth rather than renamed to it a
+   * poll later, on an opted-out install as on any other; the rename step then holds a set Name on every pass, whatever synchronization says. Creating the service
+   * is one of the passes that decide the controller's fallback warning, so a controller created under its kind's word is warned about at once, an opted-out
+   * install, whose rename step decides nothing, included.
    */
   private configureIrrigationSystem(): void {
 
-    const creationName = this.controllerNameOverride("Device.Name") ?? this.name;
+    const composed = controllerDisplayName({ override: this.controllerNameOverride("Device.Name"), reported: this.name });
 
     // Acquire the service and if needed, add a service label service in order to be able to properly enumerate and name the individual zone valves. Both are
     // created carrying the same name, which is the pairing the rename step relies on when it brings the label along with the service it sits beside.
-    const { service } = acquireService({ accessory: this.accessory, name: creationName,
-      onServiceCreate: () => acquireService({ accessory: this.accessory, name: creationName, serviceType: this.hap.Service.ServiceLabel }).service
+    const { service, transition } = acquireService({ accessory: this.accessory, name: composed.name,
+      onServiceCreate: () => acquireService({ accessory: this.accessory, name: composed.name, serviceType: this.hap.Service.ServiceLabel }).service
         .updateCharacteristic(this.hap.Characteristic.ServiceLabelNamespace, this.hap.Characteristic.ServiceLabelNamespace.ARABIC_NUMERALS),
       serviceType: this.hap.Service.IrrigationSystem });
+
+    if(transition === "attached") {
+
+      this.decideControllerFallback(composed);
+    }
 
     // Initialize the service.
     service.updateCharacteristic(this.hap.Characteristic.Active, this.hap.Characteristic.Active.ACTIVE);
@@ -1102,12 +1149,13 @@ export class HydrawiseController {
   private configureSuspendSwitches(): void {
 
     /* Reconcile the switch's presence with the user's setting in one call, which creates it when the setting wants it and removes it when the setting does not. A
-     * fresh switch composes its name from the controller's effective name - the user's Name option when set, otherwise whatever the accessory currently answers to
-     * - on exactly the terms the irrigation system service above is created, and a restored switch keeps the name it came back with, because the library leaves
-     * a kept service's name untouched.
+     * fresh switch composes its name from the controller composer's answer - the user's Name option where HomeKit can carry it, otherwise whatever the accessory
+     * currently answers to - on exactly the terms the irrigation system service above is created, and a restored switch keeps the name it came back with, because
+     * the library leaves a kept service's name untouched. The accessory's name is one HomeKit already carries, so this decides no fallback warning.
      */
-    const { service } = validService({ accessory: this.accessory, name: (this.controllerNameOverride("Device.Name") ?? this.accessoryName) + " Suspend All Zones",
-      serviceType: this.hap.Service.Switch, subtype: HydrawiseReservedNames.SWITCH_SUSPEND_ALL, validate: this.hints.suspendAll });
+    const switchName = controllerDisplayName({ override: this.controllerNameOverride("Device.Name"), reported: this.accessoryName }).name + " Suspend All Zones";
+    const { service } = validService({ accessory: this.accessory, name: switchName, serviceType: this.hap.Service.Switch,
+      subtype: HydrawiseReservedNames.SWITCH_SUSPEND_ALL, validate: this.hints.suspendAll });
 
     // A switch the setting removed, or never wanted, leaves nothing to configure.
     if(!service) {
@@ -1291,20 +1339,29 @@ export class HydrawiseController {
     // projection, and long-lived handlers read it through the instance field so they always act on the current poll's truth.
     this.enabledZones = status.relays.filter(zone => this.hasZoneFeature("Device", zone.relay_id.toString()));
 
-    /* Resolve each enabled zone's effective name once, ahead of everything that reads it. The rungs, in precedence order: the user's Name option when set, else
-     * the account API's own name for the zone, else the name the key-based wire reports.
+    /* Resolve each enabled zone's effective name once, ahead of everything that reads it, through the zone composer. The rungs, in precedence order: the user's
+     * Name option where HomeKit can carry it, else the account API's own name for the zone, else the name the key-based wire reports, and the zone's word with its
+     * relay number where HomeKit can carry nothing of the name those rungs settle on.
      *
-     * The middle rung is what makes an enriched install show whole names. The key-based API truncates at roughly fifteen characters, so a zone the account calls
+     * The account rung is what makes an enriched install show whole names. The key-based API truncates at roughly fifteen characters, so a zone the account calls
      * "Backyard Planters Drip" arrives here as "Backyard Plante"; the account read already fetches that zone, so carrying its name costs no call at all. It reads
      * through the same freshness chokepoint every other account fact does, which is what keeps the promise to an install without credentials: with no trustworthy
      * snapshot the rung contributes nothing and the wire name stands, exactly as it always has.
      *
-     * This is the ONE place a zone's displayed name is decided. Every consumer downstream - the valve's name, a standalone accessory's own display name, the
-     * persisted roster, the MQTT payload, the log labels - reads the map this builds, so a name arriving from the account is simply a rename, travelling the same
-     * path a rename made in the Hydrawise app already travels.
+     * This is the ONE place a zone's displayed name is decided. Everything this pass names the zone with in HomeKit - the valve, a standalone accessory's own
+     * display name, the companion suspension switch - reads the map this builds, so a name arriving from the account is simply a rename, travelling the same path a
+     * rename made in the Hydrawise app already travels. What the zone IS - the persisted roster and the MQTT payload - reads zoneName above rather than this map,
+     * and the log labels read the name the valve carries. The Name option is read here once per zone, and the composer's source says whether it counts as set,
+     * because a set Name is what holds the zone's name gate in the walk below whatever synchronization says.
      */
-    const effectiveNames = new Map(this.enabledZones.map(zone => [ zone.relay_id,
-      this.zoneNameOverride("Device.Name", zone.relay_id.toString()) ?? this.zoneName(zone, facts) ]));
+    const composeZoneName = (zone: HydrawiseZoneConfig): HydrawiseComposedName => {
+
+      const override = this.zoneNameOverride("Device.Name", zone.relay_id.toString());
+
+      return zoneDisplayName({ override, relay: zone.relay, reported: this.zoneName(zone, facts) });
+    };
+
+    const zoneNames = new Map(this.enabledZones.map((zone): [ number, HydrawiseComposedName ] => [ zone.relay_id, composeZoneName(zone) ]));
 
     // The enabled zones the user has asked to expose as HomeKit accessories of their own.
     const standaloneZones = this.enabledZones.filter(zone => this.hasZoneFeature("Device.Standalone", zone.relay_id.toString()));
@@ -1312,15 +1369,27 @@ export class HydrawiseController {
     /* Hand the platform this poll's standalone request and take back the hosting map, which every hosting decision below reads so the prune and the walk cannot
      * disagree. The present-relay set carries EVERY zone the report named, before the enablement filter above, because that pre-filter population is what lets
      * the platform tell a configuration change from a zone that fell off the wire. The wire name goes into the identity while the effective name goes into the
-     * display name: the accessory's label and its persisted identity are different jobs.
+     * display name: the accessory's label and its persisted identity are different jobs. Composing where the map holds no entry keeps the read total.
      */
     const zoneAccessories = this.platform.reconcileZoneAccessories({ controller: this.controller,
       presentRelayIds: new Set(status.relays.map(zone => zone.relay_id)),
-      zones: standaloneZones.map(zone => ({ displayName: effectiveNames.get(zone.relay_id) ?? zone.name, identity: zoneIdentity(zone) })) });
+      zones: standaloneZones.map(zone => ({ displayName: (zoneNames.get(zone.relay_id) ?? composeZoneName(zone)).name, identity: zoneIdentity(zone) })) });
 
-    // Project one live-id set from the enabled zones - reported by the API and enabled by feature option - and drive the hint prune from it, so a zone that
-    // vanishes and later reappears starts fresh instead of resurrecting its old manual and rain-stopped flags.
-    this.zoneHints.prune(new Set(this.enabledZones.map(zone => zone.relay_id)));
+    /* Project one live-id set from the enabled zones - reported by the API and enabled by feature option - and drive each prune from it: the hint prune, so a
+     * zone that vanishes and later reappears starts fresh instead of resurrecting its old manual and rain-stopped flags, and the fallback warning's, so such a zone
+     * is warned about again if it returns under its kind's word.
+     */
+    const liveRelayIds = new Set(this.enabledZones.map(zone => zone.relay_id));
+
+    this.zoneHints.prune(liveRelayIds);
+
+    for(const tile of this.fallbackWarned) {
+
+      if((tile !== "controller") && !liveRelayIds.has(tile)) {
+
+        this.fallbackWarned.delete(tile);
+      }
+    }
 
     /* Remove the controller accessory's valves for zones that no longer exist, that the user has disabled, or that live on a standalone accessory of their own.
      * The keep-set is derived from the hosting map rather than from the enablement projection, so pruning and hosting read one source of truth: a promoted zone's
@@ -1352,16 +1421,12 @@ export class HydrawiseController {
     // Discover any new zones and update our zone state.
     for(const zone of this.enabledZones) {
 
-      /* The name this zone's valve carries, read from the pre-pass above. The fallback is the same wire name that pre-pass would itself have stored, which keeps
-       * the read total.
-       *
-       * The sanitized form is resolved once beside it, and every rename gate below requires it to be non-empty. HomeKit's naming rules can empty a name outright,
-       * and while HBPU's name helpers refuse an empty name themselves, the companion switch's composed name keeps its bare suffix through sanitizing, so the gate
-       * is what makes a zone whose effective name sanitizes to nothing rename nothing at all - not its valve, not the accessory hosting it, not its companion
-       * switch - and keep the labels it already carries.
+      /* The name this zone's valve carries, read from the pre-pass above, and composing where the map holds no entry keeps the read total. The composer answers
+       * the zone's word where HomeKit can carry nothing of the chosen name, so the name is always one HomeKit can carry, and the valve, the accessory hosting it and
+       * its companion switch all take it.
        */
-      const effectiveName = effectiveNames.get(zone.relay_id) ?? zone.name;
-      const sanitizedName = sanitizeName(effectiveName);
+      const composed = zoneNames.get(zone.relay_id) ?? composeZoneName(zone);
+      const effectiveName = composed.name;
 
       // Where this zone's valve lives: the standalone accessory the reconcile established for it, or the controller accessory. One derived answer, read by every
       // decision below that depends on which it is.
@@ -1370,9 +1435,10 @@ export class HydrawiseController {
 
       this.zoneHosts.set(zone.relay_id, host);
 
-      // Whether this zone's names track the configured truth. Resolved once per zone, because the valve service and the standalone accessory answer to the same
-      // gate at the same cadence.
-      const syncName = this.hasZoneFeature("Device.SyncName", zone.relay_id.toString());
+      // Whether this zone's names are brought into line with its effective name this pass: always where a Name option HomeKit can carry is set, and otherwise
+      // wherever synchronization holds. Resolved once per zone, because the valve, its companion switch and a standalone host answer to the same gate at the same
+      // cadence.
+      const tracksName = (composed.source === "override") || this.hasZoneFeature("Device.SyncName", zone.relay_id.toString());
 
       // Acquire the valve service. The transition the library answers says whether this pass created it, which is what the rename gate below reads.
       const { service: valveService, transition } = acquireService({ accessory: host, name: effectiveName, onServiceCreate: (newService: Service): void => {
@@ -1401,15 +1467,23 @@ export class HydrawiseController {
       // for every valve on the first poll, and for a cached standalone valve a later poll hosts for the first time.
       const unbound = !this.bound.has(valveService);
 
-      // While name synchronization holds for this zone, the effective name - the user's Name option when set, otherwise the name Hydrawise reports - is
-      // authoritative: it is applied whenever the service's name differs, so a Hydrawise rename lands on the next poll, a changed Name option lands at the
-      // first poll after restart, and a rename made in the Home app yields to the configured truth. Synchronization is deliberately enabled by default,
-      // because the names Hydrawise reports are the source of truth this integration projects into HomeKit and the Name option exists to correct them where
-      // Hydrawise truncates. With synchronization disabled, names are established at creation and never touched again, and a Home app rename persists. The
-      // name helper compares before it writes and answers whether it wrote, and a write marks the host for the save window.
-      if((transition !== "attached") && syncName && sanitizedName.length && setServiceName(valveService, effectiveName)) {
+      // While this zone's name gate holds, the effective name - the user's Name option when set, otherwise the name Hydrawise reports - is authoritative: it
+      // is applied whenever the service's name differs, so a Hydrawise rename lands on the next poll, a changed Name option lands at the first poll after restart,
+      // and a rename made in the Home app yields to the configured truth. A set Name option always holds the gate. Without one, synchronization decides, and it
+      // is deliberately enabled by default, because the names Hydrawise reports are the source of truth this integration projects into HomeKit and the Name
+      // option exists to correct them where Hydrawise truncates; with synchronization disabled, a name is set once when its service is created, and a Home app
+      // rename stands. The name helper compares before it writes and answers whether it wrote, and a write marks the host for the save window.
+      if((transition !== "attached") && tracksName && setServiceName(valveService, effectiveName)) {
 
         this.platform.persistence.persist(host);
+      }
+
+      // The passes that decide this zone's fallback warning: the one that created its valve, and each one its name gate holds. The label is read after the rename
+      // above, so the line opens with the name this pass leaves the zone carrying, as every other line about the zone does.
+      if(((transition === "attached") || tracksName) && this.decideFallbackWarning(zone.relay_id, composed)) {
+
+        this.log.warn("%s: HomeKit cannot use this zone's name, so HomeKit shows it as %s. Set a Name for it in the plugin's settings, using letters or numbers, to " +
+          "choose another.", this.zoneLabel(zone, valveService), effectiveName);
       }
 
       // A standalone zone accessory carries its own information service, established the first time this process binds the zone's valve on it. The zone carries no
@@ -1426,7 +1500,7 @@ export class HydrawiseController {
        * deliberately: a rename arriving on a later poll must still land. The name helper compares every name the accessory carries before it writes, and a write
        * marks the host for the save window, which is what persists the new name to Homebridge's cache.
        */
-      if(isStandaloneHost && syncName && sanitizedName.length && setAccessoryName(host, effectiveName)) {
+      if(isStandaloneHost && tracksName && setAccessoryName(host, effectiveName)) {
 
         this.platform.persistence.persist(host);
       }
@@ -1453,7 +1527,7 @@ export class HydrawiseController {
       const hints = this.zoneHints.ensure(zone.relay_id, isStopped, state?.state === "suspended");
 
       // Establish this zone's companion suspension switch where the user asked for one, and record where it landed for the sweep below to judge against.
-      const suspendSubtype = this.configureZoneSuspendSwitch({ effectiveName, facts, host, sanitizedName, state, syncName, zone });
+      const suspendSubtype = this.configureZoneSuspendSwitch({ effectiveName, facts, host, state, tracksName, zone });
 
       if(suspendSubtype) {
 
@@ -1660,19 +1734,19 @@ export class HydrawiseController {
    * parameter at all and acts on the whole controller, so a switch built on it would render and resolve while doing something else entirely.
    *
    * @param options               - This zone's pass.
-   * @param options.effectiveName - The zone's effective display name, which the switch's own name is composed from.
+   * @param options.effectiveName - The zone's effective display name, always one HomeKit can carry, which the switch's own name is composed from.
    * @param options.facts         - The account-credentialed facts this pass resolved, or null when there are none to trust.
    * @param options.host          - The accessory hosting this zone's valve, and therefore its switch.
-   * @param options.sanitizedName - The zone's effective name in its sanitized form, which the rename gate compares and requires to be non-empty.
    * @param options.state         - The zone's classified schedule state, which the starting characteristic is written from.
-   * @param options.syncName      - Whether this zone's names track the configured truth.
+   * @param options.tracksName    - Whether this zone's names are brought into line this pass: always under a set Name option, otherwise where synchronization
+   *                                holds.
    * @param options.zone          - The wire zone.
    *
    * @returns The composed subtype of the switch this established, or null when the zone is to have none.
    */
-  private configureZoneSuspendSwitch({ effectiveName, facts, host, sanitizedName, state, syncName, zone }: { effectiveName: string;
-    facts: Nullable<HydrawiseControllerFactsSnapshot>; host: HydrawiseAccessory; sanitizedName: string; state: HydrawiseZoneScheduleStatus | undefined;
-    syncName: boolean; zone: HydrawiseZoneConfig; }): Nullable<string> {
+  private configureZoneSuspendSwitch({ effectiveName, facts, host, state, tracksName, zone }: { effectiveName: string;
+    facts: Nullable<HydrawiseControllerFactsSnapshot>; host: HydrawiseAccessory; state: HydrawiseZoneScheduleStatus | undefined; tracksName: boolean;
+    zone: HydrawiseZoneConfig; }): Nullable<string> {
 
     if(!this.platform.hasV2Client || !this.hasZoneFeature("Device.Suspend.Zone", zone.relay_id.toString())) {
 
@@ -1690,11 +1764,10 @@ export class HydrawiseController {
     }
 
     /* The switch's name tracks its zone's on every poll, under the gate the valve answers to, so a Hydrawise rename reaches the companion rather than stranding it
-     * under a name the zone no longer carries. The emptiness half of that gate is asked of the ZONE's own sanitized name rather than of the composed one: the
-     * composed name inherits its non-emptiness from the zone half, so a zone whose name sanitizes to nothing would otherwise rename its switch to the bare
-     * suffix - a label naming no zone at all. The name helper compares before it writes, and a write marks the host for the save window.
+     * under a name the zone no longer carries. The zone half is the composer's answer, which HomeKit can always carry, so the composed name always names the zone,
+     * the zone's word with its relay number where the composer answers it. The name helper compares before it writes, and a write marks the host for the save window.
      */
-    if((transition !== "attached") && syncName && sanitizedName.length && setServiceName(service, name)) {
+    if((transition !== "attached") && tracksName && setServiceName(service, name)) {
 
       this.platform.persistence.persist(host);
     }
@@ -2164,32 +2237,29 @@ export class HydrawiseController {
     return this.platform.featureOptions.test(option, zoneId, this.controller.serial_number);
   }
 
-  /* Utility for reading a zone-scoped value option. The zone id goes in the device position ALONE, and an unset, empty, or whitespace-only value normalizes to
-   * undefined so callers can default with ??.
+  /* Utility for reading a zone-scoped value option. The zone id goes in the device position ALONE, and the raw value is handed on as the engine answers it: the
+   * zone composer alone decides whether it counts, through HBPU's override resolution, which trims it and refuses one that is empty or that HomeKit cannot carry.
    *
    * Presenting exactly one id is the rule every value reader keeps, and here it is what makes a controller-level entry unreachable from a zone's read: the Name
    * option resolves at the controller as well as the zone, so a read that also presented the serial would answer a zone with its controller's name whenever the
    * zone had no entry of its own. A probe against the real engine records both polarities - the serial-bearing read resolves the controller's entry, the
    * serial-free read does not - and the pair is why the argument is absent rather than merely unused.
    */
-  private zoneNameOverride(option: HydrawiseZoneValueOption, zoneId: string): string | undefined {
+  private zoneNameOverride(option: HydrawiseZoneValueOption, zoneId: string): Nullable<string | undefined> {
 
-    const name = this.platform.featureOptions.value(option, zoneId)?.trim();
-
-    return name?.length ? name : undefined;
+    return this.platform.featureOptions.value(option, zoneId);
   }
 
-  // Utility for reading a controller-scoped value option, on the same single-id terms and with the same normalization. The serial goes in the device position,
-  // because the controller row writes its own entry there and the engine's storage keys are flat, so this is the read that resolves the row's own value.
-  private controllerNameOverride(option: HydrawiseControllerValueOption): string | undefined {
+  // Utility for reading a controller-scoped value option, on the same single-id terms, handing the raw value on to the controller composer. The serial goes in
+  // the device position, because the controller row writes its own entry there and the engine's storage keys are flat, so this is the read that resolves the
+  // row's own value.
+  private controllerNameOverride(option: HydrawiseControllerValueOption): Nullable<string | undefined> {
 
-    const name = this.platform.featureOptions.value(option, this.controller.serial_number)?.trim();
-
-    return name?.length ? name : undefined;
+    return this.platform.featureOptions.value(option, this.controller.serial_number);
   }
 
-  /* The label a zone's log lines carry: the configured name of its valve where one exists, the name Hydrawise reports otherwise, and the zone number the operator
-   * sees on the controller itself.
+  /* The label a zone's log lines carry: the name its valve carries where one exists, read through HBPU's name reader, which adds nothing to the service, the name
+   * Hydrawise reports otherwise, and the zone number the operator sees on the controller itself.
    *
    * Every cadence that narrates a zone composes through here, which is what makes their lines read identically. The poll walk already holds the valve service and
    * hands it over; the refresh tail holds only the wire zone, so it lets this look the service up on the controller's own accessory - a zone promoted onto a
@@ -2199,7 +2269,7 @@ export class HydrawiseController {
 
     const valve = service ?? this.accessory.getServiceById(this.hap.Service.Valve, zone.relay_id.toString());
 
-    return ((valve?.getCharacteristic(this.hap.Characteristic.ConfiguredName).value as string | undefined) ?? zone.name) + " [Zone " + zone.relay.toString() + "]";
+    return (getServiceName(valve) ?? zone.name) + " [Zone " + zone.relay.toString() + "]";
   }
 
   /* Whether the account reads as fully suspended, which is what drives the suspend-all switch's state. Answers in precedence, the account-grain twin of the
@@ -2286,7 +2356,8 @@ export class HydrawiseController {
     return name?.length ? name : this.controller.name;
   }
 
-  // Utility function to return the current accessory name of this device, read through the same name reader from the accessory information service.
+  // Utility function to return the current accessory name of this device, read through the same name reader from the accessory information service. The fallback
+  // answers the reader's type, which allows a service with no name, though HAP builds every accessory's information service carrying one.
   private get accessoryName(): string {
 
     return getServiceName(this.accessory.getService(this.hap.Service.AccessoryInformation)) ?? this.controller.name;

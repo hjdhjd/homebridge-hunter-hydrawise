@@ -1,7 +1,8 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
  * platform.configure.test.ts: Discovery and lifecycle behavior of the HydrawisePlatform, driven by firing the captured DID_FINISH_LAUNCHING handler to
- * run the private configureHydrawise against a MockAgent-backed wire. Covers the discovery happy path, the short-circuiting second pass and cached-accessory reuse,
+ * run the private configureHydrawise against a MockAgent-backed wire. Covers the discovery happy path, the controller word a fresh accessory is minted under where
+ * HomeKit can carry nothing of its name, the short-circuiting second pass and cached-accessory reuse,
  * orphan pruning, the bug-16 device gate in both directions, the no-API-key early return, the bug-2 debug routing, the MQTT construction arms, the discovery
  * retry failure paths and the report of a repeating one, the shutdown teardown and the retained offline each built controller states through the MQTT client's
  * end ahead of it, the refusal a restored accessory answers with until its controller vouches for it, and the retained offline the platform states for a
@@ -13,8 +14,8 @@
 import { Characteristic, Service, TestMqttClient, buildPlatform, dispatcherOf, installMockDispatcher, programJsonReply, programStatusReply, seedAccessory,
   v2DispatcherOf } from "./testing/platform.helpers.ts";
 import { HAPStatus, MQTT_DEFAULT_END_GRACE_MS, MqttClient, onAbort } from "homebridge-plugin-utils";
+import { HYDRAWISE_CONTROLLER_FALLBACK_NAME, HydrawiseReservedNames, suspendZoneSubtype, zoneAccessoryId } from "./types.ts";
 import type { Characteristic as HapCharacteristic, PlatformAccessory } from "homebridge";
-import { HydrawiseReservedNames, suspendZoneSubtype, zoneAccessoryId } from "./types.ts";
 import { describe, test } from "node:test";
 import { formatLogEntry, hapStatus, logCount, loggedAt, present, settle, settleUntil, triggerGet, triggerSet, waitUntil } from "homebridge-plugin-utils/testing";
 import { makeCustomerDetails, normalSchedule } from "./api.helpers.ts";
@@ -103,13 +104,37 @@ describe("HydrawisePlatform configure", () => {
     assert.equal(registered()[0]?.displayName, "Garden Controller", "a fresh accessory carries the name the user configured rather than the wire's");
   });
 
+  test("mints a controller whose name HomeKit cannot carry under the controller word, and goes on to configure every controller after it", async (t) => {
+
+    /* HomeKit refuses an accessory minted under a name its rules empty, and discovery configures the account's controllers in turn, so the mint composes the
+     * name through the controller composer: the controller Hydrawise names in emoji alone is minted under the word, and the controller listed after it is
+     * configured too, with nothing ending discovery early.
+     */
+    const second = { ...syntheticController, controller_id: 500002, name: "Second Controller", serial_number: "SN9Z8Y7X6W5" };
+    const { emit, entries, registered } = buildPlatform();
+
+    t.after(() => emit(SHUTDOWN));
+    await using dispatcher = installMockDispatcher();
+    programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails({ controllers: [ { ...syntheticController, name: "\u{1F331}\u{1F4A7}" },
+      second ] }));
+    programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
+
+    emit(DID_FINISH_LAUNCHING);
+    await waitUntil(() => registered().length >= 2, { description: "both controllers' accessory registrations" });
+
+    assert.deepEqual(registered().map((accessory) => accessory.displayName), [ HYDRAWISE_CONTROLLER_FALLBACK_NAME, "Second Controller" ],
+      "the controller HomeKit can carry no name for is minted under the word, and the next is minted under its own");
+    assert.equal(logCount(entries, "info", "Configuring irrigation controller"), 2, "discovery configures both");
+    assert.equal(logCount(entries, "error", "stopped unexpectedly"), 0, "and nothing ends it early");
+  });
+
   test("leaves a cached accessory's display name alone at discovery, whatever the Name option says", async (t) => {
 
-    /* Discovery establishes a name, it never corrects one. A cached accessory comes back under the name it was flushed with, and bringing it into line is the
-     * rename step's job on the poll cadence, under the synchronization gate the user controls.
+    /* Discovery establishes a name, it never corrects one. A cached accessory comes back under the name it was saved with, and bringing it into line is the
+     * rename step's job on the poll cadence, which holds a set Name whatever synchronization says.
      *
-     * Synchronization is turned OFF here so that gate can never fire, which leaves discovery's own behavior as the only thing the assertions can be reading.
-     * With it on, a poll landing mid-assertion could rename the accessory for an entirely legitimate reason and the assertion would be reading the clock.
+     * No status reply is programmed, so no poll lands and discovery's own behavior is the only thing the assertions can be reading. A poll landing mid-assertion
+     * would rename the accessory for an entirely legitimate reason, and the assertion would be reading the clock.
      */
     const { emit, platform, registered } = buildPlatform({ options: [ "Enable.Device.Name.SN0A1B2C3D4=Garden Controller",
       "Disable.Device.SyncName.SN0A1B2C3D4" ] });
@@ -119,7 +144,6 @@ describe("HydrawisePlatform configure", () => {
     const cached = seedAccessory(platform, "Test Controller", platform.hap.uuid.generate("500001"));
 
     programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
-    programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
     await waitUntil(() => cached.getService(Service.IrrigationSystem) !== undefined, { description: "the cached accessory's irrigation system to appear" });

@@ -15,7 +15,8 @@ import { HYDRAWISE_API_BASE_URL, HYDRAWISE_API_BUDGET_CALLS, HYDRAWISE_API_BUDGE
   HYDRAWISE_V2_MUTATION_BUDGET_CALLS, HYDRAWISE_V2_MUTATION_BUDGET_WINDOW, HYDRAWISE_V2_REFRESH_INTERVAL, HYDRAWISE_ZONE_ACCESSORY_CATEGORY,
   HYDRAWISE_ZONE_ACCESSORY_GRACE_POLLS, PLATFORM_NAME, PLUGIN_NAME } from "./settings.ts";
 import type { HydrawiseGlobalFlagOption, HydrawiseGlobalValueOption, HydrawiseOptions } from "./options.ts";
-import { controllerIdentity, isControllerIdentity, isZoneAccessoryContext, sameControllerIdentity, sameZoneIdentity, zoneAccessoryId } from "./types.ts";
+import { controllerDisplayName, controllerIdentity, isControllerIdentity, isZoneAccessoryContext, sameControllerIdentity, sameZoneIdentity,
+  zoneAccessoryId } from "./types.ts";
 import { featureOptionCategories, featureOptions } from "./options.ts";
 import { request, setGlobalDispatcher } from "undici";
 import type { Dispatcher } from "undici";
@@ -728,15 +729,17 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       return null;
     }
 
-    /* The name a FRESH accessory is created under: the user's Name option when they set one, and the name Hydrawise reports otherwise. A cached accessory keeps
-     * whatever display name it came back with, which is what keeps discovery from renaming a controller behind the synchronization opt-out's back.
+    /* The name a FRESH accessory is created under, the controller composer's answer: the user's Name option where HomeKit can carry it, the name Hydrawise reports
+     * where HomeKit can carry that, and the controller word otherwise, so the mint never meets HAP's refusal of an empty name and discovery goes on to every later
+     * controller. The mint says nothing about a fallback, because the controller's own services decide that warning once it is built. A cached accessory keeps
+     * whatever display name it came back with, because discovery leaves a cached name to the poll's rename step, where the naming rule decides: a set Name applies
+     * there, and with none, a synchronization opt-out keeps the user's name.
      *
      * The read presents the serial and nothing else, which is the single-id rule every runtime reader of this option keeps: the option resolves at the controller
      * and the zone alike, so a read carrying a second id would answer with something written for another scope.
      */
-    const nameOverride = this.featureOptions.value("Device.Name", controller.serial_number)?.trim();
-
-    accessory ??= this.addAccessory(sanitizeName(nameOverride?.length ? nameOverride : controller.name), uuid);
+    accessory ??= this.addAccessory(sanitizeName(controllerDisplayName({ override: this.featureOptions.value("Device.Name", controller.serial_number),
+      reported: controller.name }).name), uuid);
 
     this.log.info("Configuring irrigation controller: %s (serial: %s id: %s).", controller.name, controller.serial_number, controller.controller_id);
 

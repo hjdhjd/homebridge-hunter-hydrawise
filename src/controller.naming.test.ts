@@ -2,27 +2,28 @@
  *
  * controller.naming.test.ts: Zone and controller naming, and the synchronization behind both. Asserts the effective name a valve is created with (the user's Name
  * option when set, otherwise the name Hydrawise reports), the synchronization that keeps it current while SyncName holds, the exact-compare that keeps a matching
- * name from being rewritten on every poll, the creation-only behavior a SyncName opt-out restores, the same contract applied to the controller's own surfaces -
- * its irrigation system service, its accessory, and its suspend-all switch - and the scopes the framework enforces for the Name option at either grain.
+ * name from being rewritten on every poll, the set Name option that applies whatever SyncName says, the creation-only behavior a SyncName opt-out restores where no
+ * Name is set, the same contract applied to the controller's own surfaces - its irrigation system service, its accessory, and its suspend-all switch - the
+ * scopes the framework enforces for the Name option at either grain, and the kind's word a name HomeKit cannot carry falls back to, with the warning it draws.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
 import { Characteristic, Service, buildController, makeV2Facts, makeZoneV2Facts, seedEstablished, waitFor } from "./testing/platform.helpers.ts";
-import { FeatureOptions, acquireService, getServiceName, setAccessoryName } from "homebridge-plugin-utils";
+import { FeatureOptions, acquireService, getServiceName, setAccessoryName, setServiceName } from "homebridge-plugin-utils";
 import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
+import { HYDRAWISE_CONTROLLER_FALLBACK_NAME, HYDRAWISE_ZONE_FALLBACK_NAME, HydrawiseReservedNames, scheduleStatus } from "./types.ts";
 import type { Service as HapService, PlatformAccessory } from "homebridge";
 import type { HydrawiseAccessoryContext, HydrawiseControllerIdentity, HydrawiseControllerV2Facts, HydrawiseZoneConfig, HydrawiseZoneIdentity,
   StatusScheduleResponse } from "./types.ts";
 import type { HydrawiseControllerOption, HydrawiseControllerValueOption, HydrawiseZoneOption, HydrawiseZoneValueOption } from "./options.ts";
-import { HydrawiseReservedNames, scheduleStatus } from "./types.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
 import { featureOptionCategories, featureOptions } from "./options.ts";
+import { logCount, present, triggerSet, waitUntil } from "homebridge-plugin-utils/testing";
 import type { BuildControllerResult } from "./testing/platform.helpers.ts";
 import assert from "node:assert/strict";
 import { bareSensors } from "./api.fixtures.ts";
-import { waitUntil } from "homebridge-plugin-utils/testing";
 
 // The single zone every scenario here works against, and the names standing in for each source a valve's name can come from: what the wire reports, what a user
 // renamed it to in the Home app, and what the Name option configures.
@@ -73,6 +74,18 @@ const CONTROLLER_FREE_FORM_SANITIZED = "Garden 2.0 North Wing";
 // A name with nothing HomeKit's rules will keep: every character is disallowed, so it sanitizes to the empty string.
 const UNUSABLE_NAME = "***";
 
+// A name of emoji alone, the other shape HomeKit can carry nothing of, and the one a user is most likely to give a controller or a zone.
+const EMOJI_NAME = "\u{1F331}\u{1F4A7}";
+
+// The name the zone composer falls back to for the zone under test, which sits at relay 1.
+const ZONE_FALLBACK_NAME = HYDRAWISE_ZONE_FALLBACK_NAME + " 1";
+
+// The warning each fallback draws, as far as it names what HomeKit shows, so a count reads one tile's warnings and nothing else.
+const CONTROLLER_FALLBACK_WARNING = "HomeKit cannot use the name of this controller (serial: " + CONTROLLER_SERIAL + "), so HomeKit shows it as " +
+  HYDRAWISE_CONTROLLER_FALLBACK_NAME + ".";
+
+const ZONE_FALLBACK_WARNING = "HomeKit cannot use this zone's name, so HomeKit shows it as " + ZONE_FALLBACK_NAME + ".";
+
 const SUSPEND_ALL_SUFFIX = " Suspend All Zones";
 
 // The per-zone suspension switch's own suffix and the subtype it is published under, so the zone-grain naming assertions can read the companion the walk composes.
@@ -111,13 +124,16 @@ function zone(name: string): HydrawiseZoneConfig {
   return makeZone({ name, relay: 1, relay_id: ZONE_RELAY_ID, run: 480, time: 68000, timestr: "16:00" });
 }
 
-// Seed a cached valve already bearing a name, the shape Homebridge restores when an accessory returns from its cache carrying a rename the user made in the Home
-// app. The name lands on ConfiguredName, which is the characteristic a Home-app rename writes and the one the name helpers read first.
+/* Seed a cached valve already bearing a name, the shape Homebridge restores when an accessory returns from its cache carrying a rename the user made in the Home
+ * app. The name lands on ConfiguredName, which is the characteristic a Home-app rename writes and the one the name helpers read first. It is written through the
+ * HBPU helper production names a valve with, which registers ConfiguredName among the valve's optional characteristics before writing it, so the seed carries the
+ * characteristic as a valve production named carries it, and HAP adds it without a warning.
+ */
 function seedNamedValve(name: string): (accessory: PlatformAccessory) => void {
 
   return (accessory: PlatformAccessory): void => {
 
-    accessory.addService(new Service.Valve(name, ZONE_SUBTYPE)).updateCharacteristic(Characteristic.ConfiguredName, name);
+    setServiceName(accessory.addService(new Service.Valve(name, ZONE_SUBTYPE)), name);
   };
 }
 
@@ -228,7 +244,7 @@ describe("zone naming at creation", () => {
     const valve = await valveOf(h);
 
     await pollPast(h);
-    h.abort();
+    await h.abort();
 
     /* Creation applies the effective name through each name characteristic the kind supports before the valve joins the accessory, which is where the accessory's
      * change record for the valve begins. The names the valve carries are what that creation wrote, and the record holds every name write after it: nothing in the
@@ -302,7 +318,7 @@ describe("zone name synchronization at its default", () => {
     h.accessory.clearObservations();
 
     await pollPast(h);
-    h.abort();
+    await h.abort();
 
     // The plugin's own compare stands between this poll and a write, and so does HBPU's compare-first name helper, so the claim is that no name write reaches HAP.
     assert.deepEqual(nameChanges(h, valve), [], "a poll finding the name already correct performs no name write");
@@ -323,7 +339,7 @@ describe("zone name synchronization at its default", () => {
     h.accessory.clearObservations();
 
     await pollPast(h);
-    h.abort();
+    await h.abort();
 
     // The plugin's sanitizing compare stands between this poll and a write, and so does HBPU's compare-first name helper, so the claim is that no name write
     // reaches HAP.
@@ -354,7 +370,7 @@ describe("zone name synchronization saves", () => {
 
     await waitUntil(() => nameOf(valve) === OVERRIDE_NAME, { description: "the valve to take the override name" });
     await pollPast(h);
-    h.abort();
+    await h.abort();
 
     assert.equal(rosterOf(h)[0]?.name, WIRE_NAME, "the roster keeps the name Hydrawise reports, so it moved nothing");
     assert.equal(h.flushes().length, settled + 1, "the valve's rename saves exactly once, and the polls after it save nothing");
@@ -379,14 +395,14 @@ describe("zone name synchronization opted out", () => {
       h.accessory.clearObservations();
 
       await pollPast(h);
-      h.abort();
+      await h.abort();
 
       assert.deepEqual(nameChanges(h, valve), [], "no poll re-asserts a name while synchronization is disabled");
       assert.equal(nameOf(valve), HOME_APP_NAME, "the rename made in the Home app stands");
     });
   }
 
-  test("still creates a new valve with the effective name, and never re-asserts it afterwards", async (t) => {
+  test("still creates a new valve with the effective name, and writes it no second time while the valve carries it", async (t) => {
 
     const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }),
       signalAborted: false, userOptions: [ "Disable.Device.SyncName." + ZONE_SUBTYPE, "Enable.Device.Name." + ZONE_SUBTYPE + "=" + OVERRIDE_NAME ] });
@@ -400,9 +416,9 @@ describe("zone name synchronization opted out", () => {
     h.accessory.clearObservations();
 
     await pollPast(h);
-    h.abort();
+    await h.abort();
 
-    assert.deepEqual(nameChanges(h, valve), [], "nothing re-asserts the name after creation");
+    assert.deepEqual(nameChanges(h, valve), [], "a name the valve already carries is not written again");
   });
 });
 
@@ -532,7 +548,7 @@ describe("the zone name option's declared scope", () => {
     h.controller.applyFacts({ facts: v2Facts(ACCOUNT_NAME), fetchedAt: nowSeconds() - (HYDRAWISE_V2_FACTS_TTL + 1) });
 
     await pollPast(h);
-    h.abort();
+    await h.abort();
 
     assert.equal(nameOf(valve), ACCOUNT_NAME, "an aged-out snapshot leaves the last account name standing on the valve");
     assert.equal(rosterOf(h)[0]?.name, ACCOUNT_NAME, "and the persisted roster holds it too, which is the store the carry reads back from");
@@ -639,8 +655,8 @@ describe("the name carry across a restart", () => {
         seed.context = { controller: { controllerId: 500001, name: CONTROLLER_ACCOUNT_EXTENDED, serialNumber: CONTROLLER_SERIAL },
           schedule: scheduleStatus(schedule(WIRE_NAME), HYDRAWISE_ACTIVE_ZONE_INDICATOR), zones: [{ name: ACCOUNT_NAME, relay: 1, relayId: ZONE_RELAY_ID }] };
 
-        seed.addService(Service.IrrigationSystem, CONTROLLER_ACCOUNT_EXTENDED).updateCharacteristic(Characteristic.ConfiguredName, CONTROLLER_ACCOUNT_EXTENDED);
-        seed.addService(Service.Valve, ACCOUNT_NAME, ZONE_SUBTYPE).updateCharacteristic(Characteristic.ConfiguredName, ACCOUNT_NAME);
+        setServiceName(seed.addService(Service.IrrigationSystem, CONTROLLER_ACCOUNT_EXTENDED), CONTROLLER_ACCOUNT_EXTENDED);
+        setServiceName(seed.addService(Service.Valve, ACCOUNT_NAME, ZONE_SUBTYPE), ACCOUNT_NAME);
         setAccessoryName(seed, CONTROLLER_ACCOUNT_EXTENDED);
       }, signalAborted: false });
 
@@ -651,7 +667,7 @@ describe("the name carry across a restart", () => {
     h.accessory.clearObservations();
 
     await pollPast(h);
-    h.abort();
+    await h.abort();
 
     assert.equal(nameOf(valve), ACCOUNT_NAME, "the zone's valve keeps the name the previous session flushed, not the wire's cut form");
     assert.equal(nameOf(irrigationOf(h)), CONTROLLER_ACCOUNT_EXTENDED, "and the controller keeps its own");
@@ -736,7 +752,7 @@ describe("the name carry across a restart", () => {
 
     await waitUntil(() => nameOf(irrigationOf(h)) === CONTROLLER_WIRE_NAME, { description: "the irrigation system to take the wire name" });
     await pollPast(h);
-    h.abort();
+    await h.abort();
 
     assert.equal(nameOf(valve), WIRE_NAME, "the zone reads the wire's name over a restored roster full of account names");
     assert.equal(nameOf(irrigationOf(h)), CONTROLLER_WIRE_NAME, "and so does the controller");
@@ -755,7 +771,7 @@ describe("the name carry across a restart", () => {
     const valve = await valveOf(h);
 
     await pollPast(h);
-    h.abort();
+    await h.abort();
 
     assert.equal(nameOf(valve), WIRE_NAME, "the zone carries the name the wire reports");
     assert.equal(nameOf(irrigationOf(h)), CONTROLLER_WIRE_NAME, "and so does the controller");
@@ -806,7 +822,7 @@ describe("controller naming", () => {
     await waitUntil(() => identityOf(h)?.name === CONTROLLER_ACCOUNT_NAME, { description: "the persisted identity to carry the account name" });
 
     await pollPast(h);
-    h.abort();
+    await h.abort();
 
     assert.equal(nameOf(irrigation), CONTROLLER_WIRE_NAME, "no poll re-asserts a name while synchronization is disabled");
     assert.equal(h.accessory.displayName, CONTROLLER_WIRE_NAME, "the accessory keeps the name it had");
@@ -857,7 +873,7 @@ describe("controller naming", () => {
 
     await waitUntil(() => nameOf(irrigationOf(h)) === CONTROLLER_OVERRIDE_NAME, { description: "the irrigation system to take the override name" });
     await pollPast(h);
-    h.abort();
+    await h.abort();
 
     assert.equal(nameOf(valve), WIRE_NAME, "the zone keeps the name Hydrawise reports for it");
     assert.equal(nameOf(irrigationOf(h)), CONTROLLER_OVERRIDE_NAME, "while the controller itself carries the name that was written for it");
@@ -899,7 +915,7 @@ describe("controller naming", () => {
     const bareFlushesAfterFirstPoll = bare.flushes().length;
 
     await pollPast(bare);
-    bare.abort();
+    await bare.abort();
 
     /* The promise to an install carrying only an API key: nothing about this pass touches a name it has always had. The name helpers compare before they write,
      * and only a write marks the accessory, so the save count reads what they answered: an unchanged name costs no save.
@@ -929,7 +945,7 @@ describe("controller naming", () => {
     h.controller.applyFacts({ facts: controllerV2Facts(CONTROLLER_ACCOUNT_EXTENDED), fetchedAt: nowSeconds() - (HYDRAWISE_V2_FACTS_TTL + 1) });
 
     await pollPast(h);
-    h.abort();
+    await h.abort();
 
     assert.equal(nameOf(irrigation), CONTROLLER_ACCOUNT_EXTENDED, "an aged-out snapshot leaves the last account name standing on the service");
     assert.equal(identityOf(h)?.name, CONTROLLER_ACCOUNT_EXTENDED, "and the identity holds it too, which is the store the controller's carry reads back from");
@@ -953,7 +969,7 @@ describe("controller naming", () => {
     h.accessory.clearObservations();
 
     await pollPast(h);
-    h.abort();
+    await h.abort();
 
     assert.equal(flushesAfterFirstPoll, 1, "the first poll costs exactly one cache write");
     assert.equal(h.flushes().length, 1, "and a poll that moved no name writes the cache no second time");
@@ -987,7 +1003,7 @@ describe("controller naming", () => {
 
     await waitUntil(() => nameOf(irrigation) === CONTROLLER_OVERRIDE_NAME, { description: "the irrigation system to take the override name" });
     await pollPast(h);
-    h.abort();
+    await h.abort();
 
     assert.equal(h.accessory.displayName, CONTROLLER_OVERRIDE_NAME, "the rename reaches the accessory's own display name");
     assert.equal(h.flushes().length, settled + 1, "and costs exactly one cache write, which the polls after it do not repeat");
@@ -1014,7 +1030,7 @@ describe("controller naming", () => {
 
     await pollPast(h);
     await pollPast(h);
-    h.abort();
+    await h.abort();
 
     assert.equal(information.getCharacteristic(Characteristic.ConfiguredName).value, CONTROLLER_WIRE_NAME, "the first synced poll writes the controller's name to it");
     assert.equal(h.flushes().length, 1, "and saves the accessory once for it, the polls after it saving nothing");
@@ -1039,7 +1055,7 @@ describe("controller naming", () => {
     assert.equal(identityOf(h)?.name, "Former Controller", "the stale identity survives the context wipe for the first poll to judge");
 
     await pollPast(h);
-    h.abort();
+    await h.abort();
 
     assert.equal(identityOf(h)?.name, CONTROLLER_WIRE_NAME, "the first poll rewrites the identity to the name the wire reports");
     assert.equal(h.flushes().length, 1, "and that rewrite is the only save the run makes");
@@ -1067,7 +1083,7 @@ describe("controller naming", () => {
     h.accessory.clearObservations();
 
     await pollPast(h);
-    h.abort();
+    await h.abort();
 
     /* The name helpers compare in the sanitized form, so the save count is what shows a configured value HomeKit's rules rewrite reading as unchanged:
      * a compare that read it raw would call every poll a rename, and every rename marks the accessory for a save.
@@ -1081,12 +1097,11 @@ describe("controller naming", () => {
 
   test("creation consults the Name option, so an opted-out controller is established under it", async (t) => {
 
-    /* What a synchronization opt-out means at the controller grain: names are established at creation from the configured truth and never touched again. The
-     * consult has to happen at CREATION for that to hold, because the rename step returns immediately under the opt-out - a service born under the wire's name
-     * would keep it for the life of the accessory, with the option the user set to correct it unreachable.
+    /* Creation consults the configured truth at the controller grain, so a service is born under the user's own name rather than renamed to it by a later pass.
+     * The rename step holds a set Name on every poll whatever the opt-out says, so the creation half is read before the first poll can run.
      *
-     * Facts land carrying a different name as well, so the assertion distinguishes "established from the override" from "never renamed at all": an implementation that
-     * ignored the override at creation would show the wire's name here, and one that ignored the opt-out would show the account's.
+     * Facts land carrying a different name as well, so the end state distinguishes the override from the account's name: an implementation that let the account's
+     * name stand in for a set Name would show it here.
      */
     const h = buildController({ hasV2Client: true,
       program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }), signalAborted: false,
@@ -1095,13 +1110,15 @@ describe("controller naming", () => {
 
     t.after(() => h.abort());
 
+    assert.equal(nameOf(irrigationOf(h)), CONTROLLER_OVERRIDE_NAME, "the irrigation system service is created under the user's own name, before any poll");
+
     h.controller.applyFacts({ facts: controllerV2Facts(CONTROLLER_ACCOUNT_NAME), fetchedAt: nowSeconds() });
 
     await waitUntil(() => identityOf(h)?.name === CONTROLLER_ACCOUNT_NAME, { description: "the persisted identity to carry the account name" });
     await pollPast(h);
-    h.abort();
+    await h.abort();
 
-    assert.equal(nameOf(irrigationOf(h)), CONTROLLER_OVERRIDE_NAME, "the irrigation system service is established under the user's own name");
+    assert.equal(nameOf(irrigationOf(h)), CONTROLLER_OVERRIDE_NAME, "the irrigation system service keeps the user's own name");
     assert.equal(nameOf(suspendSwitchOf(h)), CONTROLLER_OVERRIDE_NAME + SUSPEND_ALL_SUFFIX, "and the switch composes its own from the same effective name");
     assert.equal(identityOf(h)?.name, CONTROLLER_ACCOUNT_NAME, "while the identity still records what the controller actually is");
   });
@@ -1109,8 +1126,8 @@ describe("controller naming", () => {
   test("creation consults the Name option for an opted-out zone's own accessory too", async (t) => {
 
     /* The same contract at the zone grain, on a zone promoted to an accessory of its own. The existing standalone assertions cover an override under synchronization
-     * ON and an opt-out with no override configured; what neither can show is the two together, which is where a creation that ignored the override would
-     * strand the accessory under the wire's name permanently.
+     * ON and an opt-out with no override configured; what neither can show is the two together. The poll's walk holds a set Name on the accessory whatever the
+     * opt-out says, so the creation half is read from the request the accessory is minted from.
      */
     const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }),
       signalAborted: false, userOptions: [ "Enable.Device.Standalone." + ZONE_SUBTYPE, "Disable.Device.SyncName." + ZONE_SUBTYPE,
@@ -1121,19 +1138,20 @@ describe("controller naming", () => {
     const zoneAccessory = await waitFor(() => h.zoneAccessories.get(ZONE_RELAY_ID), { description: "the zone's own accessory to appear" });
 
     await pollPast(h);
-    h.abort();
+    await h.abort();
 
-    assert.equal(zoneAccessory.displayName, OVERRIDE_NAME, "the zone's own accessory is created under the user's name despite the opt-out");
+    assert.equal(h.reconciles[0]?.zones[0]?.displayName, OVERRIDE_NAME, "the zone's own accessory is requested under the user's name despite the opt-out");
+    assert.equal(zoneAccessory.displayName, OVERRIDE_NAME, "and carries it");
     assert.equal(nameOf(await waitFor(() => zoneAccessory.getServiceById(Service.Valve, ZONE_SUBTYPE),
       { description: "the zone valve on the zone's own accessory to appear" })), OVERRIDE_NAME, "and so is the valve it hosts");
   });
 
-  test("a name that sanitizes to nothing leaves every surface the controller names standing", async (t) => {
+  test("a tracked name that sanitizes to nothing renames every surface the controller names to the controller word", async (t) => {
 
-    /* HomeKit's naming rules can empty a name outright, and a service has to answer to something. HBPU's name helpers decline a blank name on their own, but the
-     * suspend-all switch composes its name from the controller's, and the composed form keeps its suffix after sanitizing - so the emptiness has to be decided on
-     * the controller's half before any surface is renamed, or the switch would be renamed to a label naming no controller. This asserts every surface against a
-     * name every character of which HomeKit's rules discard.
+    /* HomeKit's naming rules can empty a name outright, and a service has to answer to something, so the controller composer answers the controller word, and
+     * every surface the rename step tracks takes it: the irrigation system, the accessory's display pair and the information service beneath it, and the
+     * suspend-all switch, whose name composes from the word rather than from a half HomeKit cannot carry. This asserts every surface against a name every
+     * character of which HomeKit's rules discard, arriving after a real one the plugin itself wrote.
      */
     const h = buildController({ hasV2Client: true,
       program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }), signalAborted: false,
@@ -1141,35 +1159,27 @@ describe("controller naming", () => {
 
     t.after(() => h.abort());
 
-    // A real name lands first, so what the gate protects is a value the plugin itself wrote rather than the absence of one.
     h.controller.applyFacts({ facts: controllerV2Facts(CONTROLLER_ACCOUNT_NAME), fetchedAt: nowSeconds() });
 
     await waitUntil(() => h.accessory.displayName === CONTROLLER_ACCOUNT_NAME, { description: "the accessory to take the account name" });
 
-    /* Clear the accessory's change record before the unusable name arrives, so it holds only what the step does with it. The claim is that the step writes
-     * NOTHING, which is stronger than any value comparison. The switch line is the one the plugin's own blank-name gate answers for: HBPU refuses the blank name
-     * on the irrigation system and its label by itself, while the composed switch name survives sanitizing and would be written without the gate.
-     */
-    h.accessory.clearObservations();
-
     h.controller.applyFacts({ facts: controllerV2Facts(UNUSABLE_NAME), fetchedAt: nowSeconds() });
 
+    await waitUntil(() => h.accessory.displayName === HYDRAWISE_CONTROLLER_FALLBACK_NAME, { description: "the accessory to take the controller word" });
     await pollPast(h);
-    h.abort();
+    await h.abort();
 
-    assert.deepEqual(nameChanges(h, irrigationOf(h)), [], "the irrigation system service takes no name write at all");
-    assert.deepEqual(nameChanges(h, suspendSwitchOf(h)), [], "nor the switch composed from the controller's name");
-    assert.equal(h.accessory.displayName, CONTROLLER_ACCOUNT_NAME, "the accessory keeps the display name it had");
-    assert.equal(nameOf(informationOf(h)), CONTROLLER_ACCOUNT_NAME, "and the information service beneath it keeps its own");
-    assert.equal(nameOf(irrigationOf(h)), CONTROLLER_ACCOUNT_NAME, "the irrigation system service keeps the label the user navigates by");
-    assert.equal(nameOf(suspendSwitchOf(h)), CONTROLLER_ACCOUNT_NAME + SUSPEND_ALL_SUFFIX, "and the switch composed from it keeps its own");
+    assert.equal(nameOf(irrigationOf(h)), HYDRAWISE_CONTROLLER_FALLBACK_NAME, "the irrigation system service takes the controller word");
+    assert.equal(h.accessory.displayName, HYDRAWISE_CONTROLLER_FALLBACK_NAME, "and so does the accessory's display name");
+    assert.equal(nameOf(informationOf(h)), HYDRAWISE_CONTROLLER_FALLBACK_NAME, "and the information service beneath it");
+    assert.equal(nameOf(suspendSwitchOf(h)), HYDRAWISE_CONTROLLER_FALLBACK_NAME + SUSPEND_ALL_SUFFIX, "and the switch composes its own name from the word");
+    assert.equal(logCount(h.entries, "warn", CONTROLLER_FALLBACK_WARNING), 1, "the move to the word is warned about once");
   });
 
-  test("a zone whose name sanitizes to nothing leaves its valve and its companion switch standing", async (t) => {
+  test("a tracked zone name that sanitizes to nothing renames its valve and its companion switch to the zone word and number", async (t) => {
 
-    /* The same rule at the zone grain, where the walk's own rename gates answer for it. The composed switch name is the case worth stating: it would sanitize
-     * to the bare suffix rather than to nothing, so a gate asking only whether the COMPOSED name survives would happily rename the switch to a label naming no
-     * zone at all. Asking the zone half is what prevents that.
+    /* The same rule at the zone grain, where the walk's own rename gates answer for it. The composed switch name is the case worth stating: the zone half is the
+     * composer's word and number, so the switch is renamed to a label that still names its zone rather than to its bare suffix.
      */
     const h = buildController({ hasV2Client: true, program: (recorder) => {
 
@@ -1182,10 +1192,311 @@ describe("controller naming", () => {
     const valve = await valveOf(h);
     const zoneSwitch = await waitFor(() => h.accessory.getServiceById(Service.Switch, ZONE_SUSPEND_SUBTYPE), { description: "the zone suspension switch to appear" });
 
+    await waitUntil(() => nameOf(valve) === ZONE_FALLBACK_NAME, { description: "the valve to take the zone word and number" });
     await pollPast(h);
-    h.abort();
+    await h.abort();
 
-    assert.equal(nameOf(valve), WIRE_NAME, "the valve keeps the name it was created with rather than being blanked");
-    assert.equal(nameOf(zoneSwitch), WIRE_NAME + ZONE_SUSPEND_SUFFIX, "and its companion switch keeps the composed name rather than falling back to the suffix");
+    assert.equal(nameOf(valve), ZONE_FALLBACK_NAME, "the valve takes the zone word and its relay number");
+    assert.equal(nameOf(zoneSwitch), ZONE_FALLBACK_NAME + ZONE_SUSPEND_SUFFIX, "and its companion switch composes its own name from them");
+    assert.equal(logCount(h.entries, "warn", ZONE_FALLBACK_WARNING), 1, "the move to the word is warned about once");
+  });
+});
+
+describe("the naming rule", () => {
+
+  test("with synchronization disabled, a set Name option reaches every surface and a rename made in the Home app yields to it", async (t) => {
+
+    /* The family rule: a Name the user set applies on every pass, whatever synchronization says. Every surface the Home app can rename is renamed there, the
+     * controller accessory and its suspend-all switch at the controller, and the valve, its companion switch and the accessory hosting them at the zone, so a
+     * gate that still read synchronization alone at the controller or at the zone leaves its half standing under the Home app's name. HomeKit carries no
+     * ConfiguredName on an irrigation system, so a rename of the controller lands on its accessory's information service, and the irrigation system, read
+     * through its Name characteristic, carries the Name it was created under.
+     */
+    const h = buildController({ accessoryName: CONTROLLER_OVERRIDE_NAME, hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }), signalAborted: false,
+      userOptions: [ "Disable.Device.SyncName", "Enable.Device.Name." + CONTROLLER_SERIAL + "=" + CONTROLLER_OVERRIDE_NAME,
+        "Enable.Device.Name." + ZONE_SUBTYPE + "=" + OVERRIDE_NAME, "Enable.Device.Standalone." + ZONE_SUBTYPE, "Enable.Device.Suspend.All",
+        "Enable.Device.Suspend.Zone." + CONTROLLER_SERIAL ] });
+
+    t.after(() => h.abort());
+
+    const host = await waitFor(() => h.zoneAccessories.get(ZONE_RELAY_ID), { description: "the zone's own accessory to appear" });
+    const valve = await waitFor(() => host.getServiceById(Service.Valve, ZONE_SUBTYPE), { description: "the zone valve on its own accessory to appear" });
+    const zoneSwitch = await waitFor(() => host.getServiceById(Service.Switch, ZONE_SUSPEND_SUBTYPE), { description: "the zone suspension switch to appear" });
+
+    await pollPast(h);
+
+    const hostInformation = present(host.getService(Service.AccessoryInformation), "the zone accessory's information service");
+    const surfaces = [ informationOf(h), suspendSwitchOf(h), valve, zoneSwitch, hostInformation ];
+
+    for(const service of surfaces) {
+
+      // eslint-disable-next-line no-await-in-loop
+      await triggerSet(service.getCharacteristic(Characteristic.ConfiguredName), HOME_APP_NAME);
+    }
+
+    assert.ok(surfaces.every(service => nameOf(service) === HOME_APP_NAME), "every surface carries the Home app's name before the next poll");
+
+    await pollPast(h);
+    await h.abort();
+
+    assert.equal(nameOf(informationOf(h)), CONTROLLER_OVERRIDE_NAME, "the controller accessory takes the controller's Name back");
+    assert.equal(irrigationOf(h).getCharacteristic(Characteristic.Name).value, CONTROLLER_OVERRIDE_NAME, "the irrigation system carries it");
+    assert.equal(nameOf(suspendSwitchOf(h)), CONTROLLER_OVERRIDE_NAME + SUSPEND_ALL_SUFFIX, "and so does the suspend-all switch composed from it");
+    assert.equal(nameOf(valve), OVERRIDE_NAME, "the valve takes the zone's Name back");
+    assert.equal(nameOf(zoneSwitch), OVERRIDE_NAME + ZONE_SUSPEND_SUFFIX, "and so does its companion switch");
+    assert.equal(nameOf(hostInformation), OVERRIDE_NAME, "and so does the accessory hosting them");
+  });
+
+  test("with synchronization disabled and no Name set, a rename made in the Home app stands across polls", async (t) => {
+
+    /* The other half of the rule: with nothing set, the opt-out means a name is written once, when its service is created, so nothing writes over the user's own.
+     * The controller's rename lands on its accessory's information service, as the Home app renames it, and the irrigation system, which carries no
+     * ConfiguredName, is read through the Name its creation wrote. The accessory is seeded as an earlier synced session left it, named through HBPU's
+     * setAccessoryName, so its information service carries the ConfiguredName the Home app writes...with the opt-out and no Name set, nothing this session
+     * writes would add it.
+     */
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }),
+      seedContext: (seed) => setAccessoryName(seed, CONTROLLER_WIRE_NAME), signalAborted: false,
+      userOptions: [ "Disable.Device.SyncName", "Enable.Device.Suspend.All" ] });
+
+    t.after(() => h.abort());
+
+    const valve = await valveOf(h);
+
+    await pollPast(h);
+
+    // The seed is read on ConfiguredName itself, because the name helpers fall back to the information service's Name, which carries the wire name without it.
+    assert.equal(informationOf(h).testCharacteristic(Characteristic.ConfiguredName), true, "the seeded information service carries a ConfiguredName");
+    assert.equal(informationOf(h).getCharacteristic(Characteristic.ConfiguredName).value, CONTROLLER_WIRE_NAME, "and it carries the name the seed wrote");
+
+    const surfaces = [ informationOf(h), suspendSwitchOf(h), valve ];
+
+    for(const service of surfaces) {
+
+      // eslint-disable-next-line no-await-in-loop
+      await triggerSet(service.getCharacteristic(Characteristic.ConfiguredName), HOME_APP_NAME);
+    }
+
+    await pollPast(h);
+    await pollPast(h);
+    await h.abort();
+
+    assert.equal(nameOf(informationOf(h)), HOME_APP_NAME, "the controller accessory keeps the Home app's name");
+    assert.equal(nameOf(suspendSwitchOf(h)), HOME_APP_NAME, "and so does the suspend-all switch");
+    assert.equal(nameOf(valve), HOME_APP_NAME, "and so does the valve");
+    assert.equal(irrigationOf(h).getCharacteristic(Characteristic.Name).value, CONTROLLER_WIRE_NAME, "while the irrigation system keeps the name it was created with");
+  });
+});
+
+describe("names HomeKit cannot carry", () => {
+
+  test("a fresh controller minted under its word is warned about exactly once across its construction and two polls", async (t) => {
+
+    /* Discovery mints a controller Hydrawise names in emoji alone under the controller word, which is the name the harness is handed here. Creating the irrigation
+     * system decides the controller's warning, and each poll's rename step decides it again, while the suspend-all switch created between them composes from the
+     * accessory's own name, which HomeKit already carries, and decides nothing - so the warning is said once rather than once per pass that names the word.
+     */
+    const h = buildController({ accessoryName: HYDRAWISE_CONTROLLER_FALLBACK_NAME, controller: { name: EMOJI_NAME },
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }), signalAborted: false,
+      userOptions: ["Enable.Device.Suspend.All"] });
+
+    t.after(() => h.abort());
+
+    assert.equal(logCount(h.entries, "warn", CONTROLLER_FALLBACK_WARNING), 1, "creating the irrigation system under the word warns about it at once");
+
+    await pollPast(h);
+    await pollPast(h);
+    await h.abort();
+
+    assert.equal(logCount(h.entries, "warn", CONTROLLER_FALLBACK_WARNING), 1, "and the polls after it say nothing more while the word still applies");
+    assert.equal(nameOf(irrigationOf(h)), HYDRAWISE_CONTROLLER_FALLBACK_NAME, "the irrigation system carries the word");
+    assert.equal(nameOf(suspendSwitchOf(h)), HYDRAWISE_CONTROLLER_FALLBACK_NAME + SUSPEND_ALL_SUFFIX, "and the switch composes its own name from it");
+  });
+
+  test("a zone that leaves its word and returns to it is warned about again on its return, and on no pass between", async (t) => {
+
+    const h = buildController({ program: (recorder) => {
+
+      recorder.program("statusschedule.php", { body: schedule(UNUSABLE_NAME), kind: "response" });
+      recorder.program("statusschedule.php", { body: schedule(UNUSABLE_NAME), kind: "response" });
+      recorder.program("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" });
+      recorder.programDefault("statusschedule.php", { body: schedule(UNUSABLE_NAME), kind: "response" });
+    }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    const valve = await valveOf(h);
+
+    await waitUntil(() => nameOf(valve) === WIRE_NAME, { description: "the valve to take the wire's name", timeoutMs: 5000 });
+
+    assert.equal(logCount(h.entries, "warn", ZONE_FALLBACK_WARNING), 1, "a valve created under the word and held there a second poll is warned about once");
+
+    await waitUntil(() => nameOf(valve) === ZONE_FALLBACK_NAME, { description: "the valve to return to the zone word", timeoutMs: 5000 });
+    await pollPast(h);
+    await h.abort();
+
+    assert.equal(logCount(h.entries, "warn", ZONE_FALLBACK_WARNING), 2, "and its return to the word is warned about once more");
+  });
+
+  test("a zone that leaves the wire for a poll and returns under its word is warned about again", async (t) => {
+
+    /* A poll reporting only another zone takes this one out of the enabled projection, so the walk removes its valve and forgets the warning it said. Its return
+     * under its word creates the valve anew, and that creation warns again, as it would for a zone this run had never seen.
+     */
+    const other = makeZone({ name: "Back Beds", relay: 2, relay_id: 700002, run: 480, time: 68000, timestr: "16:00" });
+    const h = buildController({ program: (recorder) => {
+
+      recorder.program("statusschedule.php", { body: schedule(UNUSABLE_NAME), kind: "response" });
+      recorder.program("statusschedule.php", { body: fastPolling(makeStatusSchedule({ relays: [other], sensors: bareSensors })), kind: "response" });
+      recorder.programDefault("statusschedule.php", { body: schedule(UNUSABLE_NAME), kind: "response" });
+    }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    await valveOf(h);
+    await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 3, { description: "the poll that returns the zone", timeoutMs: 5000 });
+    await pollPast(h);
+    await h.abort();
+
+    assert.equal(logCount(h.entries, "warn", ZONE_FALLBACK_WARNING), 2, "the zone's return under its word is warned about again");
+  });
+
+  test("a restart over a zone its word already names warns about it once again, writing nothing", async (t) => {
+
+    // The previous session left the valve under the word, so this run's first pass finds nothing to write, and the warning it still says is the run's own.
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(UNUSABLE_NAME), kind: "response" }),
+      seedContext: seedNamedValve(ZONE_FALLBACK_NAME), signalAborted: false });
+
+    t.after(() => h.abort());
+
+    const valve = await valveOf(h);
+
+    h.accessory.clearObservations();
+
+    await pollPast(h);
+    await h.abort();
+
+    assert.deepEqual(nameChanges(h, valve), [], "the valve already carries the word, so no pass writes it");
+    assert.equal(logCount(h.entries, "warn", ZONE_FALLBACK_WARNING), 1, "while the run's first deciding pass warns about it once");
+  });
+
+  test("with synchronization disabled, a cached controller and zone neither rename nor warn, whatever HomeKit can carry of their names", async (t) => {
+
+    /* The previous session left the controller under its word and the user renamed the valve in the Home app. With synchronization off and no Name set, no pass
+     * decides either tile, so neither is renamed and neither is warned about after the restart.
+     */
+    const h = buildController({ accessoryName: HYDRAWISE_CONTROLLER_FALLBACK_NAME, controller: { name: EMOJI_NAME },
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(UNUSABLE_NAME), kind: "response" }),
+      seedContext: (seed) => {
+
+        setServiceName(seed.addService(Service.IrrigationSystem, HYDRAWISE_CONTROLLER_FALLBACK_NAME), HYDRAWISE_CONTROLLER_FALLBACK_NAME);
+        seedNamedValve(HOME_APP_NAME)(seed);
+      }, signalAborted: false, userOptions: ["Disable.Device.SyncName"] });
+
+    t.after(() => h.abort());
+
+    const valve = await valveOf(h);
+
+    h.accessory.clearObservations();
+
+    await pollPast(h);
+    await h.abort();
+
+    assert.deepEqual(nameChanges(h, valve), [], "no pass renames the valve");
+    assert.equal(nameOf(valve), HOME_APP_NAME, "so the name the Home app gave it stands");
+    assert.equal(nameOf(irrigationOf(h)), HYDRAWISE_CONTROLLER_FALLBACK_NAME, "and the controller keeps the name it came back with");
+    assert.equal(logCount(h.entries, "warn", "HomeKit cannot use"), 0, "and neither tile is warned about");
+  });
+
+  test("with synchronization disabled, a controller and a zone created under their words are each warned about once", async (t) => {
+
+    // Creation names a service once with synchronization off, so creation is the one pass that decides each tile's warning.
+    const h = buildController({ accessoryName: HYDRAWISE_CONTROLLER_FALLBACK_NAME, controller: { name: EMOJI_NAME },
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(UNUSABLE_NAME), kind: "response" }), signalAborted: false,
+      userOptions: ["Disable.Device.SyncName"] });
+
+    t.after(() => h.abort());
+
+    const valve = await valveOf(h);
+
+    await pollPast(h);
+    await h.abort();
+
+    assert.equal(nameOf(irrigationOf(h)), HYDRAWISE_CONTROLLER_FALLBACK_NAME, "the irrigation system is created under the controller word");
+    assert.equal(nameOf(valve), ZONE_FALLBACK_NAME, "and the valve under the zone word and number");
+    assert.equal(logCount(h.entries, "warn", CONTROLLER_FALLBACK_WARNING), 1, "the controller is warned about once");
+    assert.equal(logCount(h.entries, "warn", ZONE_FALLBACK_WARNING), 1, "and so is the zone");
+  });
+
+  test("a controller and a zone Hydrawise names by the kind's word carry those names as their own and draw no warning", async (t) => {
+
+    // The warning reads the composer's source rather than comparing the name with the word, so a zone named "Zone 1" at relay 1 is no fallback at all.
+    const h = buildController({ controller: { name: HYDRAWISE_CONTROLLER_FALLBACK_NAME },
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(ZONE_FALLBACK_NAME), kind: "response" }), signalAborted: false });
+
+    t.after(() => h.abort());
+
+    const valve = await valveOf(h);
+
+    await pollPast(h);
+    await h.abort();
+
+    assert.equal(nameOf(irrigationOf(h)), HYDRAWISE_CONTROLLER_FALLBACK_NAME, "the controller carries the name Hydrawise reports");
+    assert.equal(nameOf(valve), ZONE_FALLBACK_NAME, "and so does the zone");
+    assert.equal(logCount(h.entries, "warn", "HomeKit cannot use"), 0, "and neither is warned about");
+  });
+
+  test("a Name HomeKit cannot carry yields to the reported name, the suspend-all switch composing its own from it", async (t) => {
+
+    // A Name of emoji alone counts as no Name at all, so creation and every pass after it name each surface as if the user had set none.
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }),
+      signalAborted: false, userOptions: [ "Enable.Device.Name." + CONTROLLER_SERIAL + "=" + EMOJI_NAME, "Enable.Device.Name." + ZONE_SUBTYPE + "=" + EMOJI_NAME,
+        "Enable.Device.Suspend.All" ] });
+
+    t.after(() => h.abort());
+
+    assert.equal(nameOf(irrigationOf(h)), CONTROLLER_WIRE_NAME, "the irrigation system is created under the name Hydrawise reports");
+    assert.equal(nameOf(suspendSwitchOf(h)), CONTROLLER_WIRE_NAME + SUSPEND_ALL_SUFFIX, "and the switch is created as that name with its suffix");
+
+    const valve = await valveOf(h);
+
+    await pollPast(h);
+    await h.abort();
+
+    assert.equal(nameOf(valve), WIRE_NAME, "the valve takes the name Hydrawise reports for the zone");
+    assert.equal(h.accessory.displayName, CONTROLLER_WIRE_NAME, "and the accessory keeps the controller's");
+    assert.equal(logCount(h.entries, "warn", "HomeKit cannot use"), 0, "and nothing is named by its word, so nothing is warned about");
+  });
+
+  test("with synchronization disabled, a zone Name HomeKit cannot carry leaves a rename made in the Home app standing on the valve and its switch", async (t) => {
+
+    // A Name HomeKit cannot carry holds no name gate, so with synchronization off nothing writes over the user's own name on either surface.
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }), signalAborted: false,
+      userOptions: [ "Disable.Device.SyncName", "Enable.Device.Name." + ZONE_SUBTYPE + "=" + EMOJI_NAME, "Enable.Device.Suspend.Zone." + CONTROLLER_SERIAL ] });
+
+    t.after(() => h.abort());
+
+    const valve = await valveOf(h);
+    const zoneSwitch = await waitFor(() => h.accessory.getServiceById(Service.Switch, ZONE_SUSPEND_SUBTYPE), { description: "the zone suspension switch to appear" });
+
+    await pollPast(h);
+
+    assert.equal(nameOf(valve), WIRE_NAME, "the valve is created under the name Hydrawise reports");
+    assert.equal(nameOf(zoneSwitch), WIRE_NAME + ZONE_SUSPEND_SUFFIX, "and its switch under that name with its suffix");
+
+    for(const service of [ valve, zoneSwitch ]) {
+
+      // eslint-disable-next-line no-await-in-loop
+      await triggerSet(service.getCharacteristic(Characteristic.ConfiguredName), HOME_APP_NAME);
+    }
+
+    await pollPast(h);
+    await pollPast(h);
+    await h.abort();
+
+    assert.equal(nameOf(valve), HOME_APP_NAME, "the valve keeps the Home app's name");
+    assert.equal(nameOf(zoneSwitch), HOME_APP_NAME, "and so does its companion switch");
   });
 });

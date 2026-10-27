@@ -12,12 +12,12 @@
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let the fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
 import { HYDRAWISE_ZONE_ACCESSORY_CATEGORY, HYDRAWISE_ZONE_ACCESSORY_GRACE_POLLS } from "./settings.ts";
+import { HYDRAWISE_ZONE_FALLBACK_NAME, controllerIdentity, zoneAccessoryId, zoneIdentity } from "./types.ts";
 import type { HydrawiseControllerConfig, HydrawiseZoneConfig, HydrawiseZoneIdentity } from "./types.ts";
 import { buildPlatform, installMockDispatcher, programJsonReply, seedAccessory } from "./testing/platform.helpers.ts";
-import { controllerIdentity, zoneAccessoryId, zoneIdentity } from "./types.ts";
 import { describe, test } from "node:test";
 import { formatLogEntry, logCount, loggedAt, waitUntil } from "homebridge-plugin-utils/testing";
-import { makeCustomerDetails, makeZone, normalSchedule } from "./api.helpers.ts";
+import { makeCustomerDetails, makeStatusSchedule, makeZone, normalSchedule } from "./api.helpers.ts";
 import type { HydrawisePlatform } from "./platform.ts";
 import type { PlatformAccessory } from "homebridge";
 import assert from "node:assert/strict";
@@ -469,5 +469,30 @@ describe("HydrawisePlatform zone accessories (orphan sweep)", () => {
     assert.equal(unregistered()[0]?.UUID, zoneUuid(platform, 500001, 700001),
       "an unreadable context takes the controller arm and is swept, so the next poll can rebuild it");
     assert.ok(!loggedAt(entries, "error", "stopped unexpectedly"), "and the bridge accepted the unregistration, so discovery ran on past the sweep");
+  });
+});
+
+describe("HydrawisePlatform zone accessories (names HomeKit cannot carry)", () => {
+
+  test("a standalone zone whose name HomeKit cannot carry is minted under the zone word and number, with no setup failure", async (t) => {
+
+    /* The controller composes each standalone request's display name, so the platform's mint is handed a name HomeKit can always carry: a zone Hydrawise names
+     * in emoji alone is requested, and minted, under the zone word and its relay number rather than failing its setup on every poll.
+     */
+    const { emit, entries, platform, registered } = buildPlatform({ options: ["Enable.Device.Standalone." + ZONE_RELAY_ID.toString()] });
+
+    t.after(() => emit(SHUTDOWN));
+    await using dispatcher = installMockDispatcher();
+    programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
+    programJsonReply(dispatcher.agent, "statusschedule.php", makeStatusSchedule({ relays: [zoneFixture({ name: "\u{1F331}" })] }));
+
+    emit(DID_FINISH_LAUNCHING);
+    await waitUntil(() => registered().some((accessory) => accessory.UUID === zoneUuid(platform, syntheticController.controller_id, ZONE_RELAY_ID)),
+      { description: "the zone's own accessory registration", timeoutMs: 5000 });
+
+    const promoted = registered().find((accessory) => accessory.UUID === zoneUuid(platform, syntheticController.controller_id, ZONE_RELAY_ID));
+
+    assert.equal(promoted?.displayName, HYDRAWISE_ZONE_FALLBACK_NAME + " 1", "the zone's accessory is minted under the zone word and its relay number");
+    assert.equal(logCount(entries, "error", "Unable to establish a standalone accessory"), 0, "and its setup fails on no poll");
   });
 });

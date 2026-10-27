@@ -11,6 +11,9 @@
  * Two settings substrates meet here. A feature option is where a setting lives, and a handful of configuration properties are a second home the plugin honors
  * so that a configuration nobody has opened the webUI on keeps working. Reconciling the two is this module's whole job: the interpreters read them in
  * precedence order, and the migration moves a property's value into its option and marks the property for deletion.
+ *
+ * The page's naming rule sits beside them on the same terms, pure and import-free with HBPU's naming functions handed in, so the suites hold it to the runtime's
+ * own composers under Node.
  */
 
 // The number of characters in a Hydrawise API key, which is always nineteen. This is the VALIDATION fact the first-run screen gates on and stamps onto its
@@ -54,6 +57,35 @@ const ACTION_PREFIXES = [ "disable.", "enable." ];
  * later, and an entry that has already been rewritten costs nothing to re-examine.
  */
 const RETIRED_OPTION_RENAMES = new Map([[ "device.suspend", "Device.Suspend.All" ]]);
+
+// The words a controller and a zone are named by where HomeKit can carry nothing of any name they could take: this module's own copies of the runtime's, since
+// it imports nothing, held to them by the config suite's parity row.
+const CONTROLLER_FALLBACK_NAME = "Controller";
+const ZONE_FALLBACK_NAME = "Zone";
+
+/* Build the page's naming rule over HBPU's naming functions, injected as the engine is below so this module stays import-free. It mirrors the runtime's composers,
+ * controllerDisplayName and zoneDisplayName in src/types.ts, and the config suite's parity row holds the two to one answer: the user's Name where HomeKit can carry
+ * it, the reported name where HomeKit can carry that, and the kind's word otherwise, a zone's followed by its relay number. The name chosen is shown sanitized, as
+ * the runtime applies it to HomeKit, so the page names each controller and zone as HomeKit carries it.
+ *
+ * It takes no catalog, so a name is answerable before the catalog loads, in the window the degraded-mode interpreter covers.
+ *
+ * @param injected.displayedName - HBPU's displayedName: the resolved Name, or the fallback, sanitized.
+ * @param injected.sanitizeName  - HBPU's sanitizeName, which decides whether HomeKit can carry anything of the reported name.
+ *
+ * @returns The page's names: controllerName and zoneName, each taking the runtime composer's arguments and answering the name the page shows.
+ */
+export const makeHydrawiseNames = ({ displayedName, sanitizeName }) => {
+
+  // The name a Name HomeKit cannot carry yields to: the reported name where HomeKit can carry something of it, and the kind's word otherwise.
+  const fallbackOf = (reported, word) => (sanitizeName(reported).length ? reported : word);
+
+  return {
+
+    controllerName: ({ override, reported }) => displayedName({ fallback: fallbackOf(reported, CONTROLLER_FALLBACK_NAME), override }),
+    zoneName: ({ override, relay, reported }) => displayedName({ fallback: fallbackOf(reported, ZONE_FALLBACK_NAME + " " + relay.toString()), override })
+  };
+};
 
 /* Build the interpreter over an injected feature-option engine class and the option catalog the plugin's own UI server publishes. Injecting both is what keeps
  * this module import-free and testable under node against the real engine and the real catalog, rather than against a stand-in that could drift from either.

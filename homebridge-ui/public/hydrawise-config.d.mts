@@ -2,7 +2,7 @@
  *
  * hydrawise-config.d.mts: Type declarations for the pure Hydrawise platform-configuration interpreters.
  */
-import type { FeatureCategoryEntry, FeatureOptionEntry, FeatureOptions } from "homebridge-plugin-utils";
+import type { FeatureCategoryEntry, FeatureOptionEntry, FeatureOptions, displayedName, sanitizeName } from "homebridge-plugin-utils";
 
 /** The number of characters in a Hydrawise API key. */
 export declare const API_KEY_LENGTH: number;
@@ -90,6 +90,27 @@ export interface HydrawiseLegacyConfigInterpreter {
   username(config?: HydrawiseConfig): string;
   withFirstRun(config: HydrawiseConfig | undefined, values: HydrawiseFirstRunValues): HydrawiseLegacyConfigPatch;
 }
+
+/**
+ * The page's naming rule, mirroring the runtime's controller and zone composers in `src/types.ts`: each answers the name the page shows, sanitized as HomeKit
+ * carries it.
+ */
+export interface HydrawiseNames {
+
+  controllerName(names: { override?: string | null; reported: string }): string;
+  zoneName(names: { override?: string | null; relay: number; reported: string }): string;
+}
+
+/**
+ * Build the page's naming rule over HBPU's injected naming functions.
+ *
+ * @param injected.displayedName - HBPU's displayedName.
+ * @param injected.sanitizeName  - HBPU's sanitizeName.
+ *
+ * @returns The page's names.
+ */
+export declare const makeHydrawiseNames: ({ displayedName, sanitizeName }: { displayedName: typeof displayedName; sanitizeName: typeof sanitizeName }) =>
+  HydrawiseNames;
 
 /**
  * Build the interpreter over an injected feature-option engine class and the served option catalog.
