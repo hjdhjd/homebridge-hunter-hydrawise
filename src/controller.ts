@@ -14,8 +14,8 @@ import type { HydrawiseAccessory, HydrawiseControllerAccessory, HydrawiseControl
   HydrawiseControllerV2Facts, HydrawiseScheduleStatus, HydrawiseZoneConfig, HydrawiseZoneIdentity, HydrawiseZoneScheduleStatus, HydrawiseZoneSuspensionResult,
   SetZoneResponse, StatusScheduleResponse } from "./types.ts";
 import type { HydrawiseControllerOption, HydrawiseControllerValueOption, HydrawiseZoneOption, HydrawiseZoneValueOption } from "./options.ts";
-import { MQTT_AVAILABILITY_OFFLINE, MQTT_AVAILABILITY_ONLINE, acquireService, getServiceName, loopFaultReporter, mqttTopic, notResponding, prefixedLog, retry,
-  sameEntries, sanitizeName, setAccessoryName, setServiceName, superviseLoop, validCharacteristic, validService } from "homebridge-plugin-utils";
+import { MQTT_AVAILABILITY_OFFLINE, MQTT_AVAILABILITY_ONLINE, acquireService, getServiceName, loopFaultReporter, mqttTopic, notResponding, prefixedLog,
+  presenceChanged, retry, sameEntries, sanitizeName, setAccessoryName, setServiceName, superviseLoop, validCharacteristic, validService } from "homebridge-plugin-utils";
 import type { Dispatcher } from "undici";
 import type { HydrawisePlatform } from "./platform.ts";
 import { mqttTopics } from "./mqtt.ts";
@@ -397,20 +397,21 @@ export class HydrawiseController {
    *
    * The manufacturer and the serial always write. What happens to the model and the firmware depends on which of the following combinations holds.
    *
-   * Called WITH hardware, this writes it - that is the enrichment landing, and it writes unconditionally, comparing nothing first. HAP already drops a write whose
-   * value matches what the characteristic holds, so a compare here would only duplicate the library's own work and add a second place for the two answers to
-   * disagree.
+   * Called WITH hardware, this writes it - that is the enrichment landing, and it writes unconditionally, comparing nothing first. HAP sends HomeKit no event for
+   * a write whose value matches what the characteristic holds, so a compare here would only duplicate HAP's own work and add a second place for the two answers
+   * to disagree.
    *
    * Called WITHOUT hardware on the controller's OWN accessory while the account credentials are configured, it leaves BOTH alone. Those characteristics are the
-   * store: HAP restored real values from a previous session into them, and the fetch that will refresh those values is already on its way, so writing a
-   * placeholder over them would blank a correct display for the length of a network round trip. The single exception is an accessory that has never been
-   * stamped at all, which still carries HAP's own default model - there is nothing to preserve there, and leaving it would show the user a library-internal
-   * string, so the placeholder is written.
+   * store: HAP restored the model a previous session wrote, while Homebridge stamped its firmware placeholder on the restore, so a warm restart shows "0" for the
+   * firmware until the first refresh lands. The fetch that will refresh them is already on its way, so writing a placeholder over the model would blank a
+   * correct display for the length of a network round trip. The single exception is an accessory that has never been stamped at all, which still carries HAP's
+   * own default model - there is nothing to preserve there, and leaving it would show the user a library-internal string, so the placeholder is written.
    *
    * Called WITHOUT hardware and with no credentials configured, both write unconditionally: the product-line placeholder, and the firmware returned to the
-   * unknown-firmware marker Homebridge itself stamps on a restored accessory. That reset is what makes removing the credentials a clean revert - the
-   * characteristics outlive the credentials that populated them, so an omitted write would strand a real version on display permanently, with nothing left in the
-   * plugin that could refresh or correct it.
+   * unknown-firmware marker Homebridge itself stamps on a restored accessory. The model's reset is what makes removing the credentials a clean revert - the
+   * characteristic outlives the credentials that populated it, so an omitted write would strand a real model on display permanently, with nothing left in the
+   * plugin that could refresh or correct it. Homebridge stamps the firmware marker on every restore itself, so the firmware write changes only a fresh accessory,
+   * which HAP constructs with a default version of its own.
    */
   private configureInfo({ accessory, hardware, serialNumber }: { accessory: HydrawiseAccessory; hardware?: HydrawiseControllerHardware; serialNumber: string } =
     { accessory: this.accessory, serialNumber: this.controller.serial_number }): void {
@@ -457,11 +458,14 @@ export class HydrawiseController {
    * the snapshot this controller was holding on entry; a comparison written against the field after the store would read the new value on both sides and could
    * never report a change. The first arrival counts as a change whenever it carries hardware, since that arrival is the one that has to reach the disk.
    *
-   * The characteristics are the only store the hardware facts have. HAP round-trips them through Homebridge's on-disk accessory cache, so writing them here and
-   * flushing is the whole of the persistence - no parallel copy is kept, which is what keeps a restart from having two answers to reconcile.
+   * The characteristics are the store the hardware facts have, and no parallel copy is kept. HAP round-trips them through Homebridge's on-disk accessory cache,
+   * so writing them here and marking the accessory for the save window is the whole of the persistence, with one exception Homebridge itself makes: it stamps
+   * its firmware placeholder on every restore before the plugin sees the accessory, so a warm restart shows "0" for the firmware until the first refresh lands,
+   * while the model carries over.
    *
-   * The flush is CHANGE-GATED, and on a recurring cadence that gate is the point: a tick that moved nothing would otherwise write the accessory cache to disk
-   * every quarter hour for no reason at all. It fires when the projection moved or when the hardware genuinely differs from what this controller already held.
+   * The mark is CHANGE-GATED, and on a recurring cadence that gate is the point: a tick that moved nothing would otherwise write the accessory cache to disk
+   * every quarter hour for no reason at all. It is made only when the hardware genuinely differs from what this controller already held, and a projection the
+   * tick moved marks its own write.
    *
    * @param facts     - The hardware, availability, and per-zone facts the account API reported for this controller.
    * @param fetchedAt - The local instant, in epoch seconds, the request that fetched them was made.
@@ -475,11 +479,16 @@ export class HydrawiseController {
     if(facts.hardware) {
 
       this.configureInfo({ accessory: this.accessory, hardware: facts.hardware, serialNumber: this.controller.serial_number });
+
+      if(!this.sameHardware(prior?.hardware ?? null, facts.hardware)) {
+
+        this.platform.persistence.persist(this.accessory);
+      }
     }
 
     this.reportAvailability(facts.online);
 
-    this.rederiveProjection(!this.sameHardware(prior?.hardware ?? null, facts.hardware));
+    this.rederiveProjection();
 
     this.log.debug("Enhanced details updated: model %s, firmware %s, reachable %s, zones %s.", facts.hardware?.model ?? "unknown",
       facts.hardware?.firmware ?? "unknown", facts.online ?? "unknown", facts.zones.size.toString());
@@ -489,30 +498,22 @@ export class HydrawiseController {
    * classification outside a poll runs this: a refresh tick, which brings fresh account facts, and a successful suspension command, whose acceptance is itself a
    * fact about the zones it named.
    *
-   * Each write is CHANGE-GATED, which is what lets a recurring cadence run this freely. A tick or a command that moved no classification writes nothing to the
+   * Each write is CHANGE-GATED, which is what lets a recurring cadence run this freely. A tick or a command that moved no classification marks nothing for the
    * accessory cache and republishes no status payload, where an unconditional pair would write the cache to disk every quarter hour and republish an unchanged
-   * payload with it. The poll cadence keeps its own unconditional status publish, which is a contract of its own and deliberately not shared here. The
-   * availability word is re-judged at the end of every pass behind its own change gate, because the facts a tick brings can move the verdict without moving
-   * any zone's classification.
+   * payload with it. The projection marks its own write as it makes it, so the publish is the one gate left here. The poll cadence keeps its own unconditional
+   * status publish, which is a contract of its own and deliberately not shared here. The availability word is re-judged at the end of every pass behind its own
+   * change gate, because the facts a tick brings can move the verdict without moving any zone's classification.
    *
    * The facts are resolved ONCE and threaded through both the classification and the payload, on the same terms every other pass in this class resolves them, so
    * a lifetime boundary crossed midway cannot leave the two describing different worlds.
    *
-   * Before the first completed poll the projection step returns early with nothing to classify, so neither of its gates opens, and only the availability word can
-   * move.
-   *
-   * @param mustFlush - Whether something outside the projection also has to reach the accessory cache this pass, which the projection's own change gate cannot
-   *                    see. The hardware facts are the case: HAP's characteristics are their only store, so a hardware change has to be flushed to survive.
+   * Before the first completed poll the projection step returns early with nothing to classify, so it marks nothing and opens no publish, and only the
+   * availability word can move.
    */
-  private rederiveProjection(mustFlush = false): void {
+  private rederiveProjection(): void {
 
     const facts = this.currentFacts;
     const projectionChanged = this.applyProjection(facts);
-
-    if(projectionChanged || mustFlush) {
-
-      this.api.updatePlatformAccessories([this.accessory]);
-    }
 
     if(projectionChanged) {
 
@@ -538,12 +539,11 @@ export class HydrawiseController {
       return;
     }
 
-    this.accessory.context.controllers = roster;
-    this.api.updatePlatformAccessories([this.accessory]);
+    this.platform.persistence.persist(this.accessory, { controllers: roster });
   }
 
   // Compare two hardware answers field-wise, treating an absent answer as a value of its own so the first arrival against a null baseline reports as a change.
-  // Never by reference: each refresh composes a fresh object, so a reference check would call every tick a change and flush the accessory cache on every one.
+  // Never by reference: each refresh composes a fresh object, so a reference check would call every tick a change and save the accessory on every one.
   private sameHardware(a: Nullable<HydrawiseControllerHardware>, b: Nullable<HydrawiseControllerHardware>): boolean {
 
     if(!a || !b) {
@@ -682,8 +682,8 @@ export class HydrawiseController {
    * whose acceptance is a fact about the zones it named - so a suspension reaches HomeKit, the log, and the accessory cache with whatever learned of it rather
    * than waiting for the next poll.
    *
-   * The flush is deliberately NOT performed here. Each caller owns its own write policy - the poll folds this into the single cache write it already makes, while
-   * the refresh and command cadences gate theirs on the boolean returned here - so this method persists and reports, and never decides.
+   * The schedule write marks the accessory for the save window where it is made, so every cadence that moves the projection saves it with no write policy of its
+   * own. The boolean returned here gates the status publish alone: the refresh and command cadences publish on it, while the poll publishes on every pass.
    *
    * This is deliberately not a whole applyStatus re-run. That method also drives the standalone-accessory reconcile, whose wire-absence grace COUNTS POLLS, so
    * re-entering it outside a poll would double-count that grace and could demote an accessory the wire never actually dropped.
@@ -821,24 +821,20 @@ export class HydrawiseController {
    * One cadence carries every rename this plugin performs: this runs on the poll, exactly where the zone walk applies its own, so a controller and its zones
    * adopt a Hydrawise-side rename together rather than one of them lagging a refresh behind.
    *
-   * The gate is the irrigation system service's name, compared in its SANITIZED form on both sides exactly as the zone gate compares. HomeKit's naming rules
-   * cannot round-trip every configured value, and an unsanitized comparison would read those as differing on every poll and rewrite the same name forever. That
-   * service is this controller's primary label - the proxy the name getter itself reads - so what it carries decides what the accessory, the service label
-   * enumerating its zones, and the suspend-all switch are brought into line with.
+   * Each surface compares itself. The irrigation system service, the service label enumerating its zones, the accessory's own display pair and information
+   * service, and the suspend-all switch are each handed their name through HBPU's name helpers, which sanitize it, write only what differs, and answer whether
+   * they wrote. The comparison runs in the sanitized form on both sides, so a configured value HomeKit's naming rules cannot round-trip reads as unchanged rather
+   * than being rewritten on every poll, and a surface that drifted on its own - a tile renamed in the Home app, a switch restored from a session under another
+   * controller name - is brought back into line on its own terms. Any write marks the accessory for the save window, because the accessory's display name and
+   * its services' names live in Homebridge's cache, and a rename that never reached it would come back under its old label at the next restart.
    *
-   * A name with nothing left after sanitization skips every write this step performs, at every surface it touches. Those rules can empty a name outright, and a
-   * service must answer to something: setServiceName writes whatever it is handed, so without this gate an unusable name would blank the very labels the user
-   * navigates by. The accessory helper carries a guard of its own for the same reason, which is what a blanked pair would otherwise have cost.
-   *
-   * The accessory's display pair answers to the SERVICE name's gate rather than to one of its own. Creation writes both stores from the same effective name and this
-   * step rewrites both together, so the two move in lockstep and a single comparison settles whether either is stale.
+   * A name with nothing left after sanitization skips every write this step performs, at every surface it touches. The helpers refuse an empty name themselves,
+   * but the suspend-all switch's composed name keeps its bare suffix through sanitizing, so without this gate an unusable name would relabel the switch with a
+   * name that names no controller at all.
    *
    * @param facts - The account-credentialed facts this pass resolved, or null when there are none to trust.
-   *
-   * @returns Whether any name was written this pass, which is what lets a rename join the poll's single cache write - the accessory's display name lives in
-   *          Homebridge's cache, so a rename that never flushed would come back under its old label at the next restart.
    */
-  private applyControllerName(facts: Nullable<HydrawiseControllerFactsSnapshot>): boolean {
+  private applyControllerName(facts: Nullable<HydrawiseControllerFactsSnapshot>): void {
 
     const irrigationService = this.accessory.getService(this.hap.Service.IrrigationSystem);
 
@@ -847,53 +843,27 @@ export class HydrawiseController {
      */
     if(!irrigationService || !this.hasFeature("Device.SyncName")) {
 
-      return false;
+      return;
     }
 
     const effectiveName = this.controllerNameOverride("Device.Name") ?? this.controllerName(facts);
-    const sanitized = sanitizeName(effectiveName);
 
-    if(!sanitized.length) {
+    if(!sanitizeName(effectiveName).length) {
 
-      return false;
+      return;
     }
 
-    let renamed = false;
-
-    if(getServiceName(irrigationService) !== sanitized) {
-
-      setServiceName(irrigationService, effectiveName);
-
-      // The service label is acquired beside the irrigation system and created carrying the same name, so a rename that skipped it would leave the two disagreeing.
-      const labelService = this.accessory.getService(this.hap.Service.ServiceLabel);
-
-      if(labelService) {
-
-        setServiceName(labelService, effectiveName);
-      }
-
-      // The accessory's own display pair - the Home app's tile and the information service's name - is written here through the library helper that owns every
-      // write in it.
-      setAccessoryName(this.accessory, effectiveName);
-
-      renamed = true;
-    }
-
-    /* The suspend-all switch composes its name from the controller's, so it answers to a comparison against that COMPOSED form rather than to the one above: a
-     * switch the user renamed, or one restored from a session under a different controller name, is brought back into line on its own terms. The composed form
-     * needs no emptiness check of its own - it inherits non-emptiness from the controller half the gate above already required.
-     */
+    // The service label is created beside the irrigation system carrying the same name, and the suspend-all switch composes its name from the controller's, so
+    // each is handed the name it was created from.
+    const labelService = this.accessory.getService(this.hap.Service.ServiceLabel);
     const suspendService = this.accessory.getServiceById(this.hap.Service.Switch, HydrawiseReservedNames.SWITCH_SUSPEND_ALL);
-    const suspendName = effectiveName + " Suspend All Zones";
+    const writes = [ setServiceName(irrigationService, effectiveName), (labelService !== undefined) && setServiceName(labelService, effectiveName),
+      setAccessoryName(this.accessory, effectiveName), (suspendService !== undefined) && setServiceName(suspendService, effectiveName + " Suspend All Zones") ];
 
-    if(suspendService && (getServiceName(suspendService) !== sanitizeName(suspendName))) {
+    if(writes.includes(true)) {
 
-      setServiceName(suspendService, suspendName);
-
-      renamed = true;
+      this.platform.persistence.persist(this.accessory);
     }
-
-    return renamed;
   }
 
   /* Whether a suspension command still speaks for what it was issued against, which it does exactly while no fresher truth has arrived to supersede it. This is
@@ -1250,30 +1220,25 @@ export class HydrawiseController {
     const facts = this.currentFacts;
 
     // Bring this controller's own names into line before anything reads them, so the log prefix and every label this pass writes speak with one voice. What it
-    // wrote joins the flush below, because the accessory's display name is persisted in Homebridge's cache rather than derived on each start.
-    const nameChanged = this.applyControllerName(facts);
+    // wrote marks the accessory for the save window, because the accessory's display name is persisted in Homebridge's cache rather than derived on each start.
+    this.applyControllerName(facts);
 
-    /* Persist the identity roster, the schedule projection, and this controller's own identity, each on change, through one flush: whichever moved this poll lands in
-     * a single updatePlatformAccessories call, so a poll costs at most one cache write no matter how many projections it advanced. Every one of these runs before
-     * the enablement projection below, so what is persisted covers every reported zone, feature-disabled or not - the complete listing and schedule the webUI
-     * reads back from cache with no cloud call.
+    /* Persist the identity roster, the schedule projection, and this controller's own identity, each on change. Each write marks the accessory where it is made,
+     * and the platform's save window carries every mark this pass makes into one cache write, so a poll costs at most one write no matter how many projections it
+     * advanced. Every one of these runs before the enablement projection below, so what is persisted covers every reported zone, feature-disabled or not - the
+     * complete listing and schedule the webUI reads back from cache with no cloud call.
      *
      * The self-identity carries the controller's TRUE name rather than the label HomeKit shows, which is the same line the zone roster draws: a user's private
      * override is display, and what the webUI lists and the account roster denormalizes is what the controller actually is.
      */
-    const rosterChanged = this.persistZoneRoster(facts);
-    const scheduleChanged = this.applyProjection(facts);
+    this.persistZoneRoster(facts);
+    this.applyProjection(facts);
+
     const identity = this.identity;
-    const identityChanged = !this.accessory.context.controller || !sameControllerIdentity(this.accessory.context.controller, identity);
 
-    if(identityChanged) {
+    if(!this.accessory.context.controller || !sameControllerIdentity(this.accessory.context.controller, identity)) {
 
-      this.accessory.context.controller = identity;
-    }
-
-    if(rosterChanged || scheduleChanged || identityChanged || nameChanged) {
-
-      this.api.updatePlatformAccessories([this.accessory]);
+      this.platform.persistence.persist(this.accessory, { controller: identity });
     }
 
     // The classification this pass just persisted, keyed by relay. Every consumer below - the zone walk's seeds, its rain and status sentences - reads a zone's
@@ -1318,12 +1283,16 @@ export class HydrawiseController {
     /* Remove the controller accessory's valves for zones that no longer exist, that the user has disabled, or that live on a standalone accessory of their own.
      * The keep-set is derived from the hosting map rather than from the enablement projection, so pruning and hosting read one source of truth: a promoted zone's
      * controller-side valve is pruned by exactly this line, while a zone whose promotion failed keeps its valve here - which is where the walk below will host
-     * it. The map's number keys are bridged to the string subtypes each valve service carries.
+     * it. The map's number keys are bridged to the string subtypes each valve service carries. Each removal marks the controller accessory for the save window,
+     * since the cache holds the services an accessory carries.
      */
     const hostedZoneIds = new Set(this.enabledZones.filter(zone => !zoneAccessories.has(zone.relay_id)).map(zone => zone.relay_id.toString()));
 
-    this.accessory.services.filter(x => (x.UUID === this.hap.Service.Valve.UUID) && !hostedZoneIds.has(x.subtype ?? ""))
-      .map(x => this.accessory.removeService(x));
+    for(const valve of this.accessory.services.filter(x => (x.UUID === this.hap.Service.Valve.UUID) && !hostedZoneIds.has(x.subtype ?? ""))) {
+
+      this.accessory.removeService(valve);
+      this.platform.persistence.persist(this.accessory);
+    }
 
     let irrigationRemaining = 0;
 
@@ -1344,9 +1313,10 @@ export class HydrawiseController {
       /* The name this zone's valve carries, read from the pre-pass above. The fallback is the same wire name that pre-pass would itself have stored, which keeps
        * the read total.
        *
-       * The sanitized form is resolved once beside it and is what every rename gate below compares against, because HomeKit's naming rules can empty a name
-       * outright and setServiceName writes whatever it is handed. A zone whose effective name sanitizes to nothing therefore renames nothing at all - not its
-       * valve, not the accessory hosting it, not its companion switch - and keeps the labels it already carries.
+       * The sanitized form is resolved once beside it, and every rename gate below requires it to be non-empty. HomeKit's naming rules can empty a name outright,
+       * and while HBPU's name helpers refuse an empty name themselves, the companion switch's composed name keeps its bare suffix through sanitizing, so the gate
+       * is what makes a zone whose effective name sanitizes to nothing rename nothing at all - not its valve, not the accessory hosting it, not its companion
+       * switch - and keep the labels it already carries.
        */
       const effectiveName = effectiveNames.get(zone.relay_id) ?? zone.name;
       const sanitizedName = sanitizeName(effectiveName);
@@ -1379,6 +1349,12 @@ export class HydrawiseController {
         newService.updateCharacteristic(this.hap.Characteristic.ValveType, this.hap.Characteristic.ValveType.IRRIGATION);
       }, serviceType: this.hap.Service.Valve, subtype: zone.relay_id.toString() });
 
+      // A valve this pass attached changes the services the host carries, which the cache holds, so the host is marked for the save window.
+      if(presenceChanged(transition)) {
+
+        this.platform.persistence.persist(host);
+      }
+
       // Whether this process has yet to bind this valve, which is the establishment gate every first-binding step below reads: true for a valve this pass created,
       // for every valve on the first poll, and for a cached standalone valve a later poll hosts for the first time.
       const unbound = !this.bound.has(valveService);
@@ -1387,28 +1363,30 @@ export class HydrawiseController {
       // authoritative: it is applied whenever the service's name differs, so a Hydrawise rename lands on the next poll, a changed Name option lands at the
       // first poll after restart, and a rename made in the Home app yields to the configured truth. Synchronization is deliberately enabled by default,
       // because the names Hydrawise reports are the source of truth this integration projects into HomeKit and the Name option exists to correct them where
-      // Hydrawise truncates. With synchronization disabled, names are established at creation and never touched again, and a Home app rename persists.
-      if((transition !== "attached") && syncName && sanitizedName.length && (getServiceName(valveService) !== sanitizedName)) {
+      // Hydrawise truncates. With synchronization disabled, names are established at creation and never touched again, and a Home app rename persists. The
+      // name helper compares before it writes and answers whether it wrote, and a write marks the host for the save window.
+      if((transition !== "attached") && syncName && sanitizedName.length && setServiceName(valveService, effectiveName)) {
 
-        setServiceName(valveService, effectiveName);
+        this.platform.persistence.persist(host);
       }
 
       // A standalone zone accessory carries its own information service, established the first time this process binds the zone's valve on it. The zone carries no
-      // wire serial, so we synthesize one from the controller's serial and the relay id: stable, unique, and purely presentational.
+      // wire serial, so we synthesize one from the controller's serial and the relay id: stable, unique, and purely presentational. The cache holds those
+      // characteristics, so the host is marked for the save window.
       if(isStandaloneHost && unbound) {
 
         this.configureInfo({ accessory: host, serialNumber: this.controller.serial_number + "-" + zone.relay_id.toString() });
+        this.platform.persistence.persist(host);
       }
 
       /* Keep the standalone accessory's own top-level name tracking the effective name, on every poll and under the same gate the valve service answers to, so a
        * Hydrawise rename or a changed Name option lands on the accessory exactly when it lands on the valve. This sits outside the establishment gate above
-       * deliberately: a rename arriving on a later poll must still land. The flush is what persists the new name to Homebridge's cache, and it only runs when the
-       * name actually moved.
+       * deliberately: a rename arriving on a later poll must still land. The name helper compares every name the accessory carries before it writes, and a write
+       * marks the host for the save window, which is what persists the new name to Homebridge's cache.
        */
-      if(isStandaloneHost && syncName && sanitizedName.length && (host.displayName !== sanitizedName)) {
+      if(isStandaloneHost && syncName && sanitizedName.length && setAccessoryName(host, effectiveName)) {
 
-        setAccessoryName(host, effectiveName);
-        this.api.updatePlatformAccessories([host]);
+        this.platform.persistence.persist(host);
       }
 
       /* This zone's classified state, which decides what the user is SHOWN, and the sensor reading the rain transition and the program-mode aggregate answer to.
@@ -1592,7 +1570,7 @@ export class HydrawiseController {
      * wherever a zone's services landed - the platform's reconcile decides which accessories exist and never touches a service.
      *
      * The match is on the COMPOSED SUBTYPE, never on the Switch service type alone: the account-wide suspend switch shares that type, and an unscoped sweep would
-     * destroy it.
+     * destroy it. Each removal marks the accessory it came off for the save window.
      */
     for(const suspendHost of new Set<HydrawiseAccessory>([ this.accessory, ...this.zoneHosts.values() ])) {
 
@@ -1601,6 +1579,7 @@ export class HydrawiseController {
         if(suspendHosts.get(service.subtype ?? "") !== suspendHost) {
 
           suspendHost.removeService(service);
+          this.platform.persistence.persist(suspendHost);
         }
       }
     }
@@ -1662,14 +1641,20 @@ export class HydrawiseController {
     const subtype = suspendZoneSubtype(zone.relay_id);
     const { service, transition } = acquireService({ accessory: host, name, serviceType: this.hap.Service.Switch, subtype });
 
+    // A switch this pass attached changes the services the host carries, which the cache holds, so the host is marked for the save window.
+    if(presenceChanged(transition)) {
+
+      this.platform.persistence.persist(host);
+    }
+
     /* The switch's name tracks its zone's on every poll, under the gate the valve answers to, so a Hydrawise rename reaches the companion rather than stranding it
      * under a name the zone no longer carries. The emptiness half of that gate is asked of the ZONE's own sanitized name rather than of the composed one: the
      * composed name inherits its non-emptiness from the zone half, so a zone whose name sanitizes to nothing would otherwise rename its switch to the bare
-     * suffix - a label naming no zone at all.
+     * suffix - a label naming no zone at all. The name helper compares before it writes, and a write marks the host for the save window.
      */
-    if((transition !== "attached") && syncName && sanitizedName.length && (getServiceName(service) !== sanitizeName(name))) {
+    if((transition !== "attached") && syncName && sanitizedName.length && setServiceName(service, name)) {
 
-      setServiceName(service, name);
+      this.platform.persistence.persist(host);
     }
 
     /* Bind the handler under the establishment gate the valve uses - a switch this process has not yet bound - so a warm restart, where the service returns from
@@ -1974,16 +1959,12 @@ export class HydrawiseController {
     return Array.isArray(candidate.relays) && Array.isArray(candidate.sensors) && (typeof candidate.nextpoll === "number");
   }
 
-  /* Write the reported zone roster to the accessory context when it changed since the last poll, and report whether it wrote. We project every reported zone to the
-   * identity-only shape, naming each field explicitly rather than spreading the wire zone, ordered by relay for a stable comparison. The comparison is field-wise
-   * because the projection is a fresh array every poll, so a reference check would differ every time and write on every poll. A rare single-poll flap that flips a
-   * field and back across two polls costs two writes, which we accept - roster changes are rare and a write is cheap.
-   *
-   * The return value is the change signal the applyStatus chokepoint reads: this method persists to the context but never flushes, because the chokepoint is the one
-   * consumer that turns any projection's change into the poll's single cache write. A future caller that discards the signal forfeits that write, and the fresh-seed
-   * cadence assertion fails when it does, since the seed's flush would never land.
+  /* Write the reported zone roster to the accessory context when it changed since the last poll, marking the accessory for the save window as it writes. We project
+   * every reported zone to the identity-only shape, naming each field explicitly rather than spreading the wire zone, ordered by relay for a stable comparison. The
+   * comparison is field-wise because the projection is a fresh array every poll, so a reference check would differ every time and write on every poll. A rare
+   * single-poll flap that flips a field and back across two polls costs two writes, which we accept - roster changes are rare and a write is cheap.
    */
-  private persistZoneRoster(facts: Nullable<HydrawiseControllerFactsSnapshot>): boolean {
+  private persistZoneRoster(facts: Nullable<HydrawiseControllerFactsSnapshot>): void {
 
     const zones = this.status.relays.map(zone => ({ ...zoneIdentity(zone), name: this.zoneName(zone, facts) })).sort((a, b) => a.relay - b.relay);
 
@@ -1991,23 +1972,22 @@ export class HydrawiseController {
     // than an expected path.
     if(sameEntries(this.accessory.context.zones ?? [], zones, sameZoneIdentity)) {
 
-      return false;
+      return;
     }
 
-    this.accessory.context.zones = zones;
-
-    return true;
+    this.platform.persistence.persist(this.accessory, { zones });
   }
 
-  /* Write the schedule projection to the accessory context when it changed since the last poll, and report whether it wrote - the roster's discipline above applied
-   * to the volatile half of what this accessory persists. The projection stores absolute instants, so an unchanged schedule projects byte-identically poll after
-   * poll and the comparison takes the no-change return; a projection compared before any has been persisted is a change by definition and seeds the context.
+  /* Write the schedule projection to the accessory context when it changed since the last poll, marking the accessory for the save window as it writes, and report
+   * whether it wrote - the roster's discipline above applied to the volatile half of what this accessory persists. The projection stores absolute instants, so an
+   * unchanged schedule projects byte-identically poll after poll and the comparison takes the no-change return; a projection compared before any has been persisted
+   * is a change by definition and seeds the context.
    *
    * This is where the witnesses meet. The commands map is composed from the per-zone records this pass has already swept, so every entry in it is standing
    * by construction and the classifier is handed direction alone - one place decides what still stands, and one classification weighs it against the wire and the
    * account's own facts. Composing here rather than overlaying at each consumer is what keeps the webUI, MQTT, the log, and the switches reading one answer.
    *
-   * Like the roster it never flushes, and the applyStatus chokepoint is the single consumer of the signal it returns.
+   * The signal it returns gates the status publish a refresh or a command makes, and nothing else: the mark here is the save.
    */
   private persistScheduleStatus(facts: Nullable<HydrawiseControllerFactsSnapshot>): boolean {
 
@@ -2021,7 +2001,7 @@ export class HydrawiseController {
       return false;
     }
 
-    this.accessory.context.schedule = schedule;
+    this.platform.persistence.persist(this.accessory, { schedule });
 
     return true;
   }

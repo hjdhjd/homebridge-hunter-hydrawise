@@ -17,9 +17,9 @@ import type { CharacteristicValue, Characteristic as HapCharacteristic, Platform
 import { HAP_DEFAULT_MODEL, HOMEBRIDGE_UNKNOWN_FIRMWARE, HYDRAWISE_API_JITTER, HYDRAWISE_REVERT_DELAY, HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
 import type { HydrawiseControllerHardware, StatusScheduleResponse } from "./types.ts";
 import { TestClock, advanceThroughSchedule, hapStatus, logCount, present, triggerGet, triggerSet, waitUntil } from "homebridge-plugin-utils/testing";
+import { controllerIdentity, suspendZoneSubtype, zoneAccessoryId } from "./types.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
-import { suspendZoneSubtype, zoneAccessoryId } from "./types.ts";
 import type { BuildControllerResult } from "./testing/platform.helpers.ts";
 import { HAPStatus } from "homebridge-plugin-utils";
 import assert from "node:assert/strict";
@@ -175,7 +175,22 @@ describe("HydrawiseController facts adoption", () => {
      * comparison written after the overwrite would read the new value on both sides, find no difference, and flush zero times.
      */
     assert.equal(h.flushes().length - before, 1, "the first arrival carrying hardware flushes the accessory cache exactly once");
-    assert.deepEqual(h.flushes().at(-1), [h.accessory], "the flush names the accessory that changed and nothing else");
+    assert.ok(h.flushes().at(-1)?.includes(h.accessory), "the save names the accessory that changed");
+  });
+
+  test("a tick that moves the hardware and the account roster saves the accessory once", () => {
+
+    /* The hardware write and the recomposed roster's write land on one accessory in one tick, in the order the platform's refresh hands them over. Every mark
+     * falls inside one save window, so the accessory cache is written once for the tick rather than once for each write.
+     */
+    const h = buildController({ hasV2Client: true });
+    const before = h.flushes().length;
+
+    h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: now() });
+    h.controller.applyRoster([ controllerIdentity(h.controllerConfig), { controllerId: 500002, name: "Second Controller", serialNumber: "SN9Z8Y7X6W5" } ]);
+
+    assert.equal(h.flushes().length - before, 1, "the hardware and the roster share one cache write");
+    assert.ok(h.flushes().at(-1)?.includes(h.accessory), "and that write carries the accessory the tick changed");
   });
 
   test("a tick that moves nothing flushes ZERO times", () => {

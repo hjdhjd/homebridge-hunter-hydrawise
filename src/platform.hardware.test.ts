@@ -124,33 +124,48 @@ describe("HydrawisePlatform hardware distribution", () => {
     t.after(() => emit(SHUTDOWN));
     await using dispatcher = installMockDispatcher();
 
-    /* The map is deliberately keyed in the OPPOSITE order to the account's controller list, and both entries carry facts the other controller could plausibly own.
-     * A distribution that matched positionally rather than by id would swap them, and each assertion below would then read the sibling's model.
+    /* The second fetch's map is deliberately keyed in the OPPOSITE order to the account's controller list, and both entries carry facts the other controller could
+     * plausibly own. A distribution that matched positionally rather than by id would swap them, and each assertion below would then read the sibling's model.
+     *
+     * The first fetch carries no hardware, so discovery's saves and the first polls' are behind the count taken below before any hardware lands, and the tick this
+     * row drives is the only thing that can save it.
      */
-    installV2Client(platform, makeTestV2Client(new Map([ [ SECOND_CONTROLLER.controller_id, makeV2Facts({ hardware: SECOND_HARDWARE }) ],
-      [ syntheticController.controller_id, makeV2Facts({ hardware: FIRST_HARDWARE }) ] ])).client);
+    const { client, fetches } = makeTestV2Client((fetch) => (fetch === 1) ?
+      new Map([ [ SECOND_CONTROLLER.controller_id, makeV2Facts() ], [ syntheticController.controller_id, makeV2Facts() ] ]) :
+      new Map([ [ SECOND_CONTROLLER.controller_id, makeV2Facts({ hardware: SECOND_HARDWARE }) ], [ syntheticController.controller_id,
+        makeV2Facts({ hardware: FIRST_HARDWARE }) ] ]));
+
+    installV2Client(platform, client);
 
     programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails({ controllers: [ { ...syntheticController }, { ...SECOND_CONTROLLER } ] }));
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
 
-    // The refresh loop's first tick runs on its own schedule, so each wait is on the characteristic actually landing rather than on discovery returning.
     const firstUuid = platform.hap.uuid.generate(syntheticController.controller_id.toString());
     const secondUuid = platform.hap.uuid.generate(SECOND_CONTROLLER.controller_id.toString());
     const first = await waitFor(() => registered().find(accessory => accessory.UUID === firstUuid), { description: "the first controller's accessory to register" });
     const second = await waitFor(() => registered().find(accessory => accessory.UUID === secondUuid), { description: "the second controller's accessory to register" });
 
-    await waitUntil(() => informationValue(first, Characteristic.Model) === FIRST_HARDWARE.model, { description: "the first controller's model to apply" });
-    await waitUntil(() => informationValue(second, Characteristic.Model) === SECOND_HARDWARE.model, { description: "the second controller's model to apply" });
+    // The refresh loop's first tick and each controller's first poll run on their own schedules, so the wait is on each having landed.
+    await waitUntil(() => (fetches() >= 1) && [ first, second ].every(accessory => (accessory.context as HydrawiseAccessoryContext).schedule !== undefined),
+      { description: "the first refresh tick and each controller's first poll" });
 
+    const savesBefore = updated().length;
+
+    await refreshV2FactsOnce(platform);
+
+    assert.equal(informationValue(first, Characteristic.Model), FIRST_HARDWARE.model, "the first controller shows its own model");
+    assert.equal(informationValue(second, Characteristic.Model), SECOND_HARDWARE.model, "the second controller shows its own model");
     assert.equal(informationValue(first, Characteristic.FirmwareRevision), FIRST_HARDWARE.firmware, "the first controller shows its own firmware");
     assert.equal(informationValue(second, Characteristic.FirmwareRevision), SECOND_HARDWARE.firmware, "the second controller shows its own firmware");
 
-    // The durable half of the same claim: the characteristics ARE the store, so each accessory was flushed once with its own values and the next restart reads
-    // them straight back.
-    assert.ok(updated().some(batch => batch.includes(first)), "the first controller's accessory was flushed to the disk cache");
-    assert.ok(updated().some(batch => batch.includes(second)), "the second controller's accessory was flushed to the disk cache");
+    // The durable half of the same claim: the characteristics ARE the store, so the tick that landed the hardware saved each accessory with its own values and
+    // the next restart reads the model straight back.
+    const saves = updated().slice(savesBefore);
+
+    assert.ok(saves.some(batch => batch.includes(first)), "the tick's save carries the first controller's accessory");
+    assert.ok(saves.some(batch => batch.includes(second)), "and the second controller's");
   });
 
   test("the account's controller name reaches every persisted identity at once", async (t) => {

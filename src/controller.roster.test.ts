@@ -1,21 +1,24 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
  * controller.roster.test.ts: The accessory-context identity rosters HydrawiseController persists - the self identity and denormalized account roster seeded
- * at construction (with a prior zone roster preserved or shape-degraded across the wipe), and the zone roster written and flushed on change from each poll. These
- * assertions fix the zero-cloud-call source the webUI reads back: the full reported zone set (feature-disabled zones included), identity fields only, flushed exactly
- * once per change and never on an unchanged poll.
+ * at construction (with a prior zone roster preserved or shape-degraded across the wipe), the zone roster written and saved on change from each poll, and the
+ * account roster a refresh tick hands over. These assertions fix the zero-cloud-call source the webUI reads back: the full reported zone set (feature-disabled
+ * zones included), identity fields only, saved exactly once per change and never on an unchanged poll.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
 import type { HydrawiseAccessoryContext, HydrawiseControllerIdentity, HydrawiseZoneConfig, HydrawiseZoneIdentity, StatusScheduleResponse } from "./types.ts";
+import { Service, buildController, makeV2Facts, seedEstablished } from "./testing/platform.helpers.ts";
 import { bareSensors, normalZoneMatrix } from "./api.fixtures.ts";
 import { describe, test } from "node:test";
 import { expectAt, waitUntil } from "homebridge-plugin-utils/testing";
 import { fastPolling, makeStatusSchedule, makeZone, normalSchedule } from "./api.helpers.ts";
+import { HYDRAWISE_ACTIVE_ZONE_INDICATOR } from "./settings.ts";
 import assert from "node:assert/strict";
 import { assertSameShape } from "./testing.helpers.ts";
-import { buildController } from "./testing/platform.helpers.ts";
+import { getServiceName } from "homebridge-plugin-utils";
+import { scheduleStatus } from "./types.ts";
 
 // The synthetic controller identity the default fixture carries, and a disabled sibling, so the denormalized account roster the platform passes in carries more than
 // one controller.
@@ -117,7 +120,8 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
     const alpha = makeZone({ name: "Alpha", relay: 1, relay_id: 700001, run: 480, time: 68000, timestr: "16:00" });
     const beta = makeZone({ name: "Beta", relay: 1, relay_id: 700001, run: 480, time: 68000, timestr: "16:00" });
 
-    // Seed the context with the pre-rename roster so poll 1 matches and does not flush; the rename is then the sole flush.
+    // Seed the context with the pre-rename roster so poll 1's roster matches: that poll's one save carries the schedule seed and the valve it attaches, and the
+    // rename is then the run's only other save.
     const h = buildController({ program: (recorder) => {
 
       recorder.program("statusschedule.php", { body: schedule([alpha]), kind: "response" });
@@ -129,7 +133,7 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
     await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 3, { description: "the third status poll" });
     h.abort();
 
-    assert.equal(h.flushes().length, 2, "the matching first poll flushes the schedule seed alone; the rename then flushes exactly once");
+    assert.equal(h.flushes().length, 2, "the matching first poll saves once for the schedule seed and its valve; the rename then saves exactly once");
     assert.equal(expectAt(contextOf(h.accessory).zones ?? [], 0, "zone").name, "Beta", "the persisted roster adopted the renamed zone");
   });
 
@@ -138,7 +142,8 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
     const first = makeZone({ name: "First", relay: 1, relay_id: 700001, run: 480, time: 68000, timestr: "16:00" });
     const second = makeZone({ name: "Second", relay: 2, relay_id: 700002, run: 480, time: 68000, timestr: "16:00" });
 
-    // Seed the context with both zones so poll 1 matches; the disappearance of the second zone is then the sole flush.
+    // Seed the context with both zones so poll 1's roster matches: that poll's one save carries the schedule seed and the valves it attaches, and the second
+    // zone's disappearance is then the run's only other save.
     const h = buildController({ program: (recorder) => {
 
       recorder.program("statusschedule.php", { body: schedule([ first, second ]), kind: "response" });
@@ -150,8 +155,35 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
     await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 3, { description: "the third status poll" });
     h.abort();
 
-    assert.equal(h.flushes().length, 2, "the matching first poll flushes the schedule seed alone; the vanished zone then flushes exactly once");
+    assert.equal(h.flushes().length, 2, "the matching first poll saves once for the schedule seed and its valves; the vanished zone then saves exactly once");
     assert.equal(contextOf(h.accessory).zones?.length, 1, "the persisted roster dropped the vanished zone");
+  });
+
+  test("a zone rename under a synchronization opt-out saves once, the roster's own write alone", async (t) => {
+
+    /* The roster's mark measured where nothing else can stand in for it. The opt-out keeps the valve under the name it was created with, so the rename moves no
+     * service name, and the projections and the services earlier polls established are seeded to match the first poll, so that poll saves nothing at all.
+     */
+    const alpha = makeZone({ name: "Alpha", relay: 1, relay_id: 700001, run: 480, time: 68000, timestr: "16:00" });
+    const beta = makeZone({ name: "Beta", relay: 1, relay_id: 700001, run: 480, time: 68000, timestr: "16:00" });
+    const h = buildController({ program: (recorder) => {
+
+      recorder.program("statusschedule.php", { body: schedule([alpha]), kind: "response" });
+      recorder.programDefault("statusschedule.php", { body: schedule([beta]), kind: "response" });
+    }, seedContext: (seed) => {
+
+      seed.context = { schedule: scheduleStatus(schedule([alpha]), HYDRAWISE_ACTIVE_ZONE_INDICATOR), zones: zoneRoster([alpha]) };
+      seedEstablished({ accessory: seed, zones: [alpha] });
+    }, signalAborted: false, userOptions: ["Disable.Device.SyncName." + SELF_IDENTITY.serialNumber] });
+
+    t.after(() => h.abort());
+
+    await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 3, { description: "the third status poll" });
+    h.abort();
+
+    assert.equal(h.flushes().length, 1, "the rename saves exactly once, and nothing else in the run saves at all");
+    assert.equal(expectAt(contextOf(h.accessory).zones ?? [], 0, "zone").name, "Beta", "the persisted roster adopted the renamed zone");
+    assert.equal(getServiceName(h.accessory.getServiceById(Service.Valve, "700001")), "Alpha", "while the opted-out valve keeps the name it was created with");
   });
 
   test("a runtime-built context conforms to the persisted identity shapes and survives a JSON round trip", async (t) => {
@@ -182,5 +214,34 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
     // The whole context is plain, JSON-serializable data: a round trip through JSON returns an equal value, so Homebridge's cache save can never fail on a
     // non-serializable context field.
     assert.deepEqual(JSON.parse(JSON.stringify(context)), context, "the persisted context is plain data that survives a JSON round trip");
+  });
+});
+
+describe("HydrawiseController account-roster persistence (refresh)", () => {
+
+  test("a refresh tick that moves only the account roster saves once, and an unchanged roster saves nothing", () => {
+
+    /* A tick hands the controller its facts and then the recomposed roster, as the platform's refresh does. These facts move nothing, and the signal starts
+     * aborted so no poll runs, which leaves the roster's own write as the only thing that can mark the accessory.
+     */
+    const h = buildController({ hasV2Client: true });
+    const tick = (roster: HydrawiseControllerIdentity[]): void => {
+
+      h.controller.applyFacts({ facts: makeV2Facts(), fetchedAt: Math.floor(Date.now() / 1000) });
+      h.controller.applyRoster(roster);
+    };
+
+    tick([SELF_IDENTITY]);
+
+    const settled = h.flushes().length;
+
+    tick([ SELF_IDENTITY, SIBLING_IDENTITY ]);
+
+    assert.equal(h.flushes().length, settled + 1, "a roster that gained a sibling saves exactly once");
+
+    tick([ SELF_IDENTITY, SIBLING_IDENTITY ]);
+
+    assert.equal(h.flushes().length, settled + 1, "and the same roster on the next tick saves nothing");
+    assert.deepEqual(contextOf(h.accessory).controllers, [ SELF_IDENTITY, SIBLING_IDENTITY ], "the persisted account roster carries the sibling");
   });
 });

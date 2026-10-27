@@ -3,9 +3,9 @@
  * platform.ts: homebridge-hunter-hydrawise platform class.
  */
 import type { API, Characteristic, DynamicPlatformPlugin, HAP, Logging, PlatformAccessory, PlatformConfig } from "homebridge";
-import { APIEvent, FeatureOptions, MQTT_AVAILABILITY_OFFLINE, RateBudget, TimerRegistry, armDeadline, classifyTransportError, composeSignals, createApiDispatcher,
-  createMqttClient, debugGatedLog, formatErrorMessage, loopFaultReporter, mqttTopic, notResponding, repeatDemotedLog, retry, sanitizeName, superviseLoop,
-  systemClock } from "homebridge-plugin-utils";
+import { APIEvent, AccessoryPersistence, FeatureOptions, MQTT_AVAILABILITY_OFFLINE, RateBudget, TimerRegistry, armDeadline, classifyTransportError, composeSignals,
+  createApiDispatcher, createMqttClient, debugGatedLog, formatErrorMessage, loopFaultReporter, mqttTopic, notResponding, repeatDemotedLog, retry, sanitizeName,
+  superviseLoop, systemClock } from "homebridge-plugin-utils";
 import type { Categories, Clock, HomebridgePluginLogging, MqttClient, Nullable, RepeatDemotedLog } from "homebridge-plugin-utils";
 import type { CustomerDetailsResponse, HydrawiseAccessory, HydrawiseAccessoryContext, HydrawiseControllerAccessory, HydrawiseControllerConfig,
   HydrawiseControllerIdentity, HydrawiseEndpoint, HydrawiseZoneIdentity, HydrawiseZoneSuspensionResult } from "./types.ts";
@@ -58,6 +58,12 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   public readonly hap: HAP;
   public readonly log: HomebridgePluginLogging;
   public readonly mqtt: Nullable<MqttClient>;
+
+  /* The one path every change to what Homebridge's accessory cache holds for this plugin's accessories takes: each change marks its accessory where it is made,
+   * and every accessory marked within one save window reaches the cache in a single write, while a removal goes through its unregister so no pending save can
+   * return the accessory to the cache. Registration stays Homebridge's own call, which writes the cache itself.
+   */
+  public readonly persistence: AccessoryPersistence;
 
   /* The request log: how every request through retrieve() reports its failure. One adapter serves the platform's whole life, so a failure is reported in full the
    * first time, at debug for as long as the same reason holds, and in full again once the reason changes or a request succeeds in between. A reader at debug still
@@ -164,6 +170,10 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     // built here beside the budgets, ahead of the missing-API-key return below. Its lifetime IS the shutdown signal - the abort drains whatever is pending and
     // leaves every later registration inert - so it takes no teardown-stack registration of its own, on the same terms as the MQTT client below.
     this.timers = new TimerRegistry({ clock: this.clock, signal: this.signal });
+
+    // The accessory cache's save path, built here beside the registry for the same reason: construction arms no timer, and the helper subscribes to Homebridge's
+    // shutdown itself to save whatever is waiting, so it takes no teardown-stack registration of its own.
+    this.persistence = new AccessoryPersistence({ api, clock: this.clock, platformName: PLATFORM_NAME, pluginIdentifier: PLUGIN_NAME });
 
     /* Assemble the effective configuration. This is the one place a raw configuration property and a configured feature option meet: every consolidated setting
      * resolves through the engine's one precedence here - an explicitly configured option rules in every state it can be in, a legacy configuration property
@@ -585,7 +595,8 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
     /* Recompose the denormalized account roster now that every controller has this tick's facts, and hand it to each of them. A configured controller answers for
      * its own name - the account's where it has one - while a controller this plugin never built can only be described by the wire, and the roster carries both
-     * kinds because the webUI lists the whole account from any one accessory. Each controller writes and flushes only when its own copy actually moved.
+     * kinds because the webUI lists the whole account from any one accessory. Each controller writes its copy, and marks its accessory for the save window, only
+     * when that copy actually moved.
      */
     const roster = this.account.controllers.map(controller => this.configuredController(controller)?.identity ?? controllerIdentity(controller));
 
@@ -710,7 +721,8 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
     this.log.info("Configuring irrigation controller: %s (serial: %s id: %s).", controller.name, controller.serial_number, controller.controller_id);
 
-    /* Add it to our list of configured devices. The controller seeds its accessory context during construction; the flush just below persists that seed.
+    /* Add it to our list of configured devices. The controller seeds its accessory context and reconciles its services as it constructs, which runs synchronously
+     * inside this call, so the one mark just below carries everything construction changed into the next save.
      *
      * The cast to the controller arm is sound by construction, and it is the one place the narrowing cannot be derived from a predicate. A controller
      * accessory's UUID is seeded from the bare controller_id above, while every zone accessory's is seeded from the `.Zone.`-infixed compound, so the
@@ -719,7 +731,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
      */
     this.configuredDevices[uuid] = new HydrawiseController(this, accessory as HydrawiseControllerAccessory, controller, roster);
 
-    this.api.updatePlatformAccessories([accessory]);
+    this.persistence.persist(accessory);
 
     return this.configuredDevices[uuid];
   }
@@ -756,10 +768,9 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
     this.log.info("%s: Removing device from HomeKit.", accessory.displayName);
 
-    // Unregister the accessory and delete its remnants from HomeKit.
-    this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+    // Unregister the accessory, which drops any save still pending for it and has Homebridge write its cache without it, and stop tracking it.
+    this.persistence.unregister([accessory]);
     this.accessories.splice(index, 1);
-    this.api.updatePlatformAccessories(this.accessories);
   }
 
   /** Reconcile this controller's standalone zone accessories against one poll's truth - the single chokepoint through which every zone-accessory creation, context
@@ -772,9 +783,9 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
    * change, so it is demoted at once; a zone missing from both is a wire absence, which is graced for a few polls because a transient flake must never destroy a
    * HomeKit identity the user placed in a room.
    *
-   * The flush shape differs by arm, and every one of them is strictly on-change. A demotion flushes the whole array through removeAccessory's own tail, while a
-   * creation or a context refresh flushes just its accessory. A poll on which a zone is renamed on the wire can therefore produce this context flush and the
-   * controller's own accessory-name flush for the same accessory - two flushes on one rename poll, self-limiting and accepted.
+   * Every arm's cache write is strictly on-change. A demotion unregisters its accessory, which has Homebridge write its cache, while a creation or a context
+   * refresh marks just its accessory for the platform's save window. A poll on which a zone is renamed on the wire marks the same accessory here and again for
+   * the controller's own accessory-name write, and the window carries the marks as one save.
    *
    * This method never touches a service: what lands on a hosted accessory is the controller's business.
    *
@@ -837,20 +848,15 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       const uuid = this.hap.uuid.generate(zoneAccessoryId(controller.controller_id, zone.identity.relayId));
       let accessory = this.accessories.find(entry => entry.UUID === uuid);
 
-      // The accessory this call itself registered, if any. It is the only thing a fault below may undo: an accessory that already existed is not this call's to
-      // remove, and one whose registration threw was never tracked in the first place.
-      let created: Nullable<HydrawiseAccessory> = null;
-
-      /* The whole per-zone sequence sits in one try. A fault establishing one zone must never end the controller's polling loop, and must leave no ghost behind:
-       * we undo a registration this call performed, omit the zone from the returned map - which sends the controller's hosting back to the controller accessory
-       * for this poll - and carry on with the remaining zones. The next poll retries.
+      /* The whole per-zone sequence sits in one try. A fault establishing one zone must never end the controller's polling loop: we log it, omit the zone from the
+       * returned map - which sends the controller's hosting back to the controller accessory for this poll - and carry on with the remaining zones. A registration
+       * that throws leaves no ghost behind, because addAccessory tracks an accessory only once Homebridge has taken it, and the next poll retries.
        */
       try {
 
         if(!accessory) {
 
           accessory = this.addAccessory(sanitizeName(zone.displayName), uuid, HYDRAWISE_ZONE_ACCESSORY_CATEGORY);
-          created = accessory;
 
           // A fresh accessory starts with a fresh grace window even when an earlier accessory at this UUID was removed for sustained absence, so an inherited
           // count can never truncate the new one.
@@ -861,8 +867,9 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
         }
 
         /* Seed or refresh the persisted identity pair. The comparison is field-wise because both halves are freshly built projections, so a reference check would
-         * differ every poll and flush every poll. On any difference - or on a context that fails the kind predicate, which is how an ambiguous or corrupt cache
-         * entry heals - we assign a COMPLETE fresh object rather than individual fields, which re-asserts the kinds' mutual exclusivity at every write.
+         * differ every poll and save every poll. On any difference - or on a context that fails the kind predicate, which is how an ambiguous or corrupt cache
+         * entry heals - we assign a COMPLETE fresh object rather than individual fields, which re-asserts the kinds' mutual exclusivity at every write, and then
+         * mark the accessory. The mark merges nothing, because a field merge onto an ambiguous context would keep the stray fields that made it ambiguous.
          */
         // The owner stamp reads the controller's own identity where this plugin built one, so a zone accessory names its owner exactly as that owner names itself
         // - the account's full name included. The wire projection is the floor for a controller no runtime object answers for.
@@ -873,7 +880,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
           !sameZoneIdentity(context.zone, zone.identity)) {
 
           accessory.context = { ownerController, zone: zone.identity };
-          this.api.updatePlatformAccessories([accessory]);
+          this.persistence.persist(accessory);
         }
 
         hosts.set(zone.identity.relayId, accessory);
@@ -881,11 +888,6 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
         this.log.error("%s: Unable to establish a standalone accessory for this zone: %s", zone.displayName,
           util.inspect(error, { colors: true, depth: null, sorted: true }));
-
-        if(created) {
-
-          this.removeAccessory(created);
-        }
       }
     }
 

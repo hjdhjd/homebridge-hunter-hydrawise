@@ -179,10 +179,10 @@ export const HYDRAWISE_SUSPEND_DURATION = 31556926;
  * accessory it restores from its cache, before a plugin is handed that accessory - so writing it is how this plugin says "no firmware version is known" in the
  * platform's own vocabulary rather than inventing a second spelling of the same idea.
  *
- * It is a real write rather than an omitted one on purpose. HAP round-trips characteristic values through Homebridge's accessory cache, so an accessory whose
- * firmware was once populated keeps showing that version until something writes over it; without this write, removing the account credentials would strand a real
- * version on display permanently. On a restored accessory the write matches what Homebridge already stamped, which HAP drops as a same-value write, so the
- * unenriched display is exactly what it has always been.
+ * It is a real write rather than an omitted one on purpose. Homebridge stamps it on every accessory it restores, while a fresh accessory carries HAP's own default
+ * version instead, so the write is what gives an unenriched controller one spelling of an unknown version whichever way its accessory arrived. On a restored
+ * accessory the write matches what Homebridge already stamped, so HAP sends HomeKit no event for it, and the unenriched display is exactly what it has always
+ * been.
  */
 export const HOMEBRIDGE_UNKNOWN_FIRMWARE = "0";
 

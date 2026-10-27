@@ -8,8 +8,8 @@
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { Characteristic, Service, buildController, makeV2Facts, makeZoneV2Facts, waitFor } from "./testing/platform.helpers.ts";
-import { FeatureOptions, getServiceName } from "homebridge-plugin-utils";
+import { Characteristic, Service, buildController, makeV2Facts, makeZoneV2Facts, seedEstablished, waitFor } from "./testing/platform.helpers.ts";
+import { FeatureOptions, acquireService, getServiceName, setAccessoryName } from "homebridge-plugin-utils";
 import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
 import type { Service as HapService, PlatformAccessory } from "homebridge";
 import type { HydrawiseAccessoryContext, HydrawiseControllerIdentity, HydrawiseControllerV2Facts, HydrawiseZoneConfig, HydrawiseZoneIdentity,
@@ -332,6 +332,35 @@ describe("zone name synchronization at its default", () => {
   });
 });
 
+describe("zone name synchronization saves", () => {
+
+  test("a changed Name option renames the valve alone and saves it once, and an unchanged name saves nothing", async (t) => {
+
+    /* The valve's rename measured where nothing else can stand in for it. The override is display, so the persisted roster keeps the name Hydrawise reports and
+     * no projection moves: the valve's own rename is the only thing that can mark the accessory.
+     */
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }),
+      signalAborted: false });
+
+    t.after(() => h.abort());
+
+    const valve = await valveOf(h);
+
+    await pollPast(h);
+
+    const settled = h.flushes().length;
+
+    h.platform.featureOptions.configuredOptions = ["Enable.Device.Name." + ZONE_SUBTYPE + "=" + OVERRIDE_NAME];
+
+    await waitUntil(() => nameOf(valve) === OVERRIDE_NAME, { description: "the valve to take the override name" });
+    await pollPast(h);
+    h.abort();
+
+    assert.equal(rosterOf(h)[0]?.name, WIRE_NAME, "the roster keeps the name Hydrawise reports, so it moved nothing");
+    assert.equal(h.flushes().length, settled + 1, "the valve's rename saves exactly once, and the polls after it save nothing");
+  });
+});
+
 describe("zone name synchronization opted out", () => {
 
   // The opt-out is honored wherever it is written: a single zone, or the controller the zone lives under.
@@ -599,9 +628,9 @@ describe("the name carry across a restart", () => {
    */
   test("a restored roster holds its full names through a facts-absent first poll, and writes nothing", async (t) => {
 
-    /* A faithful warm restart: Homebridge hands back the accessory with the services and the persisted state the previous session flushed, all of them carrying
-     * the account's full names. Seeding the schedule projection alongside them is what makes the cardinality claim below literal rather than a claim about the
-     * schedule seed - a first poll that matched nothing would flush on the schedule's account whatever the names did.
+    /* A faithful warm restart: Homebridge hands back the accessory with the services, the persisted state and the accessory's own name the previous session
+     * saved, all of them carrying the account's full names. Seeding the schedule projection alongside them is what makes the cardinality claim below literal
+     * rather than a claim about the schedule seed - a first poll that matched nothing would save on the schedule's account whatever the names did.
      */
     const h = buildController({ hasV2Client: true,
       program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }),
@@ -612,6 +641,7 @@ describe("the name carry across a restart", () => {
 
         seed.addService(Service.IrrigationSystem, CONTROLLER_ACCOUNT_EXTENDED).updateCharacteristic(Characteristic.ConfiguredName, CONTROLLER_ACCOUNT_EXTENDED);
         seed.addService(Service.Valve, ACCOUNT_NAME, ZONE_SUBTYPE).updateCharacteristic(Characteristic.ConfiguredName, ACCOUNT_NAME);
+        setAccessoryName(seed, CONTROLLER_ACCOUNT_EXTENDED);
       }, signalAborted: false });
 
     t.after(() => h.abort());
@@ -862,7 +892,8 @@ describe("controller naming", () => {
 
     bare.accessory.clearObservations();
 
-    // The first poll seeds the roster and the schedule projection through the one flush the chokepoint performs, so a flush past it can only be a rename.
+    // The first poll's marks - the roster and schedule seeds, the valve it attaches, the name its information service gains - reach the cache as one save, so a
+    // save past it can only be a rename.
     await waitUntil(() => bare.flushes().length >= 1, { description: "the first accessory flush" });
 
     const bareFlushesAfterFirstPoll = bare.flushes().length;
@@ -870,8 +901,8 @@ describe("controller naming", () => {
     await pollPast(bare);
     bare.abort();
 
-    /* The promise to an install carrying only an API key: nothing about this pass touches a name it has always had. HBPU's compare-first name helper would hold
-     * back an unchanged name write on its own, so the flush count is what tests the plugin's own compare: a rename joins the poll's cache write.
+    /* The promise to an install carrying only an API key: nothing about this pass touches a name it has always had. The name helpers compare before they write,
+     * and only a write marks the accessory, so the save count reads what they answered: an unchanged name costs no save.
      */
     assert.deepEqual(nameChanges(bare, bareIrrigation), [], "an install with no credentials performs no controller rename at all");
     assert.equal(bareFlushesAfterFirstPoll, 1, "the first poll costs exactly one cache write");
@@ -914,7 +945,7 @@ describe("controller naming", () => {
     const irrigation = irrigationOf(h);
     const suspendSwitch = suspendSwitchOf(h);
 
-    // The first poll seeds the roster and the schedule projection through the one flush the chokepoint performs; what this asserts is the poll after it.
+    // The first poll's marks reach the cache as one save; what this asserts is the poll after it.
     await waitUntil(() => h.flushes().length >= 1, { description: "the first accessory flush" });
 
     const flushesAfterFirstPoll = h.flushes().length;
@@ -962,6 +993,58 @@ describe("controller naming", () => {
     assert.equal(h.flushes().length, settled + 1, "and costs exactly one cache write, which the polls after it do not repeat");
   });
 
+  test("an accessory missing its information service's ConfiguredName gains it on its first synced poll, saved once and not again", async (t) => {
+
+    /* A cached accessory carries the characteristic only once the rename step has written it, because HAP declares it optional on the information service and
+     * builds none. The accessory's display name already matches, and the context and the valve are restored as a warm restart restores them, so the information
+     * service's half of the name is the only thing the first poll writes.
+     */
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }),
+      seedContext: (seed) => {
+
+        seed.context = { schedule: scheduleStatus(schedule(WIRE_NAME), HYDRAWISE_ACTIVE_ZONE_INDICATOR), zones: [{ name: WIRE_NAME, relay: 1, relayId: ZONE_RELAY_ID }] };
+        acquireService({ accessory: seed, name: WIRE_NAME, serviceType: Service.Valve, subtype: ZONE_SUBTYPE });
+      }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    const information = informationOf(h);
+
+    assert.equal(information.testCharacteristic(Characteristic.ConfiguredName), false, "the restored information service carries no ConfiguredName");
+
+    await pollPast(h);
+    await pollPast(h);
+    h.abort();
+
+    assert.equal(information.getCharacteristic(Characteristic.ConfiguredName).value, CONTROLLER_WIRE_NAME, "the first synced poll writes the controller's name to it");
+    assert.equal(h.flushes().length, 1, "and saves the accessory once for it, the polls after it saving nothing");
+  });
+
+  test("a stale persisted identity is rewritten on the first poll, the run's only save", async (t) => {
+
+    /* The identity's mark measured where nothing else can stand in for it. A previous session persisted a name other than the one the wire reports, and with no account
+     * credentials nothing can carry it, so the first poll rewrites the identity, while the projections and the services earlier polls established are restored
+     * to match that poll and write nothing.
+     */
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }),
+      seedContext: (seed) => {
+
+        seed.context = { controller: { controllerId: 500001, name: "Former Controller", serialNumber: CONTROLLER_SERIAL },
+          schedule: scheduleStatus(schedule(WIRE_NAME), HYDRAWISE_ACTIVE_ZONE_INDICATOR), zones: [{ name: WIRE_NAME, relay: 1, relayId: ZONE_RELAY_ID }] };
+        seedEstablished({ accessory: seed, zones: [zone(WIRE_NAME)] });
+      }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    assert.equal(identityOf(h)?.name, "Former Controller", "the stale identity survives the context wipe for the first poll to judge");
+
+    await pollPast(h);
+    h.abort();
+
+    assert.equal(identityOf(h)?.name, CONTROLLER_WIRE_NAME, "the first poll rewrites the identity to the name the wire reports");
+    assert.equal(h.flushes().length, 1, "and that rewrite is the only save the run makes");
+  });
+
   test("does not rewrite a controller name whose HomeKit form differs from the configured value", async (t) => {
 
     /* The other half of the rename-loop guard, and the half a clean name cannot show. HomeKit's rules rewrite this override, so the name the service carries can
@@ -976,7 +1059,7 @@ describe("controller naming", () => {
 
     await waitUntil(() => nameOf(irrigation) === CONTROLLER_FREE_FORM_SANITIZED, { description: "the irrigation system to take the sanitized free-form name" });
 
-    // The first poll seeds the roster and the schedule projection through the one flush the chokepoint performs, so a flush past it can only be a rename.
+    // The first poll's marks reach the cache as one save, so a save past it can only be a rename.
     await waitUntil(() => h.flushes().length >= 1, { description: "the first accessory flush" });
 
     const flushesAfterFirstPoll = h.flushes().length;
@@ -986,8 +1069,8 @@ describe("controller naming", () => {
     await pollPast(h);
     h.abort();
 
-    /* HBPU's compare-first name helper would hold back an unchanged name write on its own, so the flush count is what tests the plugin's own sanitizing compare: a
-     * compare that read the configured value raw would call every poll a rename, and every rename joins the poll's cache write.
+    /* The name helpers compare in the sanitized form, so the save count is what shows a configured value HomeKit's rules rewrite reading as unchanged:
+     * a compare that read it raw would call every poll a rename, and every rename marks the accessory for a save.
      */
     assert.deepEqual(nameChanges(h, irrigation), [], "a sanitized name that already matches is not rewritten on every poll");
     assert.equal(flushesAfterFirstPoll, 1, "the first poll costs exactly one cache write");

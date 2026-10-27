@@ -1,8 +1,8 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
  * platform.helpers.test.ts: Self-test for the platform harness. Asserts the programmable retrieve recorder's record-and-program semantics, the MockAgent
- * installer's snapshot-and-restore discipline, the call views that read the Homebridge API double's record live, and the platform double's mutable debug channel
- * and signal lifecycle - pre-aborted by default, abortable when requested.
+ * installer's snapshot-and-restore discipline, the call views that read the Homebridge API double's record live, the reconcile stub's answer to a zone the
+ * request drops, and the platform double's mutable debug channel and signal lifecycle - pre-aborted by default, abortable when requested.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
@@ -10,9 +10,13 @@
 import { PLATFORM_NAME, PLUGIN_NAME } from "../settings.ts";
 import { RetrieveRecorder, buildController, buildPlatform, installMockDispatcher, makeTestPlatform } from "./platform.helpers.ts";
 import { describe, test } from "node:test";
+import { loggedAt, present } from "homebridge-plugin-utils/testing";
+import type { PlatformAccessory } from "homebridge";
 import assert from "node:assert/strict";
 import { getGlobalDispatcher } from "undici";
-import { loggedAt } from "homebridge-plugin-utils/testing";
+import { makeZone } from "../api.helpers.ts";
+import { syntheticController } from "../api.fixtures.ts";
+import { zoneIdentity } from "../types.ts";
 
 describe("RetrieveRecorder", () => {
 
@@ -79,22 +83,25 @@ describe("the harness's call views", () => {
 
     // Each result is destructured before any call is made, the way every suite holds one, and buildController's result is itself a spread of the platform
     // double's.
-    const { api, emit, registered, unregistered, updated } = buildPlatform();
-    const { accessory, flushes, platform } = buildController();
+    const { api, emit, platform, registered, unregistered, updated } = buildPlatform();
+    const { accessory, flushes, platform: double } = buildController();
 
     t.after(() => emit("shutdown"));
 
     const fresh = new api.platformAccessory("Views", api.hap.uuid.generate("platform-helpers-test.views"));
 
+    // Each mark goes through a real persistence, whose window no row advances, so a save reaches a view only because the view closes the window itself.
     api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [fresh]);
-    api.updatePlatformAccessories([fresh]);
-    api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [fresh]);
-    platform.api.updatePlatformAccessories([accessory]);
+    platform.persistence.persist(fresh);
+
+    assert.deepEqual(updated(), [[fresh]], "the save view closes the platform's window and reads the save it brings");
+
+    platform.persistence.unregister([fresh]);
+    double.persistence.persist(accessory);
 
     assert.deepEqual(registered(), [fresh], "the registration view reads the registration made after the result was built");
-    assert.deepEqual(updated(), [[fresh]], "the cache flush view reads the flush made after it");
     assert.deepEqual(unregistered(), [fresh], "the unregistration view reads the unregistration made after it");
-    assert.deepEqual(flushes(), [[accessory]], "and the controller harness's flush view reads a flush made after its result was spread and destructured");
+    assert.deepEqual(flushes(), [[accessory]], "and the controller harness's save view closes its own window after its result was spread and destructured");
   });
 });
 
@@ -126,5 +133,47 @@ describe("makeTestPlatform", () => {
     assert.equal(platform.signal.aborted, false, "a live signal starts unaborted");
     abort();
     assert.equal(platform.signal.aborted, true, "the abort lever aborts the live signal");
+  });
+
+  test("the reconcile stub unregisters a zone the request drops while the wire reports it, and mints it afresh on the bridge when it returns", () => {
+
+    const zone = makeZone({ name: "Front Lawn", relay: 1, relay_id: 700001 });
+    const request = { displayName: zone.name, identity: zoneIdentity(zone) };
+    const reported = new Set([zone.relay_id]);
+    const { platform, zoneAccessories } = makeTestPlatform();
+    const unregistered = (): (readonly PlatformAccessory[])[] => platform.api.calls.flatMap(call => (call.kind === "unregister") ? [call.accessories] : []);
+    const first = present(platform.reconcileZoneAccessories({ controller: syntheticController, presentRelayIds: reported, zones: [request] }).get(zone.relay_id),
+      "the requested zone's accessory");
+
+    // The wire still reports the zone and the request leaves it out, which production reads as configuration intent and demotes on the same call.
+    const dropped = platform.reconcileZoneAccessories({ controller: syntheticController, presentRelayIds: reported, zones: [] });
+
+    assert.equal(dropped.size, 0, "the dropped zone is not hosted");
+    assert.deepEqual(unregistered(), [[first]], "its accessory is unregistered, as the platform's demotion unregisters it");
+    assert.equal(zoneAccessories.has(zone.relay_id), false, "and the stub drops it");
+
+    const again = present(platform.reconcileZoneAccessories({ controller: syntheticController, presentRelayIds: reported, zones: [request] }).get(zone.relay_id),
+      "the returning zone's accessory");
+
+    assert.notEqual(again, first, "the zone's return mints a fresh accessory");
+    assert.equal(again._associatedHAPAccessory.bridged, true, "which Homebridge takes onto the bridge, since no accessory of its UUID is left there");
+  });
+
+  test("the reconcile stub holds a zone the request drops while the wire leaves it out, registered and unhosted", () => {
+
+    const zone = makeZone({ name: "Front Lawn", relay: 1, relay_id: 700001 });
+    const request = { displayName: zone.name, identity: zoneIdentity(zone) };
+    const { platform, zoneAccessories } = makeTestPlatform();
+    const unregistered = (): (readonly PlatformAccessory[])[] => platform.api.calls.flatMap(call => (call.kind === "unregister") ? [call.accessories] : []);
+    const first = present(platform.reconcileZoneAccessories({ controller: syntheticController, presentRelayIds: new Set([zone.relay_id]), zones: [request] })
+      .get(zone.relay_id), "the requested zone's accessory");
+
+    // The wire leaves the zone out as well, which production holds through its grace rather than demoting.
+    const absent = platform.reconcileZoneAccessories({ controller: syntheticController, presentRelayIds: new Set(), zones: [] });
+
+    assert.equal(absent.size, 0, "the wire-absent zone is not hosted");
+    assert.deepEqual(unregistered(), [], "its accessory is not unregistered");
+    assert.equal(first._associatedHAPAccessory.bridged, true, "so it stays on the bridge");
+    assert.equal(zoneAccessories.get(zone.relay_id), first, "and the stub holds it, to hand back when the zone returns");
   });
 });

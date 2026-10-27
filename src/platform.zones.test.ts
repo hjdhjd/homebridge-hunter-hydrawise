@@ -6,7 +6,7 @@
  *
  * Covers the persistence-critical UUID seed, the accessory category and sanitized name, the exclusive context key set, the field-wise refresh comparison, the
  * demotion split between configuration intent and wire absence with its poll-count grace, per-controller isolation, the per-zone promotion-failure
- * containment, and the undo that runs when a registered accessory fails to persist.
+ * containment, and the save Homebridge's shutdown signal carries.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let the fixtures mirror the wire verbatim.
@@ -19,6 +19,7 @@ import { describe, test } from "node:test";
 import { loggedAt, waitUntil } from "homebridge-plugin-utils/testing";
 import { makeCustomerDetails, makeZone, normalSchedule } from "./api.helpers.ts";
 import type { HydrawisePlatform } from "./platform.ts";
+import type { PlatformAccessory } from "homebridge";
 import assert from "node:assert/strict";
 import { sanitizeName } from "homebridge-plugin-utils";
 import { syntheticController } from "./api.fixtures.ts";
@@ -306,46 +307,25 @@ describe("HydrawisePlatform zone accessories (reconcile)", () => {
     assert.equal(registered().length, 2, "the faulted zone leaves no residue behind, so the next reconcile retries its registration");
   });
 
-  test("undoes a promotion whose seed flush fails and retries the zone once the flush recovers", () => {
+  test("a promotion's mark is saved synchronously inside Homebridge's shutdown signal", () => {
 
-    const failing = zoneFixture();
-    const healthy = zoneFixture({ name: "Side Yard", relay: 2, relay_id: SECOND_RELAY_ID });
-    const { entries, failUpdateUuids, platform, registered, unregistered, updated } = buildPlatform();
-    const present = new Set([ ZONE_RELAY_ID, SECOND_RELAY_ID ]);
-    const failingUuid = zoneUuid(platform, syntheticController.controller_id, ZONE_RELAY_ID);
-
-    /* Failing the CACHE FLUSH rather than the registration is what reaches the undo arm: the registration succeeds, so this pass has an accessory of its own to
-     * take back. The knob cannot deadlock that undo either - removeAccessory splices the accessory out of the tracked array before its own tail flush, so the
-     * accessory the knob names is already gone from the array that flush carries, and the scenario terminates.
+    /* A cadence property rather than a durability one: Homebridge writes its whole cache before it signals shutdown, so the change would survive either way. What
+     * the row holds is that a mark still waiting for its window goes out synchronously inside the signal, rather than on a timer a process on its way out never
+     * runs. The raw record is read, because the harness's save view closes the window itself and would satisfy the row with no shutdown listener at all.
      */
-    failUpdateUuids.add(failingUuid);
+    const { api, emit, platform, registered } = buildPlatform();
+    const saves = (): (readonly PlatformAccessory[])[] => api.calls.flatMap(call => (call.kind === "update") ? [call.accessories] : []);
 
-    const hosts = platform.reconcileZoneAccessories({ controller: syntheticController, presentRelayIds: present,
-      zones: [ zoneRequest(failing), zoneRequest(healthy) ] });
+    platform.reconcileZoneAccessories({ controller: syntheticController, presentRelayIds: new Set([ZONE_RELAY_ID]), zones: [zoneRequest(zoneFixture())] });
 
-    assert.equal(registered().length, 2, "both zones register - it is the flush that fails here, not the registration");
-    assert.equal(unregistered().length, 1, "the failed pass takes back exactly the accessory it created");
-    assert.equal(unregistered()[0]?.UUID, failingUuid, "the undo unregisters the zone whose flush threw");
-    assert.equal(hosts.has(ZONE_RELAY_ID), false, "the faulted zone is omitted from the hosting map, so the controller keeps hosting its valve");
-    assert.equal(hosts.get(SECOND_RELAY_ID)?.UUID, zoneUuid(platform, 500001, 700002), "the other zone's accessory still lands");
-    assert.ok(loggedAt(entries, "error", "Unable to establish a standalone accessory"), "the fault is reported against the zone it belongs to");
+    const [promoted] = registered();
 
-    const updatesAfterFailure = updated().length;
+    assert.ok(promoted, "the zone is promoted onto an accessory of its own");
+    assert.equal(saves().length, 0, "the seed's mark waits for its save window");
 
-    failUpdateUuids.clear();
+    emit(SHUTDOWN);
 
-    const retried = platform.reconcileZoneAccessories({ controller: syntheticController, presentRelayIds: present,
-      zones: [ zoneRequest(failing), zoneRequest(healthy) ] });
-
-    /* The signals below are what tell a cleared knob from one still stuck open. A knob still throwing would omit the zone from the hosting map again, log
-     * again, and grow the unregistered buffer again; registration-buffer growth on its own could not tell the two apart, because addAccessory registers before
-     * the gated flush ever runs. That fresh registration is the residue proof: a ghost left in the tracked array would satisfy the find-by-UUID lookup and
-     * short-circuit it, the same idiom the containment assertion above rests on.
-     */
-    assert.equal(retried.get(ZONE_RELAY_ID)?.UUID, failingUuid, "a recovered flush lets the zone take an accessory of its own");
-    assert.equal(unregistered().length, 1, "the retry undoes nothing, so the unregistered buffer stands where the failed pass left it");
-    assert.equal(updated().length, updatesAfterFailure + 1, "the retry records the seed flush the failed pass never completed");
-    assert.equal(registered().length, 3, "the faulted zone leaves no residue behind, so the retry registers it afresh");
+    assert.deepEqual(saves(), [[promoted]], "the shutdown signal saves the waiting mark before the emit returns");
   });
 });
 
@@ -366,7 +346,7 @@ describe("HydrawisePlatform zone accessories (orphan sweep)", () => {
 
     emit(DID_FINISH_LAUNCHING);
 
-    // The controller accessory's own flush lands inside configureController, which the sweep follows in the same synchronous frame.
+    // The controller accessory's mark lands inside configureController, which the sweep follows in the same synchronous frame, and the save view closes its window.
     await waitUntil(() => updated().length >= 1, { description: "the first accessory cache update" });
 
     assert.equal(unregistered().length, 0, "the sweep leaves a zone accessory whose owner is present and enabled in place");

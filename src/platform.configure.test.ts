@@ -149,14 +149,15 @@ describe("HydrawisePlatform configure", () => {
     await using dispatcher = installMockDispatcher();
     const cached = seedAccessory(platform, "Test Controller", platform.hap.uuid.generate("500001"));
 
+    // No status reply is programmed, so the controller's first poll never lands and discovery's own save of the reused accessory is the only one it can take.
     programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
-    programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
     await waitUntil(() => updated().length >= 1, { description: "the first accessory cache update" });
 
     assert.equal(registered().length, 0, "a cached accessory should be reused, not registered anew");
     assert.ok(cached.getService(Service.IrrigationSystem), "the reused accessory should be configured with an irrigation system service");
+    assert.ok(updated()[0]?.includes(cached), "and discovery saves it with everything its construction changed");
   });
 
   test("prunes an orphaned accessory that no discovered controller claims", async (t) => {

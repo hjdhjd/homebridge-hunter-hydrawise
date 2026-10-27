@@ -8,7 +8,7 @@
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { Characteristic, Service, buildController, pollsCompleted, restoreCached } from "./testing/platform.helpers.ts";
+import { Characteristic, Service, buildController, pollsCompleted, restoreCached, seedEstablished } from "./testing/platform.helpers.ts";
 import type { HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
 import { UNSCHEDULED_SENTINEL, bareSensors, rainSensors, syntheticController } from "./api.fixtures.ts";
 import { describe, test } from "node:test";
@@ -36,6 +36,9 @@ const WIRE_NAME_SANITIZED = "Front Lawn North";
 const WIRE_RENAMED = "Rear/Lawn South";
 const WIRE_RENAMED_SANITIZED = "Rear Lawn South";
 const OVERRIDE_NAME = "Front Bed Drip Line";
+
+// The name a user gives the zone accessory's tile in the Home app, which lands on its information service's ConfiguredName.
+const HOME_APP_NAME = "Patio Sprinklers";
 
 // The standalone zone, running now by default, with the remaining runtime the aggregate assertion reads back off the controller accessory.
 function standaloneZone(overrides: Partial<HydrawiseZoneConfig> = {}): HydrawiseZoneConfig {
@@ -259,7 +262,35 @@ describe("HydrawiseController standalone zones", () => {
     await pollsCompleted(h, 4);
     h.abort();
 
-    assert.equal(h.flushes().filter(batch => batch[0] === zoneAccessory).length, 1, "the name change flushes the zone accessory exactly once across the run");
+    // The first poll's save carries the accessory as it is established, its valve attached and its information stamped, and the rename's carries it once more.
+    assert.equal(h.flushes().filter(batch => batch.includes(zoneAccessory)).length, 2,
+      "the zone accessory is saved once when it is established and once for the rename, across the run");
+  });
+
+  test("re-asserts the zone accessory's own name over a Home app rename of its tile, saving the accessory once", async (t) => {
+
+    /* The host's own rename measured where nothing else can stand in for it. A Home app rename of the tile writes the accessory's information service and leaves
+     * its valve alone, so the next poll's re-assertion of the accessory's name is the only thing that can mark it.
+     */
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([standaloneZone()]), kind: "response" }),
+      signalAborted: false, userOptions: [STANDALONE_ON] });
+
+    t.after(() => h.abort());
+
+    await pollsCompleted(h, 2);
+
+    const zoneAccessory = present(h.zoneAccessories.get(STANDALONE_RELAY_ID), "the standalone zone's own accessory");
+    const information = present(zoneAccessory.getService(Service.AccessoryInformation), "the zone accessory's information service");
+    const valve = present(zoneAccessory.getServiceById(Service.Valve, STANDALONE_SUBTYPE), "the standalone zone's valve");
+    const settled = h.flushes().filter(batch => batch.includes(zoneAccessory)).length;
+
+    await triggerSet(information.getCharacteristic(Characteristic.ConfiguredName), HOME_APP_NAME);
+    await waitUntil(() => getServiceName(information) === WIRE_NAME_SANITIZED, { description: "the zone accessory's own name to be re-asserted" });
+    await pollsCompleted(h, h.retrieve.callsTo("statusschedule.php").length);
+    h.abort();
+
+    assert.equal(getServiceName(valve), WIRE_NAME_SANITIZED, "the valve kept its name throughout");
+    assert.equal(h.flushes().filter(batch => batch.includes(zoneAccessory)).length, settled + 1, "the re-assertion saves the zone accessory exactly once");
   });
 
   test("leaves the zone accessory's name alone when synchronization is off", async (t) => {
@@ -274,9 +305,10 @@ describe("HydrawiseController standalone zones", () => {
     await pollsCompleted(h, 3);
     h.abort();
 
-    // The accessory was created under the first poll's name and is never re-touched, so the rename does not reach it.
+    // The accessory was created under the first poll's name and is never re-touched, so the rename does not reach it, and only its establishment saves it.
     assert.equal(h.zoneAccessories.get(STANDALONE_RELAY_ID)?.displayName, WIRE_NAME_SANITIZED, "an opted-out zone keeps the name its accessory was created with");
-    assert.equal(h.flushes().filter(batch => batch[0] === h.zoneAccessories.get(STANDALONE_RELAY_ID)).length, 0, "and nothing flushes the accessory");
+    assert.equal(h.flushes().filter(batch => batch.includes(present(h.zoneAccessories.get(STANDALONE_RELAY_ID), "the zone's accessory"))).length, 1,
+      "and the accessory is saved once, when it is established, with the rename saving nothing on it");
   });
 
   test("attaches the manual-run handler to a cache-restored valve on a warm restart", async (t) => {
@@ -309,6 +341,33 @@ describe("HydrawiseController standalone zones", () => {
 
     assert.equal(valve.getCharacteristic(Characteristic.InUse).value, Characteristic.InUse.IN_USE,
       "the first poll bound a handler to the restored valve, so firing it drives the zone");
+  });
+
+  test("a cached standalone host carrying its valve is saved once on its first binding, and the next poll saves nothing on it", async (t) => {
+
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php",
+      { body: schedule([standaloneZone(SCHEDULED)]), kind: "response" }), signalAborted: false, userOptions: [STANDALONE_ON] });
+
+    t.after(() => h.abort());
+
+    /* The zone's accessory as the cache restores it once an earlier session established it, its name and its valve seeded as the walk writes them. The first
+     * binding then finds no name and no valve to write, so the information service it stamps the host with is the only change the one save it costs can carry.
+     */
+    const { api } = h.platform;
+    const restored = new api.platformAccessory(WIRE_NAME_SANITIZED, api.hap.uuid.generate(zoneAccessoryId(h.controllerConfig.controller_id, STANDALONE_RELAY_ID)));
+
+    seedEstablished({ accessory: restored, name: WIRE_NAME, zones: [standaloneZone(SCHEDULED)] });
+    restoreCached(api, restored);
+    h.zoneAccessories.set(STANDALONE_RELAY_ID, restored);
+
+    await pollsCompleted(h, 1);
+
+    assert.equal(h.flushes().filter(batch => batch.includes(restored)).length, 1, "the first binding saves the host once");
+
+    await pollsCompleted(h, 2);
+    h.abort();
+
+    assert.equal(h.flushes().filter(batch => batch.includes(restored)).length, 1, "and the poll after it saves nothing on the host");
   });
 
   test("hosts a zone the reconcile does not answer for back on the controller accessory", async (t) => {

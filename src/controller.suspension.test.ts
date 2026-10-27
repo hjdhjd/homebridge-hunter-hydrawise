@@ -15,11 +15,11 @@
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { Characteristic, Service, buildController, makeV2Facts, makeZoneV2Facts, pollsCompleted, waitFor } from "./testing/platform.helpers.ts";
+import { Characteristic, Service, buildController, makeV2Facts, makeZoneV2Facts, pollsCompleted, seedEstablished, waitFor } from "./testing/platform.helpers.ts";
 import { HAPStatus, RateBudget, getServiceName } from "homebridge-plugin-utils";
 import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_SUSPEND_DURATION, HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_V2_FACTS_TTL,
   HYDRAWISE_V2_GRAPH_ENDPOINT, HYDRAWISE_V2_MUTATION_BUDGET_CALLS, HYDRAWISE_V2_MUTATION_BUDGET_WINDOW, HYDRAWISE_V2_TOKEN_ENDPOINT } from "./settings.ts";
-import { HYDRAWISE_RAIN_SENSOR_TYPE, scheduleStatus, suspendZoneSubtype } from "./types.ts";
+import { HYDRAWISE_RAIN_SENSOR_TYPE, scheduleStatus, suspendZoneSubtype, zoneIdentity } from "./types.ts";
 import type { Service as HapService, PlatformAccessory } from "homebridge";
 import type { HydrawiseAccessoryContext, HydrawiseZoneConfig, HydrawiseZoneScheduleStatus, HydrawiseZoneV2Facts,
   StatusScheduleResponse } from "./types.ts";
@@ -211,6 +211,44 @@ describe("HydrawiseController per-zone suspension switches", () => {
     // HAP builds On at false, so only the change record tells the establishment's own write from HAP's default.
     assert.ok(h.accessory.changesOn(service, Characteristic.On).some(change => change.newValue === false), "the walk writes the switch's starting state itself");
     assert.ok(loggedAt(h.entries, "info", "Per-zone suspension switches enabled."), "the enabled feature is reported once at the startup grain");
+  });
+
+  test("a companion switch attached to a restored accessory, and one removed from it, is each the only save of its poll", async (t) => {
+
+    /* Each switch change measured where nothing else can stand in for it. Each accessory comes back from the cache carrying a context and a valve that already
+     * match the first poll, so the switch the option adds to the first, and the one its absence sweeps from the second, is each the only thing that marks its
+     * accessory.
+     */
+    const seedRestored = (accessory: PlatformAccessory): void => {
+
+      accessory.context = { schedule: scheduleStatus(schedule([scheduledZone()]), HYDRAWISE_ACTIVE_ZONE_INDICATOR), zones: [zoneIdentity(scheduledZone())] };
+      seedEstablished({ accessory, zones: [scheduledZone()] });
+    };
+
+    const attached = buildController({ hasV2Client: true, program: (recorder) => recorder.programDefault("statusschedule.php",
+      { body: schedule([scheduledZone()]), kind: "response" }), seedContext: seedRestored, signalAborted: false, userOptions: [SUSPEND_ZONE_ON] });
+    const removed = buildController({ hasV2Client: true, program: (recorder) => recorder.programDefault("statusschedule.php",
+      { body: schedule([scheduledZone()]), kind: "response" }), seedContext: (accessory) => {
+
+      seedRestored(accessory);
+      accessory.addService(new Service.Switch("Alpha Suspend", ALPHA_SWITCH_SUBTYPE));
+    }, signalAborted: false });
+
+    t.after(() => {
+
+      attached.abort();
+      removed.abort();
+    });
+
+    await pollsCompleted(attached, 3);
+    await pollsCompleted(removed, 3);
+    attached.abort();
+    removed.abort();
+
+    assert.ok(suspendSwitch(attached.accessory), "the option attaches the switch");
+    assert.equal(attached.flushes().length, 1, "and the attach saves the accessory once, the polls after it saving nothing");
+    assert.equal(suspendSwitch(removed.accessory), undefined, "the switch the option does not want is swept");
+    assert.equal(removed.flushes().length, 1, "and the removal saves the accessory once, the polls after it saving nothing");
   });
 
   test("a switch established on an already-suspended zone starts ON", async (t) => {

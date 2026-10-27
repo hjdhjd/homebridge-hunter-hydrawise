@@ -20,13 +20,13 @@
 // the sunset deletes.
 import "homebridge-plugin-utils/polyfills";
 import type { API, PlatformAccessory } from "homebridge";
+import { AccessoryPersistence, FeatureOptions, TimerRegistry, acquireService, sanitizeName, setAccessoryName, systemClock } from "homebridge-plugin-utils";
 import type { Clock, HomebridgePluginLogging, Nullable, RateBudget } from "homebridge-plugin-utils";
-import { FeatureOptions, TimerRegistry, sanitizeName, systemClock } from "homebridge-plugin-utils";
 import { HYDRAWISE_API_BASE_URL, PLATFORM_NAME, PLUGIN_NAME } from "../settings.ts";
 import type { HydrawiseAccessory, HydrawiseControllerConfig, HydrawiseControllerHardware, HydrawiseControllerIdentity, HydrawiseControllerV2Facts,
-  HydrawiseV2MutationResult, HydrawiseZoneSuspensionResult, HydrawiseZoneV2Facts } from "../types.ts";
+  HydrawiseV2MutationResult, HydrawiseZoneConfig, HydrawiseZoneSuspensionResult, HydrawiseZoneV2Facts } from "../types.ts";
 import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
-import { TestHomebridgeApi, TestMqttClient, capturingLog, loadHomebridge, present, waitUntil } from "homebridge-plugin-utils/testing";
+import { TestClock, TestHomebridgeApi, TestMqttClient, capturingLog, loadHomebridge, present, waitUntil } from "homebridge-plugin-utils/testing";
 import type { TestHomebridgeApiCall, TestLogEntry, TestPlatformAccessory } from "homebridge-plugin-utils/testing";
 import { featureOptionCategories, featureOptions } from "../options.ts";
 import type { Dispatcher } from "undici";
@@ -143,8 +143,8 @@ function callsOf(api: TestHomebridgeApi, kind: TestHomebridgeApiCall["kind"]): (
 export type RecordedReconcileCall = Parameters<HydrawisePlatform["reconcileZoneAccessories"]>[0];
 
 // The platform double's read surface, as the controller and its configure chain consume it. The construction-boundary cast to HydrawisePlatform happens in
-// buildController. The api is HBPU's Homebridge API double, through which the controller reaches HAP and flushes its persisted state, and whose record of those
-// flushes is what the harness reads back. reconcileZoneAccessories is typed by indexed access against the real method, so a signature drift is a compile error here
+// buildController. The api is HBPU's Homebridge API double, through which the controller reaches HAP and its persistence saves, and whose record of those saves
+// is what the harness reads back. reconcileZoneAccessories is typed by indexed access against the real method, so a signature drift is a compile error here
 // rather than a silent mismatch.
 export interface TestPlatform {
 
@@ -158,6 +158,9 @@ export interface TestPlatform {
   hasV2Client: boolean;
   log: HomebridgePluginLogging;
   mqtt: Nullable<TestMqttClient>;
+
+  // HBPU's real AccessoryPersistence over the API double, every mark a controller makes going through it as it goes through the platform's own in production.
+  persistence: AccessoryPersistence;
   reconcileZoneAccessories: HydrawisePlatform["reconcileZoneAccessories"];
   retrieve: RetrieveRecorder["retrieve"];
   setZoneSuspension: HydrawisePlatform["setZoneSuspension"];
@@ -208,8 +211,8 @@ export interface MakeTestPlatformResult {
   // Every line the platform double logged, read live: the array grows as the code under test logs, so a read always sees everything logged so far.
   entries: readonly TestLogEntry[];
 
-  // The accessories each updatePlatformAccessories call the controller made carried, one list per call, read from the API double's record when called, so a test
-  // asserts on the flush cadence however it holds this result.
+  // The accessories each cache save carried, one list per save, read from the API double's record when called, so a test asserts on the save cadence however it
+  // holds this result. The read closes the save window first, so the last poll's marks, or a refresh's or a command's, are saved before they are counted.
   flushes: () => (readonly PlatformAccessory[])[];
   mqtt: Nullable<TestMqttClient>;
   platform: TestPlatform;
@@ -255,7 +258,27 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
   // HBPU's Homebridge API double, one per platform double, because its accessory cache, its bridge and its record of accessory calls belong to the one platform
   // a row builds.
   const api = new TestHomebridgeApi(runtime);
+
+  /* The REAL save path, on the same terms as the timer registry above, over the API double the controller reaches. Its window runs on a clock of its own that
+   * nothing advances, so no save leaves on a timer: the window closes where production's poll interval closes it, at the next status fetch below, and where a
+   * row reads the saves.
+   */
+  const persistence = new AccessoryPersistence({ api, clock: new TestClock(), platformName: PLATFORM_NAME, pluginIdentifier: PLUGIN_NAME });
   const retrieve = new RetrieveRecorder();
+
+  /* The retrieve the platform double hands the controller: the recorder's, closing the save window before it answers each status fetch. Production's poll interval
+   * is far longer than the window, so each poll's marks reach the cache as one save before the next poll fetches, and closing the window at that fetch holds the
+   * same boundary on a clock nothing advances. A row therefore counts the saves each poll's marks produce rather than one merged across every poll between reads.
+   */
+  const retrieveClosingWindow: RetrieveRecorder["retrieve"] = async (endpoint, params) => {
+
+    if(endpoint === "statusschedule.php") {
+
+      persistence.flush();
+    }
+
+    return retrieve.retrieve(endpoint, params);
+  };
   const reconciles: RecordedReconcileCall[] = [];
   const zoneAccessories = new Map<number, TestPlatformAccessory>();
   const featureOpts = new FeatureOptions(featureOptionCategories, featureOptions, options.userOptions);
@@ -284,14 +307,17 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
   };
 
   /* A THIN EXECUTOR standing in for the platform's zone-accessory reconcile, not a second copy of its policy. It records the call, keeps one accessory per
-   * requested zone (reusing a stored one, whether the stub made it or a test seeded it), and drops the entries the request does not name. The grace window,
-   * the context writes, and the promotion-failure containment are the platform's contract and are asserted in its own suite, so nothing of them is reimplemented
-   * here: the stub honors exactly what each call asks for.
+   * requested zone (reusing a stored one, whether the stub made it or a test seeded it), and answers a zone the request does not name as production's demotion
+   * does. A zone the wire still reports is a configuration demotion: its accessory is unregistered through the platform double's save path at once, as the
+   * platform unregisters it, so a later request mints the zone afresh on the bridge rather than colliding with a UUID Homebridge still holds. A zone the wire
+   * leaves out is held and left unhosted, as the platform holds it through its grace, and handed back if a later request names it again. The grace's count,
+   * the context writes, and the promotion-failure containment are the platform's contract and are asserted in its own suite, so nothing of them is
+   * reimplemented here: a held accessory stays held for as long as the wire leaves its zone out.
    *
    * An accessory the stub mints is registered with the API double, as the platform registers a fresh zone accessory, so it sits on the bridge where every zone
    * accessory the platform holds sits.
    *
-   * It NEVER calls updatePlatformAccessories. The roster suite asserts exact flush counts across multi-poll runs, so a stub that flushed would break that net
+   * It NEVER marks an accessory for a save. The roster suite asserts exact save counts across multi-poll runs, so a stub that saved would break that net
    * without any production change behind it.
    */
   const reconcileZoneAccessories: HydrawisePlatform["reconcileZoneAccessories"] = (request) => {
@@ -300,10 +326,11 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
 
     const requestedIds = new Set(request.zones.map(zone => zone.identity.relayId));
 
-    for(const relayId of zoneAccessories.keys()) {
+    for(const [ relayId, accessory ] of zoneAccessories) {
 
-      if(!requestedIds.has(relayId)) {
+      if(!requestedIds.has(relayId) && request.presentRelayIds.has(relayId)) {
 
+        persistence.unregister([accessory]);
         zoneAccessories.delete(relayId);
       }
     }
@@ -348,8 +375,9 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
     hasV2Client: options.hasV2Client ?? false,
     log,
     mqtt,
+    persistence,
     reconcileZoneAccessories,
-    retrieve: retrieve.retrieve,
+    retrieve: retrieveClosingWindow,
     setZoneSuspension,
     signal: signalController.signal,
     timers
@@ -365,8 +393,14 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
     mqtt?.abort();
   };
 
-  return { abort, clock, entries: log.entries, flushes: () => callsOf(api, "update"), mqtt, platform, reconciles, retrieve, signalController, suspensions,
-    zoneAccessories };
+  const flushes = (): (readonly PlatformAccessory[])[] => {
+
+    persistence.flush();
+
+    return callsOf(api, "update");
+  };
+
+  return { abort, clock, entries: log.entries, flushes, mqtt, platform, reconciles, retrieve, signalController, suspensions, zoneAccessories };
 }
 
 // Options for buildController: the controller-config overrides, an optional program hook, and everything makeTestPlatform accepts.
@@ -420,7 +454,7 @@ export function buildController(options: BuildControllerOptions = {}): BuildCont
 
   /* Seed the accessory with what the cache carried, then restore it onto the API double's bridge, as Homebridge restores a cached accessory ahead of configure,
    * so a test can drive the preservation path. An accessory with nothing seeded stands for a fresh one, which discovery registers rather than restores. Neither
-   * call is a cache flush, so every flush a row counts is the controller's own.
+   * call is a cache save, so every save a row counts is the controller's own.
    */
   if(options.seedContext) {
 
@@ -454,6 +488,28 @@ export function restoreCached(api: TestHomebridgeApi, accessory: PlatformAccesso
 
   api.restorePlatformAccessories({ accessories: [accessory], platform: { configureAccessory: (): void => undefined }, platformName: PLATFORM_NAME,
     pluginIdentifier: PLUGIN_NAME });
+}
+
+/**
+ * Seed what a previous session's polls established on any accessory the walk hosts valves on, beside the context a row seeds: the accessory's own name as the
+ * rename step writes it, and each zone's valve under the name the wire reports, the one the walk gives it with no Name set, each through the HBPU helper
+ * production writes it with. A first poll that finds these, beside a context matching what it reports, has no name and no valve left to write, which is the
+ * warm restart a row counting saves describes.
+ *
+ * @param options           - What the earlier session established.
+ * @param options.accessory - The accessory the walk hosts the valves on: the controller accessory a seedContext hook is handed, or a standalone zone's own.
+ * @param options.name      - The accessory's own name. Defaults to the synthetic controller's wire name, the one the rename step writes with no override set.
+ * @param options.zones     - The zones whose valves the walk created, each under the name the wire reports for it.
+ */
+export function seedEstablished({ accessory, name = syntheticController.name, zones }: { accessory: PlatformAccessory; name?: string;
+  zones: readonly HydrawiseZoneConfig[]; }): void {
+
+  setAccessoryName(accessory, name);
+
+  for(const zone of zones) {
+
+    acquireService({ accessory, name: zone.name, serviceType: Service.Valve, subtype: zone.relay_id.toString() });
+  }
 }
 
 /**
@@ -696,10 +752,6 @@ export interface BuildPlatformResult {
   // The UUIDs whose registration should throw, so a test can drive production's promotion-failure containment. Empty by default, which leaves every registration
   // reaching the API double.
   failRegistrationUuids: Set<string>;
-
-  // The UUIDs whose cache flush should throw, so a test can drive the arm where an accessory registers and then fails to persist - the one path that reaches
-  // production's promotion undo. Empty by default, which leaves every flush reaching the API double.
-  failUpdateUuids: Set<string>;
   platform: HydrawisePlatform;
 
   // Every accessory a registration the API double accepted carried, in call order.
@@ -708,21 +760,21 @@ export interface BuildPlatformResult {
   // Every accessory an unregistration the API double accepted carried, in call order.
   unregistered: () => PlatformAccessory[];
 
-  // The accessories each cache flush the API double accepted carried, one list per flush.
+  // The accessories each cache save the API double accepted carried, one list per save. The read closes the platform's save window first, so a mark made on the
+  // platform's real clock is saved before it is counted rather than a second after.
   updated: () => (readonly PlatformAccessory[])[];
 }
 
-/* The one check-before-delegate gate the fail sets answer to: any accessory a set names throws before the API double is called at all, so a rejected call leaves
- * the double's record exactly as a call Homebridge refused would. Registration and the cache flush share this check rather than each carrying its own loop, so
- * they can never drift apart in what "rejected" means.
+/* The check-before-delegate gate the registration fail set answers to: any accessory the set names throws before the API double is called at all, so a rejected
+ * registration leaves the double's record exactly as one Homebridge refused would.
  */
-function rejectNamed(failUuids: ReadonlySet<string>, accessories: readonly PlatformAccessory[], action: string): void {
+function rejectNamed(failUuids: ReadonlySet<string>, accessories: readonly PlatformAccessory[]): void {
 
   for(const accessory of accessories) {
 
     if(failUuids.has(accessory.UUID)) {
 
-      throw new Error(action + " rejected for " + accessory.UUID + ".");
+      throw new Error("Registration rejected for " + accessory.UUID + ".");
     }
   }
 }
@@ -737,22 +789,14 @@ export function buildPlatform(options: BuildPlatformOptions = {}): BuildPlatform
   const log = capturingLog();
   const api = new TestHomebridgeApi(runtime);
   const failRegistrationUuids = new Set<string>();
-  const failUpdateUuids = new Set<string>();
   const register = api.registerPlatformAccessories.bind(api);
-  const update = api.updatePlatformAccessories.bind(api);
 
-  // The fail sets wrap the API double's own methods on this instance, consulting the sets before delegating, because the workhorse holds no test context to mock
-  // through.
+  // The fail set wraps the API double's own registration on this instance, consulting the set before delegating, because the workhorse holds no test context to
+  // mock through.
   api.registerPlatformAccessories = (pluginIdentifier, platformName, accessories): void => {
 
-    rejectNamed(failRegistrationUuids, accessories, "Registration");
+    rejectNamed(failRegistrationUuids, accessories);
     register(pluginIdentifier, platformName, accessories);
-  };
-
-  api.updatePlatformAccessories = (accessories): void => {
-
-    rejectNamed(failUpdateUuids, accessories, "Cache flush");
-    update(accessories);
   };
 
   // The topic and the debug flag pass through exactly as the caller supplied them, with no default of their own, because a synthesized legacy value would
@@ -771,8 +815,15 @@ export function buildPlatform(options: BuildPlatformOptions = {}): BuildPlatform
   const platform = new HydrawisePlatform(log as unknown as ConstructorParameters<typeof HydrawisePlatform>[0],
     config as unknown as ConstructorParameters<typeof HydrawisePlatform>[1], api as unknown as API);
 
-  return { api, emit: (event: string): void => void api.emit(event), entries: log.entries, failRegistrationUuids, failUpdateUuids, platform,
-    registered: () => callsOf(api, "register").flat(), unregistered: () => callsOf(api, "unregister").flat(), updated: () => callsOf(api, "update") };
+  const updated = (): (readonly PlatformAccessory[])[] => {
+
+    platform.persistence.flush();
+
+    return callsOf(api, "update");
+  };
+
+  return { api, emit: (event: string): void => void api.emit(event), entries: log.entries, failRegistrationUuids, platform,
+    registered: () => callsOf(api, "register").flat(), unregistered: () => callsOf(api, "unregister").flat(), updated };
 }
 
 // The Hydrawise API origin every retrieve() request targets. The MockAgent intercepts against this origin, derived from the same base URL production assembles its
@@ -887,7 +938,7 @@ export async function waitFor<T extends object>(read: () => T | undefined, optio
 }
 
 /* Wait until the controller has completed the given number of status polls. The wait bounds on the call AFTER the counted ones, which guarantees the last counted
- * poll ran its whole projection before the caller reads a count or a flush, and its deadline grows with the count, one second per poll plus one, because every
+ * poll ran its whole projection before the caller reads a count or a save, and its deadline grows with the count, one second per poll plus one, because every
  * poll counted costs a wire call and a projection on the suite's fast cadence and a fixed deadline would hold only for the first few.
  *
  * @param h     - The built controller whose retrieve recorder counts the polls.

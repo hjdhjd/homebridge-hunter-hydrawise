@@ -1,9 +1,9 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
  * controller.schedule.test.ts: The zone schedule projection the runtime persists into accessory context - the classifier that turns one wire zone into a
- * schedule state, the whole-body projection and its self-describing header, the guards that classify a cache read, and the single flush chokepoint that carries
- * both persisted projections. These assertions lock in the zero-cloud-call source the webUI's schedule display reads back, and above all its change-shaped
- * cost: a poll whose facts did not move must cost no cache write at all, however far the wire's countdowns have fallen.
+ * schedule state, the whole-body projection and its self-describing header, the guards that classify a cache read, and the one save a poll's marks reach the
+ * cache through, which carries both persisted projections. These assertions lock in the zero-cloud-call source the webUI's schedule display reads back, and
+ * above all its change-shaped cost: a poll whose facts did not move must cost no cache write at all, however far the wire's countdowns have fallen.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
@@ -13,7 +13,7 @@ import { HYDRAWISE_RAIN_SENSOR_TYPE, HYDRAWISE_UNSCHEDULED_SENTINEL, isScheduleS
 import type { HydrawiseAccessoryContext, HydrawiseScheduleStatus, HydrawiseZoneConfig, HydrawiseZoneIdentity, HydrawiseZoneScheduleState,
   StatusScheduleResponse } from "./types.ts";
 import { bareSensors, normalZoneMatrix, rainSensors, sentinelZoneMatrix, syntheticController } from "./api.fixtures.ts";
-import { buildController, buildPlatform, makeV2Facts, makeZoneV2Facts, pollsCompleted } from "./testing/platform.helpers.ts";
+import { buildController, buildPlatform, makeV2Facts, makeZoneV2Facts, pollsCompleted, seedEstablished } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import { expectAt, waitUntil } from "homebridge-plugin-utils/testing";
 import { fastPolling, makeStatusSchedule, makeZone, normalSchedule, rainStopped } from "./api.helpers.ts";
@@ -59,7 +59,8 @@ function scheduledZone(overrides: Partial<HydrawiseZoneConfig> = {}): HydrawiseZ
   return makeZone({ name: "Beta", relay: 2, relay_id: BETA_RELAY_ID, run: 480, time: 68000, timestr: "16:00", ...overrides });
 }
 
-// The identity-only roster projection, so a scenario can seed the context with a roster its first poll matches and isolate the schedule half of the chokepoint.
+// The identity-only roster projection, so a scenario can seed the context with a roster its first poll matches: the roster marks nothing, so the schedule's
+// write is what the row measures.
 function zoneRoster(zones: readonly HydrawiseZoneConfig[]): HydrawiseZoneIdentity[] {
 
   return zones.map(zone => zoneIdentity(zone)).toSorted((a, b) => a.relay - b.relay);
@@ -408,12 +409,17 @@ describe("HydrawiseController schedule persistence (poll)", () => {
     const beta = makeZone({ name: "Beta", relay: 1, relay_id: ALPHA_RELAY_ID, run: 480, time: 68000, timestr: "16:00" });
     const seeded = scheduleStatus(schedule([alpha]), HYDRAWISE_ACTIVE_ZONE_INDICATOR);
 
-    // Seed BOTH projections with what poll 1 reports, so poll 1 moves neither and the rename on poll 2 is the only change the run contains.
+    // Seed BOTH projections with what poll 1 reports, and the services earlier polls established, so poll 1 moves nothing and the rename on poll 2 is the only
+    // change the run contains.
     const h = buildController({ program: (recorder) => {
 
       recorder.program("statusschedule.php", { body: schedule([alpha]), kind: "response" });
       recorder.programDefault("statusschedule.php", { body: schedule([beta]), kind: "response" });
-    }, seedContext: (seed) => { seed.context = { schedule: seeded, zones: zoneRoster([alpha]) }; }, signalAborted: false });
+    }, seedContext: (seed) => {
+
+      seed.context = { schedule: seeded, zones: zoneRoster([alpha]) };
+      seedEstablished({ accessory: seed, zones: [alpha] });
+    }, signalAborted: false });
 
     t.after(() => h.abort());
 
@@ -435,8 +441,13 @@ describe("HydrawiseController schedule restore (restart)", () => {
     const zones = scheduledDrift(0);
     const prior: HydrawiseScheduleStatus = { ...scheduleStatus(schedule(zones), HYDRAWISE_ACTIVE_ZONE_INDICATOR), asOf: ROOT_TIME - 3600 };
 
+    // The services earlier polls established are restored beside the context, as a warm restart restores them, so the first poll has nothing left to establish.
     const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(zones), kind: "response" }),
-      seedContext: (seed) => { seed.context = { schedule: prior, zones: zoneRoster(zones) }; }, signalAborted: false });
+      seedContext: (seed) => {
+
+        seed.context = { schedule: prior, zones: zoneRoster(zones) };
+        seedEstablished({ accessory: seed, zones });
+      }, signalAborted: false });
 
     t.after(() => h.abort());
 
@@ -467,8 +478,14 @@ describe("HydrawiseController schedule restore (restart)", () => {
     for(const { label, value } of malformed) {
 
       const zones = scheduledDrift(0);
+
+      // The roster and the services earlier polls established match what the first poll reports, so the projection's write is the only one that poll makes.
       const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(zones), kind: "response" }),
-        seedContext: (seed) => { seed.context = { schedule: value, zones: zoneRoster(zones) }; }, signalAborted: false });
+        seedContext: (seed) => {
+
+          seed.context = { schedule: value, zones: zoneRoster(zones) };
+          seedEstablished({ accessory: seed, zones });
+        }, signalAborted: false });
 
       t.after(() => h.abort());
 
@@ -490,7 +507,11 @@ describe("HydrawiseController schedule restore (restart)", () => {
     const corrupt = { ...scheduleStatus(schedule(zones), HYDRAWISE_ACTIVE_ZONE_INDICATOR), asOf: "yesterday" };
 
     const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(zones), kind: "response" }),
-      seedContext: (seed) => { seed.context = { schedule: corrupt, zones: zoneRoster(zones) }; }, signalAborted: false });
+      seedContext: (seed) => {
+
+        seed.context = { schedule: corrupt, zones: zoneRoster(zones) };
+        seedEstablished({ accessory: seed, zones });
+      }, signalAborted: false });
 
     t.after(() => h.abort());
 
@@ -721,10 +742,15 @@ describe("HydrawiseController sticky suspension across a restart", () => {
     /* The restart-churn case. The plugin comes back with the cached projection but no facts yet, and the zone still presents the ambiguous sentinel shape, so
      * without the carry it would flap to "not scheduled" and back the moment the first refresh landed - a wrong display and a pair of cache writes.
      */
-    // The zone roster is seeded alongside the projection so the roster half of the flush chokepoint matches too, isolating the schedule half this assertion is about.
+    // The zone roster and the services earlier polls established are seeded alongside the projection, so nothing but the schedule could mark the accessory,
+    // isolating the schedule half this assertion is about.
     const h = buildController({ hasV2Client: true,
       program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([sentinelZone()]), kind: "response" }),
-      seedContext: (seed) => { seed.context = { schedule: priorProjection(), zones: zoneRoster([sentinelZone()]) }; }, signalAborted: false });
+      seedContext: (seed) => {
+
+        seed.context = { schedule: priorProjection(), zones: zoneRoster([sentinelZone()]) };
+        seedEstablished({ accessory: seed, zones: [sentinelZone()] });
+      }, signalAborted: false });
 
     t.after(() => h.abort());
 

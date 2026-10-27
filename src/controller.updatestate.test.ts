@@ -1,18 +1,21 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
  * controller.updatestate.test.ts: Single-poll behavior of the HydrawiseController polling loop, driven live at the fast (~250ms) cadence against the
- * synthetic zone matrices. Covers valve creation and enumeration, the Active / InUse mapping across running, active-soon, and inactive zones, and the
- * irrigation-system aggregate characteristics - program mode included - after one completed poll.
+ * synthetic zone matrices. Covers valve creation and enumeration, the Active / InUse mapping across running, active-soon, and inactive zones, the
+ * irrigation-system aggregate characteristics - program mode included - after one completed poll, and the one save a valve's attach or prune costs.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { Characteristic, Service, buildController } from "./testing/platform.helpers.ts";
+import { Characteristic, Service, buildController, pollsCompleted, seedEstablished } from "./testing/platform.helpers.ts";
+import { HYDRAWISE_UNSCHEDULED_SENTINEL, controllerIdentity, scheduleStatus, zoneIdentity } from "./types.ts";
+import { bareSensors, rainSensors, syntheticController } from "./api.fixtures.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone, normalSchedule } from "./api.helpers.ts";
-import { HYDRAWISE_UNSCHEDULED_SENTINEL } from "./types.ts";
+import { HYDRAWISE_ACTIVE_ZONE_INDICATOR } from "./settings.ts";
+import type { HydrawiseAccessoryContext } from "./types.ts";
+import type { PlatformAccessory } from "homebridge";
 import assert from "node:assert/strict";
-import { rainSensors } from "./api.fixtures.ts";
 import { waitUntil } from "homebridge-plugin-utils/testing";
 
 describe("HydrawiseController updateState (single poll)", () => {
@@ -144,5 +147,61 @@ describe("HydrawiseController updateState (single poll)", () => {
     assert.ok(irrigation, "the irrigation system service should exist");
     assert.equal(irrigation.getCharacteristic(Characteristic.ProgramMode).value, Characteristic.ProgramMode.PROGRAM_SCHEDULED,
       "a zone HomeKit never sees still breaks the sensor's group, because the sensor stops zones regardless of what the plugin exposes");
+  });
+});
+
+describe("HydrawiseController valve presence saves", () => {
+
+  // Zones scheduled well beyond the active-zone window, so a poll settles each without a start or stop transition.
+  const zones = [ makeZone({ name: "Alpha", relay: 1, relay_id: 700001, run: 480, time: 68000, timestr: "16:00" }),
+    makeZone({ name: "Beta", relay: 2, relay_id: 700002, run: 300, time: 69000, timestr: "16:08" }) ];
+  const status = fastPolling(makeStatusSchedule({ relays: zones, sensors: bareSensors }));
+
+  // The context a previous session saved for these zones: the controller's own identity, and the roster and schedule projection the first poll reports again.
+  function seedSavedContext(accessory: PlatformAccessory): void {
+
+    accessory.context = { controller: controllerIdentity(syntheticController), schedule: scheduleStatus(status, HYDRAWISE_ACTIVE_ZONE_INDICATOR),
+      zones: zones.map(zone => zoneIdentity(zone)) };
+  }
+
+  test("a zone newly enabled on a restored accessory has its valve attached, that poll's only mark, and saves once", async (t) => {
+
+    /* The cache was saved while Beta was turned off, so the accessory comes back carrying Alpha's valve alone, against a roster, a schedule and an identity that
+     * already match what the first poll reports. Beta's valve attach is then the only thing that can mark the accessory.
+     */
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: status, kind: "response" }), seedContext: (seed) => {
+
+      seedSavedContext(seed);
+      seedEstablished({ accessory: seed, zones: zones.slice(0, 1) });
+    }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    await pollsCompleted(h, 3);
+    h.abort();
+
+    assert.ok(h.accessory.getServiceById(Service.Valve, "700002"), "the newly enabled zone's valve is attached");
+    assert.equal(h.flushes().length, 1, "and the attach saves the accessory once, the polls after it saving nothing");
+  });
+
+  test("a zone disabled by option has its cached valve pruned while the roster keeps it, that poll's only mark, and saves once", async (t) => {
+
+    /* The accessory comes back carrying every zone's valve against a context that already matches, and Beta is turned off. The roster lists every reported zone
+     * whatever its options say, so the prune of Beta's valve is the only thing that can mark the accessory.
+     */
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: status, kind: "response" }), seedContext: (seed) => {
+
+      seedSavedContext(seed);
+      seedEstablished({ accessory: seed, zones });
+    }, signalAborted: false, userOptions: ["Disable.Device.700002"] });
+
+    t.after(() => h.abort());
+
+    await pollsCompleted(h, 3);
+    h.abort();
+
+    assert.equal(h.accessory.getServiceById(Service.Valve, "700002"), undefined, "the disabled zone's valve is pruned");
+    assert.ok((h.accessory.context as HydrawiseAccessoryContext).zones?.some(zone => zone.relayId === 700002), "while the roster keeps the zone");
+    assert.equal(h.flushes().length, 1, "and the prune saves the accessory once, the polls after it saving nothing");
   });
 });
