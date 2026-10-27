@@ -5,7 +5,7 @@
  */
 import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_BUDGET_CALLS, HYDRAWISE_API_BUDGET_WINDOW, HYDRAWISE_API_JITTER, HYDRAWISE_API_NEXTPOLL_MAX,
   HYDRAWISE_API_RETRY_ATTEMPTS, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_RETRY_STATUS_CODES, HYDRAWISE_API_TIMEOUT, HYDRAWISE_COMMAND_BUDGET_CALLS,
-  HYDRAWISE_COMMAND_BUDGET_WINDOW, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_MQTT_TOPIC, HYDRAWISE_SHUTDOWN_GRACE, HYDRAWISE_SUSPEND_DURATION,
+  HYDRAWISE_COMMAND_BUDGET_WINDOW, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_MQTT_TOPIC, HYDRAWISE_SUSPEND_DURATION,
   HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_V2_FACTS_TTL, HYDRAWISE_V2_MUTATION_BUDGET_CALLS, HYDRAWISE_V2_MUTATION_BUDGET_WINDOW,
   HYDRAWISE_V2_REFRESH_INTERVAL, PLATFORM_NAME, PLUGIN_NAME } from "./settings.ts";
 import { describe, test } from "node:test";
@@ -39,17 +39,6 @@ describe("settings", () => {
 
     assert.equal(ladder.maxRetries, HYDRAWISE_API_RETRY_ATTEMPTS, "the merged policy carries the plugin's own retry count");
     assert.ok(waits.reduce((total, wait) => total + wait, 0) < (HYDRAWISE_API_TIMEOUT * 1000), "the ladder's waits together fit inside the request timeout");
-  });
-
-  test("the shutdown grace is a whole number of seconds that fits inside Homebridge's shutdown window", () => {
-
-    // Homebridge force-exits five seconds after a shutdown signal arrives, so a grace reaching that window would let the forced exit cut off the teardown the
-    // grace runs ahead of. The grace is read as a number rather than as its literal type, so the comparisons check the value instead of folding to a constant.
-    const grace: number = HYDRAWISE_SHUTDOWN_GRACE;
-    const homebridgeShutdownWindow = 5;
-
-    assert.ok(Number.isInteger(grace) && (grace > 0), "the grace is a positive whole number of seconds");
-    assert.ok(grace < homebridgeShutdownWindow, "and it ends inside the window Homebridge allows its own shutdown");
   });
 
   test("the retried statuses leave out the ones that carry their own meaning", () => {

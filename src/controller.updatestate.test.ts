@@ -178,7 +178,7 @@ describe("HydrawiseController valve presence saves", () => {
     t.after(() => h.abort());
 
     await pollsCompleted(h, 3);
-    h.abort();
+    await h.abort();
 
     assert.ok(h.accessory.getServiceById(Service.Valve, "700002"), "the newly enabled zone's valve is attached");
     assert.equal(h.flushes().length, 1, "and the attach saves the accessory once, the polls after it saving nothing");
@@ -198,7 +198,7 @@ describe("HydrawiseController valve presence saves", () => {
     t.after(() => h.abort());
 
     await pollsCompleted(h, 3);
-    h.abort();
+    await h.abort();
 
     assert.equal(h.accessory.getServiceById(Service.Valve, "700002"), undefined, "the disabled zone's valve is pruned");
     assert.ok((h.accessory.context as HydrawiseAccessoryContext).zones?.some(zone => zone.relayId === 700002), "while the roster keeps the zone");

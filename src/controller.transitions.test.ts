@@ -374,7 +374,7 @@ describe("HydrawiseController suspension instant rendering", () => {
       fetchedAt: Math.floor(Date.now() / 1000) });
 
     await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
-    h.abort();
+    await h.abort();
 
     return h.entries.map(formatLogEntry);
   }
@@ -445,7 +445,7 @@ describe("HydrawiseController rain transitions speak for the sensor", () => {
     h.controller.applyFacts({ facts: second, fetchedAt: now() });
 
     await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length > (settled + 1), { description: "the second status poll past the settled one" });
-    h.abort();
+    await h.abort();
 
     return h.entries.map(formatLogEntry);
   }

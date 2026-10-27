@@ -3,22 +3,22 @@
  * platform.configure.test.ts: Discovery and lifecycle behavior of the HydrawisePlatform, driven by firing the captured DID_FINISH_LAUNCHING handler to
  * run the private configureHydrawise against a MockAgent-backed wire. Covers the discovery happy path, the short-circuiting second pass and cached-accessory reuse,
  * orphan pruning, the bug-16 device gate in both directions, the no-API-key early return, the bug-2 debug routing, the MQTT construction arms, the discovery
- * retry failure paths and the report of a repeating one, the shutdown teardown and the retained offline it states first for each built controller, the refusal a
- * restored accessory answers with until its controller vouches for it, and the retained offline the platform states for a restored controller this run does not
- * build.
+ * retry failure paths and the report of a repeating one, the shutdown teardown and the retained offline each built controller states through the MQTT client's
+ * end ahead of it, the refusal a restored accessory answers with until its controller vouches for it, and the retained offline the platform states for a
+ * restored controller this run does not build.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as controller_id, so camelcase is disabled here to let the controller fixture mirror the wire verbatim.
 /* eslint-disable camelcase */
 import { Characteristic, Service, TestMqttClient, buildPlatform, dispatcherOf, installMockDispatcher, programJsonReply, programStatusReply, seedAccessory,
   v2DispatcherOf } from "./testing/platform.helpers.ts";
-import { HAPStatus, MqttClient, onAbort } from "homebridge-plugin-utils";
-import { HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_SHUTDOWN_GRACE } from "./settings.ts";
+import { HAPStatus, MQTT_DEFAULT_END_GRACE_MS, MqttClient, onAbort } from "homebridge-plugin-utils";
 import type { Characteristic as HapCharacteristic, PlatformAccessory } from "homebridge";
 import { HydrawiseReservedNames, suspendZoneSubtype, zoneAccessoryId } from "./types.ts";
 import { describe, test } from "node:test";
 import { formatLogEntry, hapStatus, logCount, loggedAt, present, settle, settleUntil, triggerGet, triggerSet, waitUntil } from "homebridge-plugin-utils/testing";
 import { makeCustomerDetails, normalSchedule } from "./api.helpers.ts";
+import { HYDRAWISE_API_RETRY_INTERVAL } from "./settings.ts";
 import type { MqttConnectHandler } from "homebridge-plugin-utils";
 import type { TestLogEntry } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
@@ -41,22 +41,24 @@ function untrimmedCustomerDetails(): ReturnType<typeof makeCustomerDetails> {
   return makeCustomerDetails({ controllers: [{ ...syntheticController, name: "  Test Controller  " }] });
 }
 
-// Stand the library's recording MQTT double where the platform's client goes, so a row reads what shutdown publishes and can refuse it. The platform is built with
-// no broker URL, so no client of its own is displaced, and the double's lifetime is the row's own, which its `await using` binding ends.
+// Stand HBPU's recording MQTT double where the platform's client goes, so a row reads the final words shutdown's end states and can refuse them. The platform is
+// built with no broker URL, so no client of its own is displaced, and a controller discovery builds registers its word on the double. The double arms its end's
+// grace on the platform's clock, as the platform's client does. The double's lifetime is the row's own, which shutdown's end or the row's `await using` binding
+// ends.
 function installMqttDouble(platform: Parameters<typeof seedAccessory>[0]): TestMqttClient {
 
-  const mqtt = new TestMqttClient();
+  const mqtt = new TestMqttClient({ clock: platform.clock });
 
   (platform as unknown as { mqtt: TestMqttClient }).mqtt = mqtt;
 
   return mqtt;
 }
 
-// The synthetic controller's availability topic tail, composed as the controller composes its own word and as shutdown composes the offline one.
+// The synthetic controller's availability topic tail, composed as the controller composes the topic its word and its final offline go to.
 const AVAILABILITY = syntheticController.serial_number + "/availability";
 
-// Race a shutdown against two macrotask turns, the one its wire yield costs and one more, answering which came first, so a row tells a teardown that ran at once
-// from one waiting out the grace.
+// Race a shutdown against two macrotask turns, the one the end's write-flush yield costs and one more, answering which came first, so a row tells a teardown that
+// ran at once from one waiting out the grace.
 async function shutdownWithinATurn(platform: Parameters<typeof seedAccessory>[0]): Promise<boolean> {
 
   return Promise.race([ platform.shutdown().then(() => true), settle(2).then(() => false) ]);
@@ -355,7 +357,7 @@ describe("HydrawisePlatform configure", () => {
     assert.equal(dispatcherOf(platform)?.destroyed, false, "the dispatcher is live before shutdown");
 
     // This row fires Homebridge's own event rather than calling shutdown(), so it is the one that proves the registration, and it waits for the abort because
-    // the handler's word precedes the teardown.
+    // the handler awaits the MQTT client's end before the teardown.
     emit(SHUTDOWN);
     await waitUntil(() => platform.signal.aborted, { description: "the shutdown handler's abort" });
 
@@ -434,14 +436,14 @@ describe("HydrawisePlatform configure", () => {
     emit(DID_FINISH_LAUNCHING);
 
     // The controller states offline as it is built and online once its first poll lands, so the row waits for the online word: an offline recorded after it can
-    // only be the one shutdown states.
+    // only be the final word shutdown's end states.
     await waitUntil(() => mqtt.publishedTo(AVAILABILITY).at(-1)?.payload === "online", { description: "the controller's first online word" });
 
     const before = mqtt.publishedTo(AVAILABILITY).length;
 
-    /* Sample the topic AT ABORT TIME. The double outlives the platform's signal, so a word published after the abort would still be recorded and the end state
-     * could not tell it from one published before; the frame the abort runs in is the only place the order is observable. A recorded word was also published
-     * while the client was connected, because the double refuses every publish while it is not.
+    /* Sample the topic AT ABORT TIME. The double is not bound to the platform's signal, so under a shutdown that aborted first a later word would still be
+     * recorded and the end state could not tell it from one published before; the frame the abort runs in is the only place the order is observable. A recorded
+     * word was also published while the client was connected, because the double refuses every publish while it is not.
      */
     let wordsAtAbort = mqtt.publishedTo(AVAILABILITY).slice(before);
 
@@ -493,7 +495,7 @@ describe("HydrawisePlatform configure", () => {
     assert.equal(platform.signal.aborted, true, "and the abort still runs");
     assert.ok(mqtt.rejectedPublishes > refusedBefore, "the offline word was refused rather than recorded");
     assert.ok(loggedAt(entries, "warn", AVAILABILITY + " offline at shutdown"),
-      "the refusal is noted at debug with its topic, since the plugin is stopping and the user has nothing to act on");
+      "the controller's handler notes the refusal at debug with its topic, since the plugin is stopping and the user has nothing to act on");
   });
 
   test("a word the broker never takes holds the teardown for the grace at most, and the abort still runs", async (t) => {
@@ -509,15 +511,16 @@ describe("HydrawisePlatform configure", () => {
     emit(DID_FINISH_LAUNCHING);
     await waitUntil(() => mqtt.publishedTo(AVAILABILITY).at(-1)?.payload === "online", { description: "the controller's first online word" });
 
-    /* The production clock arms the grace on the global timers, which the mock replaces from here on, so the row crosses the grace in virtual time rather than
-     * waiting it out. The hold is never released: it stands for a broker that never takes the write, so only the grace can end the wait.
+    /* The end arms its default grace on the platform's clock, the system clock, which reads the global timers the mock replaces from here on, so the row crosses
+     * the grace in virtual time rather than waiting it out. The hold is never released: it stands for a broker that never takes the write, so only the grace can
+     * end the wait.
      */
     t.mock.timers.enable({ apis: ["setTimeout"] });
     mqtt.holdPublishes();
 
     const shutdown = platform.shutdown();
 
-    t.mock.timers.tick((HYDRAWISE_SHUTDOWN_GRACE * 1000) - 1);
+    t.mock.timers.tick(MQTT_DEFAULT_END_GRACE_MS - 1);
     await settle();
 
     assert.equal(platform.signal.aborted, false, "the teardown waits out the grace for a word still being written");
@@ -528,7 +531,7 @@ describe("HydrawisePlatform configure", () => {
     assert.equal(platform.signal.aborted, true, "the grace ends the wait, and the abort runs");
     assert.equal(mqtt.publishedTo(AVAILABILITY).at(-1)?.payload, "online", "the abandoned word was never recorded");
     assert.ok(loggedAt(entries, "warn", AVAILABILITY + " offline at shutdown: The operation was aborted due to timeout"),
-      "the held publish rejected with the deadline's reason");
+      "the controller's handler notes the held word, rejected with the end's deadline as its reason");
   });
 
   test("with no MQTT client, shutdown states nothing and tears down at once", async () => {

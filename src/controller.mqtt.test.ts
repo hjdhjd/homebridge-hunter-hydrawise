@@ -2,7 +2,8 @@
  *
  * controller.mqtt.test.ts: The controller's MQTT surface, driven through the recording MQTT double's invokeGet / invokeSet knobs. Covers the status
  * JSON the get handler answers, the set-command grammar (a start with or without a duration, a stop, and the throws for an invalid zone, command, or duration),
- * and the per-poll publish including the client's guarded publish, which lands a publish rejection in the log rather than as an unhandled rejection.
+ * the per-poll publish including the client's guarded publish, which lands a publish rejection in the log rather than as an unhandled rejection, and the
+ * availability word: its restatement on a new session, and the retained offline a teardown leaves as the last word, with nothing restated behind it.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
@@ -312,6 +313,81 @@ describe("HydrawiseController MQTT availability", () => {
 
     assert.equal(mqtt.publishedTo(topic).length, before + 1, "the new session carries one restatement");
     assert.deepEqual(mqtt.publishedTo(topic).at(-1), { payload: "online", retain: true, topic }, "of the current word, retained");
+  });
+
+  test("a teardown leaves a retained offline as the last word on the controller's availability topic", async (t) => {
+
+    const clock = new TestClock();
+    const h = buildController({ clock, mqtt: true, program: (recorder) => recorder.programDefault("statusschedule.php", { body: status, kind: "response" }),
+      signalAborted: false });
+
+    t.after(() => h.abort());
+
+    const mqtt = present(h.mqtt, "the MQTT recorder");
+    const topic = h.controllerConfig.serial_number + "/availability";
+
+    await advanceThroughSchedule(clock, []);
+
+    assert.equal(mqtt.publishedTo(topic).at(-1)?.payload, "online", "the first poll has stated the controller online");
+
+    // The lever ends the double before it aborts the platform's signal, as shutdown ends the client, so the final word goes out while the session still holds.
+    await h.abort();
+
+    assert.deepEqual(mqtt.publishedTo(topic).at(-1), { payload: "offline", retain: true, topic }, "the last word on the topic is the retained offline");
+  });
+
+  test("a verdict change inside the end's window, from a poll or a reconnect, publishes nothing behind the final word", async (t) => {
+
+    // The first poll fails, so the controller still reads offline when the end begins, and the poll after the first-run backoff answers, so a poll landing inside
+    // the window moves the verdict.
+    const clock = new TestClock();
+    const h = buildController({ clock, mqtt: true, program: (recorder) => {
+
+      recorder.program("statusschedule.php", { kind: "null" });
+      recorder.programDefault("statusschedule.php", { body: status, kind: "response" });
+    }, signalAborted: false });
+
+    // The hold's release, a no-op until the hold is taken, is called by the teardown before it awaits the lever, so an assertion failing ahead of the release
+    // below fails at once rather than leaving the end parked on a clock nothing advances until the test times out. The release is safe to call more than once.
+    let release = (): void => undefined;
+
+    t.after(async () => {
+
+      release();
+      await h.abort();
+    });
+
+    const mqtt = present(h.mqtt, "the MQTT recorder");
+    const topic = h.controllerConfig.serial_number + "/availability";
+
+    await advanceThroughSchedule(clock, []);
+
+    const before = mqtt.publishedTo(topic).length;
+
+    /* Hold every publish in flight, so the end's window stays open with the final word parked in it, where a real word sits while mqtt.js writes it. Inside the
+     * window a good poll lands and moves the verdict to reachable, and the broker session drops and returns, which clears the change-gated memory and runs the
+     * connect restatement. Released, the held publishes are recorded in the order they were issued.
+     */
+    release = mqtt.holdPublishes();
+
+    // The double arms the end's grace on the row's clock, so the row opens the end itself with a grace past the first-run backoff: the advance below then wakes
+    // the poll inside the window rather than crossing the grace. The lever's own end() call is handed this same end, as every call after the first is.
+    void mqtt.end({ grace: 2 * HYDRAWISE_API_RETRY_INTERVAL * 1000 });
+
+    const ending = h.abort();
+
+    await advanceThroughSchedule(clock, [HYDRAWISE_API_RETRY_INTERVAL * 1000]);
+
+    assert.equal(h.retrieve.callsTo("statusschedule.php").length, 2, "a good poll has landed inside the end's window");
+    assert.equal(h.controller.unavailable, false, "and moved the verdict to reachable");
+
+    mqtt.connected = false;
+    mqtt.connected = true;
+
+    release();
+    await ending;
+
+    assert.deepEqual(mqtt.publishedTo(topic).slice(before), [{ payload: "offline", retain: true, topic }], "the final word is the only word stated once the end began");
   });
 });
 

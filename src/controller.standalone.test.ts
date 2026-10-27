@@ -260,7 +260,7 @@ describe("HydrawiseController standalone zones", () => {
     assert.equal(getServiceName(zoneAccessory.getService(Service.AccessoryInformation)), WIRE_RENAMED_SANITIZED, "and on the information service's own name");
 
     await pollsCompleted(h, 4);
-    h.abort();
+    await h.abort();
 
     // The first poll's save carries the accessory as it is established, its valve attached and its information stamped, and the rename's carries it once more.
     assert.equal(h.flushes().filter(batch => batch.includes(zoneAccessory)).length, 2,
@@ -287,7 +287,7 @@ describe("HydrawiseController standalone zones", () => {
     await triggerSet(information.getCharacteristic(Characteristic.ConfiguredName), HOME_APP_NAME);
     await waitUntil(() => getServiceName(information) === WIRE_NAME_SANITIZED, { description: "the zone accessory's own name to be re-asserted" });
     await pollsCompleted(h, h.retrieve.callsTo("statusschedule.php").length);
-    h.abort();
+    await h.abort();
 
     assert.equal(getServiceName(valve), WIRE_NAME_SANITIZED, "the valve kept its name throughout");
     assert.equal(h.flushes().filter(batch => batch.includes(zoneAccessory)).length, settled + 1, "the re-assertion saves the zone accessory exactly once");
@@ -303,7 +303,7 @@ describe("HydrawiseController standalone zones", () => {
 
     t.after(() => h.abort());
     await pollsCompleted(h, 3);
-    h.abort();
+    await h.abort();
 
     // The accessory was created under the first poll's name and is never re-touched, so the rename does not reach it, and only its establishment saves it.
     assert.equal(h.zoneAccessories.get(STANDALONE_RELAY_ID)?.displayName, WIRE_NAME_SANITIZED, "an opted-out zone keeps the name its accessory was created with");
@@ -365,7 +365,7 @@ describe("HydrawiseController standalone zones", () => {
     assert.equal(h.flushes().filter(batch => batch.includes(restored)).length, 1, "the first binding saves the host once");
 
     await pollsCompleted(h, 2);
-    h.abort();
+    await h.abort();
 
     assert.equal(h.flushes().filter(batch => batch.includes(restored)).length, 1, "and the poll after it saves nothing on the host");
   });
@@ -401,7 +401,7 @@ describe("HydrawiseController standalone zones", () => {
 
     // Bounding on the third call guarantees poll 2 fully ran, which is the same window the roster suite's flush-count expectation is measured over.
     await pollsCompleted(h, 2);
-    h.abort();
+    await h.abort();
 
     assert.ok(h.reconciles.length >= 1, "the reconcile is still called every poll");
     assert.ok(h.reconciles.every(request => request.zones.length === 0), "with no zone opted in, every request is empty");

@@ -274,7 +274,7 @@ describe("HydrawiseController valve and suspend onSet", () => {
     await triggerSet(active, Characteristic.Active.ACTIVE);
     await delay(HYDRAWISE_REVERT_DELAY / 2);
 
-    h.abort();
+    await h.abort();
 
     await delay(HYDRAWISE_REVERT_DELAY * 3);
 

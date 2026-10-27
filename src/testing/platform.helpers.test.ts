@@ -131,7 +131,7 @@ describe("makeTestPlatform", () => {
     const { abort, platform } = makeTestPlatform({ signalAborted: false });
 
     assert.equal(platform.signal.aborted, false, "a live signal starts unaborted");
-    abort();
+    void abort();
     assert.equal(platform.signal.aborted, true, "the abort lever aborts the live signal");
   });
 

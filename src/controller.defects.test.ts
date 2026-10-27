@@ -433,7 +433,7 @@ describe("HydrawiseController updateState defect assertions", () => {
       // before suspending. A prompt abort ends that wait; because backoff() ran before delay() suspended, the arm is exercised without waiting out that interval.
       await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 1, { description: "the first status poll" });
 
-      h.abort();
+      await h.abort();
 
       assert.equal(h.retrieve.callsTo("statusschedule.php").length, 1, "the loop should make exactly one poll before the abort ends the backoff wait");
       assert.ok(!loggedAt(h.entries, "error", "stopped unexpectedly"), "a shutdown abort should unwind the loop without a fault report");

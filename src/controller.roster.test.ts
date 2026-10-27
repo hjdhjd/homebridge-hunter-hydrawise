@@ -110,7 +110,7 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
     // Poll 1 seeds the roster from the empty seed and flushes once; every later poll reports the identical set. Bounding on the third call guarantees poll 2 fully
     // ran its field-wise comparison before we read, so a single flush proves the unchanged poll took the no-change return.
     await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 3, { description: "the third status poll" });
-    h.abort();
+    await h.abort();
 
     assert.equal(h.flushes().length, 1, "only the first poll flushes; an unchanged poll does not re-flush");
   });
@@ -131,7 +131,7 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
     t.after(() => h.abort());
 
     await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 3, { description: "the third status poll" });
-    h.abort();
+    await h.abort();
 
     assert.equal(h.flushes().length, 2, "the matching first poll saves once for the schedule seed and its valve; the rename then saves exactly once");
     assert.equal(expectAt(contextOf(h.accessory).zones ?? [], 0, "zone").name, "Beta", "the persisted roster adopted the renamed zone");
@@ -153,7 +153,7 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
     t.after(() => h.abort());
 
     await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 3, { description: "the third status poll" });
-    h.abort();
+    await h.abort();
 
     assert.equal(h.flushes().length, 2, "the matching first poll saves once for the schedule seed and its valves; the vanished zone then saves exactly once");
     assert.equal(contextOf(h.accessory).zones?.length, 1, "the persisted roster dropped the vanished zone");
@@ -179,7 +179,7 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
     t.after(() => h.abort());
 
     await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 3, { description: "the third status poll" });
-    h.abort();
+    await h.abort();
 
     assert.equal(h.flushes().length, 1, "the rename saves exactly once, and nothing else in the run saves at all");
     assert.equal(expectAt(contextOf(h.accessory).zones ?? [], 0, "zone").name, "Beta", "the persisted roster adopted the renamed zone");

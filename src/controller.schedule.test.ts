@@ -291,7 +291,7 @@ describe("HydrawiseController schedule persistence (poll)", () => {
     t.after(() => h.abort());
 
     await pollsCompleted(h, 2);
-    h.abort();
+    await h.abort();
 
     const persisted = scheduleOf(h.accessory);
 
@@ -325,7 +325,7 @@ describe("HydrawiseController schedule persistence (poll)", () => {
     t.after(() => h.abort());
 
     await pollsCompleted(h, 2);
-    h.abort();
+    await h.abort();
 
     // The two wire bodies genuinely differ - the root clock advanced and every countdown fell - yet they describe the same scheduled instants, so the change gate
     // takes its no-change return and the seed remains the only flush of the run.
@@ -344,7 +344,7 @@ describe("HydrawiseController schedule persistence (poll)", () => {
     t.after(() => h.abort());
 
     await pollsCompleted(h, 2);
-    h.abort();
+    await h.abort();
 
     const persisted = expectAt(scheduleOf(h.accessory).zones, 0, "zone");
 
@@ -370,7 +370,7 @@ describe("HydrawiseController schedule persistence (poll)", () => {
     t.after(() => h.abort());
 
     await pollsCompleted(h, 2);
-    h.abort();
+    await h.abort();
 
     const persisted = scheduleOf(h.accessory);
     const alpha = expectAt(persisted.zones, 0, "zone");
@@ -395,7 +395,7 @@ describe("HydrawiseController schedule persistence (poll)", () => {
     t.after(() => h.abort());
 
     await pollsCompleted(h, 2);
-    h.abort();
+    await h.abort();
 
     // The two projections carry the same zone count and the same schedule facts at every index but one, so a comparison that stopped at the length - or that
     // compared only the arm's own facts without the relay id - would call these equal and never write the swap.
@@ -424,7 +424,7 @@ describe("HydrawiseController schedule persistence (poll)", () => {
     t.after(() => h.abort());
 
     await pollsCompleted(h, 2);
-    h.abort();
+    await h.abort();
 
     // A flush count alone cannot say which projection moved, because both travel through the one channel, so the schedule half's no-change claim is asserted on the
     // persisted value itself: a rename changes no schedule fact, and asOf therefore holds too.
@@ -454,7 +454,7 @@ describe("HydrawiseController schedule restore (restart)", () => {
     assert.deepEqual(contextOf(h.accessory).schedule, prior, "the prior projection survives the constructor's wipe-then-seed pass");
 
     await pollsCompleted(h, 2);
-    h.abort();
+    await h.abort();
 
     // Retaining the restored asOf is the deliberate conservatism of the design: the facts held when they were written and they still hold, and the only surface
     // that reads asOf is the display's staleness notice.
@@ -491,7 +491,9 @@ describe("HydrawiseController schedule restore (restart)", () => {
 
       // eslint-disable-next-line no-await-in-loop
       await pollsCompleted(h, 2);
-      h.abort();
+
+      // eslint-disable-next-line no-await-in-loop
+      await h.abort();
 
       assert.equal(h.flushes().length, 1, "a first poll after " + label + " writes the projection fresh through exactly one flush");
       assert.equal(scheduleOf(h.accessory).asOf, ROOT_TIME, "the freshly written projection carries this poll's root time");
@@ -516,7 +518,7 @@ describe("HydrawiseController schedule restore (restart)", () => {
     t.after(() => h.abort());
 
     await pollsCompleted(h, 2);
-    h.abort();
+    await h.abort();
 
     assert.equal(h.flushes().length, 1, "the corrupt-timestamp prior is dropped at restore, so the first poll seeds the projection through exactly one flush");
     assert.equal(scheduleOf(h.accessory).asOf, ROOT_TIME, "the freshly written projection carries this poll's numeric root time, never the corrupt value");
@@ -755,7 +757,7 @@ describe("HydrawiseController sticky suspension across a restart", () => {
     t.after(() => h.abort());
 
     await pollsCompleted(h, 2);
-    h.abort();
+    await h.abort();
 
     assert.deepEqual(scheduleOf(h.accessory).zones, [{ relayId: ALPHA_RELAY_ID, state: "suspended", until: SUSPENDED_UNTIL }],
       "the suspension stands until something can actually confirm or clear it");
@@ -775,7 +777,7 @@ describe("HydrawiseController sticky suspension across a restart", () => {
     t.after(() => h.abort());
 
     await pollsCompleted(h, 2);
-    h.abort();
+    await h.abort();
 
     assert.deepEqual(scheduleOf(h.accessory).zones, [{ relayId: ALPHA_RELAY_ID, state: "unscheduled" }],
       "a cache restored from a credentialed past re-classifies rather than carrying a claim nothing can update");

@@ -185,7 +185,8 @@ export type RecordedSuspensionCall = Parameters<HydrawisePlatform["setZoneSuspen
 export interface MakeTestPlatformOptions {
 
   /* The clock the platform double publishes, defaulting to the system clock. The suites' polling rows run on real time through the fast cadence, so a virtual clock
-   * as the default would hold every one of them at its first sleep; a row that drives time itself passes a TestClock and advances it.
+   * as the default would hold every one of them at its first sleep; a row that drives time itself passes a TestClock and advances it. The MQTT double arms its
+   * end's grace on the same clock, as the platform's client does, so a row that advances a TestClock while the end is open advances the grace with it.
    */
   clock?: Clock;
   config?: Partial<HydrawiseOptions>;
@@ -210,7 +211,7 @@ export interface MakeTestPlatformOptions {
 // The handles makeTestPlatform returns: the platform double plus the doubles and capture buffers a test asserts against and the lever to abort a live signal.
 export interface MakeTestPlatformResult {
 
-  abort: (reason?: string) => void;
+  abort: (reason?: string) => Promise<void>;
 
   // The clock the platform double publishes: the caller's own when it passed one, and the system clock otherwise.
   clock: Clock;
@@ -252,8 +253,8 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
     signalController.abort("pre-aborted");
   }
 
-  const mqtt = options.mqtt ? new TestMqttClient({ log }) : null;
   const clock = options.clock ?? systemClock;
+  const mqtt = options.mqtt ? new TestMqttClient({ clock, log }) : null;
 
   /* The REAL timer registry, not a double. A double stands in for an I/O surface - the recording MQTT client for a network client, the retrieve recorder for the
    * wire - while a pure in-memory, signal-scoped mechanism runs its production self here, exactly as the FeatureOptions engine and the platform's rate budgets do.
@@ -390,14 +391,19 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
     timers
   };
 
-  /* The teardown lever: the platform signal first, then the MQTT double, which is the pairing production wires - the client's lifetime is bound to the platform's own
-   * shutdown signal, so the two fall together. A test that reaches past this lever and aborts signalController directly leaves the double running, on the same
-   * terms as every other handle this harness returns.
+  /* The teardown lever, in the order production's shutdown keeps: the MQTT double's end first, which states every final word a controller registered while the
+   * double's session still holds and then tears the double down, and the platform signal after it. The end is awaited only where a double exists, so a platform
+   * with none aborts within the call, and a row reading the signal straight after an unawaited lever reads it aborted. A test that reaches past this lever and
+   * aborts signalController directly leaves the double running and its words unsaid, on the same terms as every other handle this harness returns.
    */
-  const abort = (reason?: string): void => {
+  const abort = async (reason?: string): Promise<void> => {
+
+    if(mqtt) {
+
+      await mqtt.end();
+    }
 
     signalController.abort(reason ?? "test-teardown");
-    mqtt?.abort();
   };
 
   const flushes = (): (readonly PlatformAccessory[])[] => {

@@ -173,13 +173,6 @@ export const HYDRAWISE_ACTIVE_ZONE_INDICATOR = 3600;
  */
 export const HYDRAWISE_REVERT_DELAY = 50;
 
-/* The longest, in seconds, that shutdown waits for each built controller's offline word to be written before the teardown runs regardless. The wait exists because
- * the teardown's abort ends the MQTT connection by destroying its socket, which drops a write not yet flushed, so a word that is not awaited first never reaches
- * the broker. It is bounded because a broker that has stopped answering must not hold Homebridge's own shutdown open, and a second is ample for a broker on the
- * local network while leaving Homebridge's shutdown window far from its limit.
- */
-export const HYDRAWISE_SHUTDOWN_GRACE = 1;
-
 // The suspend-all duration, in seconds. Hydrawise's suspend-all convention pushes the resume boundary one year into the future; a resume sends the current time.
 export const HYDRAWISE_SUSPEND_DURATION = 31556926;
 

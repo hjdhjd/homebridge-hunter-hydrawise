@@ -234,16 +234,16 @@ describe("HydrawiseController per-zone suspension switches", () => {
       accessory.addService(new Service.Switch("Alpha Suspend", ALPHA_SWITCH_SUBTYPE));
     }, signalAborted: false });
 
-    t.after(() => {
+    t.after(async () => {
 
-      attached.abort();
-      removed.abort();
+      await attached.abort();
+      await removed.abort();
     });
 
     await pollsCompleted(attached, 3);
     await pollsCompleted(removed, 3);
-    attached.abort();
-    removed.abort();
+    await attached.abort();
+    await removed.abort();
 
     assert.ok(suspendSwitch(attached.accessory), "the option attaches the switch");
     assert.equal(attached.flushes().length, 1, "and the attach saves the accessory once, the polls after it saving nothing");
@@ -490,7 +490,7 @@ describe("HydrawiseController per-zone suspension commands", () => {
           window: HYDRAWISE_V2_MUTATION_BUDGET_WINDOW * 1000 }), password: "test-password", signal: signal.signal,
         username: "test-user" }), userOptions: [SUSPEND_ZONE_ON] });
 
-      t.after(() => { h.abort(); signal.abort("test-teardown"); });
+      t.after(async () => { await h.abort(); signal.abort("test-teardown"); });
 
       // eslint-disable-next-line no-await-in-loop
       const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
@@ -541,7 +541,7 @@ describe("HydrawiseController per-zone suspension commands", () => {
 
     const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
 
-    h.abort();
+    await h.abort();
 
     await triggerSet(service.getCharacteristic(Characteristic.On), true);
 

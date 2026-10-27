@@ -668,7 +668,9 @@ export class HydrawiseController {
   }
 
   /* Publish this controller's availability word on its own topic, retained so a subscriber attaching later reads the last statement, and change-gated so a
-   * verdict re-judged with nothing moved costs nothing on the wire. The word reads the same verdict the refusals do, so MQTT and HomeKit cannot disagree.
+   * verdict re-judged with nothing moved costs nothing on the wire. The word reads the same verdict the refusals do, so MQTT and HomeKit cannot disagree. Once
+   * the MQTT client's end begins, HBPU's end() refuses every publish but the words its handlers state, so a poll or a reconnect landing inside the end's window
+   * restates nothing and the offline the plugin stops on stays the last word on the topic.
    */
   private refreshAvailability(): void {
 
@@ -1034,6 +1036,24 @@ export class HydrawiseController {
     // Restate this controller's availability on every broker session. The client sends nothing it was asked to publish while disconnected, and the facts the
     // verdict reads can age out with no event to mark it, so the word a subscriber holds is restated each time a session begins.
     this.platform.mqtt?.onConnect(() => this.refreshAvailability(), { signal: this.platform.signal });
+
+    /* State this controller's final word as the plugin stops: a retained offline on its availability topic, which nothing else speaks for once the plugin has
+     * stopped, because the client's last will covers only the plugin's own availability topic. The client's end invokes this while its session still holds and
+     * waits for the word within its grace before it tears down. From the moment the end begins, HBPU's end() refuses every publish but the words its handlers
+     * state, so nothing restates behind the word. The word carries the end's signal, the one signal the end admits a publish under, and no change gate, since
+     * the gate weighs a word against whatever the topic last carried and can suppress it, and a refusal is noted at debug alone, because the plugin is stopping
+     * and the user has nothing to act on.
+     */
+    this.platform.mqtt?.onEnd(async (signal: AbortSignal): Promise<void> => {
+
+      try {
+
+        await this.platform.mqtt?.publish(this.availabilityTopic, MQTT_AVAILABILITY_OFFLINE, { retain: true, signal });
+      } catch(error) {
+
+        this.log.debug("Unable to state %s offline at shutdown: %s.", this.availabilityTopic, formatErrorMessage(error));
+      }
+    }, { signal: this.platform.signal });
   }
 
   /* Configure the irrigation system service for HomeKit.
