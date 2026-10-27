@@ -5,24 +5,25 @@
  * an enrichment, never about a parallel copy.
  *
  * That makes the pre-seeded value the whole method. HAP round-trips characteristic values through Homebridge's accessory cache, so a warm restart begins with real
- * values already in place - the double models this by seeding each kind with HAP's own registered default and letting a test write over it. A test that started
- * from an empty accessory could not tell "preserved the cached value" from "wrote nothing anywhere", which is exactly the distinction this design turns on.
+ * values already in place - a test models this by writing those values over the defaults HAP constructs each characteristic with. A test that started from an
+ * untouched accessory could not tell "preserved the cached value" from "wrote nothing anywhere", which is exactly the distinction this design turns on. Homebridge
+ * stamps its own firmware placeholder on every restore before the plugin sees the accessory, so the model carries over a restart and the firmware does not.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { Characteristic, Service, TestAccessory } from "./testing/hap.helpers.ts";
-import type { CharacteristicType, TestCharacteristic } from "./testing/hap.helpers.ts";
+import { Characteristic, Service, buildController, makeV2Facts, restoreCached } from "./testing/platform.helpers.ts";
+import type { CharacteristicValue, Characteristic as HapCharacteristic, PlatformAccessory, WithUUID } from "homebridge";
 import { HAP_DEFAULT_MODEL, HOMEBRIDGE_UNKNOWN_FIRMWARE, HYDRAWISE_API_JITTER, HYDRAWISE_REVERT_DELAY, HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
 import type { HydrawiseControllerHardware, StatusScheduleResponse } from "./types.ts";
-import { TestClock, advanceThroughSchedule, logCount, present, waitUntil } from "homebridge-plugin-utils/testing";
-import { buildController, isNotResponding, makeV2Facts } from "./testing/platform.helpers.ts";
+import { TestClock, advanceThroughSchedule, hapStatus, logCount, present, triggerGet, triggerSet, waitUntil } from "homebridge-plugin-utils/testing";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
+import { suspendZoneSubtype, zoneAccessoryId } from "./types.ts";
 import type { BuildControllerResult } from "./testing/platform.helpers.ts";
+import { HAPStatus } from "homebridge-plugin-utils";
 import assert from "node:assert/strict";
 import { bareSensors } from "./api.fixtures.ts";
-import { suspendZoneSubtype } from "./types.ts";
 
 const CONTROLLER_SERIAL = "SN0A1B2C3D4";
 const STANDALONE_RELAY_ID = 700001;
@@ -35,15 +36,20 @@ const SUSPEND_ZONE_ON = "Enable.Device.Suspend.Zone." + CONTROLLER_SERIAL;
 // The product-line name an unenriched controller displays.
 const PLACEHOLDER_MODEL = "Hydrawise";
 
+// The refusal HomeKit renders as No Response: HAP's communication-failure status from a deliberate refusal, which the matcher tells apart from a handler that
+// faulted into the same status.
+const noResponse = hapStatus(HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+
 // The facts a fetch reports, and the values a warm restart begins with. They are deliberately different from each other so an assertion can tell a preserved
 // cached value from a freshly written one.
 const FETCHED: HydrawiseControllerHardware = { firmware: "4.76", model: "HCC 38 Zones" };
 const CACHED: HydrawiseControllerHardware = { firmware: "4.70", model: "HCC 24 Zones" };
 
 // One accessory's information characteristic, which is what HomeKit shows the user for it.
-function informationValue(accessory: TestAccessory, characteristic: CharacteristicType): unknown {
+function informationValue(accessory: PlatformAccessory, characteristic: WithUUID<new () => HapCharacteristic>): CharacteristicValue | null {
 
-  return accessory.getService(Service.AccessoryInformation)?.getCharacteristic(characteristic).value;
+  return present(accessory.getService(Service.AccessoryInformation), "the information service HAP builds every accessory with").getCharacteristic(characteristic)
+    .value;
 }
 
 // The instant a facts snapshot is stamped with. Tests that care only about adoption stamp it now, which is comfortably inside the freshness window every consumer
@@ -54,7 +60,7 @@ function now(): number {
 }
 
 // Seed an accessory the way HAP restores a cached one: real model and firmware values already sitting in the characteristics before anything configures it.
-function seedCached(accessory: TestAccessory): void {
+function seedCached(accessory: PlatformAccessory): void {
 
   const information = accessory.getService(Service.AccessoryInformation);
 
@@ -81,14 +87,15 @@ describe("HydrawiseController hardware display without credentials", () => {
 
   test("removing the credentials resets values a credentialed session left behind", () => {
 
-    /* This is the assertion that omitting the writes would fail, and the seeded start is what gives it teeth. The characteristics outlive the credentials that populated
-     * them, so a controller that simply skipped these writes when it had no facts would leave a real model and a real firmware version on display permanently,
-     * with nothing left in the plugin that could ever refresh or correct them.
+    /* The model is the assertion omitting the write would fail, and the seeded start is what gives it teeth. The characteristic outlives the credentials that
+     * populated it, so a controller that simply skipped the write when it had no facts would leave a real model on display permanently, with nothing left in the
+     * plugin that could ever refresh or correct it. The firmware reads Homebridge's restore placeholder, which Homebridge stamps on every cached accessory before
+     * the plugin sees it, so the version a credentialed session left never reaches this one.
      */
     const { accessory } = buildController({ seedContext: seedCached });
 
     assert.equal(informationValue(accessory, Characteristic.Model), PLACEHOLDER_MODEL, "the model returns to the product-line placeholder");
-    assert.equal(informationValue(accessory, Characteristic.FirmwareRevision), HOMEBRIDGE_UNKNOWN_FIRMWARE, "the firmware returns to the unknown marker");
+    assert.equal(informationValue(accessory, Characteristic.FirmwareRevision), HOMEBRIDGE_UNKNOWN_FIRMWARE, "the firmware reads Homebridge's restore placeholder");
   });
 });
 
@@ -97,26 +104,32 @@ describe("HydrawiseController hardware display with credentials", () => {
   test("a warm restart leaves cached real values untouched", () => {
 
     /* The refresh that will confirm these values is already on its way, so the synchronous path writes neither: blanking a correct display for the length of a
-     * network round trip would be a visible regression for a user who has done nothing but restart Homebridge.
+     * network round trip would be a visible regression for a user who has done nothing but restart Homebridge. Homebridge stamps its firmware placeholder on every
+     * restore before the plugin sees the accessory, so a warm restart shows that placeholder until the first refresh lands, and only the model carries over.
      */
     const { accessory } = buildController({ hasV2Client: true, seedContext: seedCached });
 
     assert.equal(informationValue(accessory, Characteristic.Model), CACHED.model, "the cached model survives the restart");
-    assert.equal(informationValue(accessory, Characteristic.FirmwareRevision), CACHED.firmware, "the cached firmware survives it too");
+    assert.equal(informationValue(accessory, Characteristic.FirmwareRevision), HOMEBRIDGE_UNKNOWN_FIRMWARE,
+      "the firmware reads Homebridge's restore placeholder until the first refresh lands");
   });
 
   test("a brand-new accessory is stamped with the placeholder rather than showing HAP's default", () => {
 
     // The one case where nothing is being preserved, told apart by the only value that can mean "nothing has ever written here". Without this arm a user adding a
     // controller would see a library-internal string until the first fetch landed.
-    const { accessory } = buildController({ hasV2Client: true });
+    const h = buildController({ hasV2Client: true });
+    const { accessory } = h;
 
     assert.equal(informationValue(accessory, Characteristic.Model), PLACEHOLDER_MODEL, "a fresh accessory is stamped with the product line");
 
     /* The firmware is left exactly as HAP constructed it, which is the other half of this arm: stamping the model does not drag the firmware along with it. The
-     * assertion reads the double's own registered default rather than a literal, so what it means is "nothing wrote here" rather than "here is a value".
+     * assertion reads the firmware a freshly made accessory carries, HAP's own default, rather than a literal, so what it means is "nothing wrote here" rather than
+     * "here is a value".
      */
-    assert.equal(informationValue(accessory, Characteristic.FirmwareRevision), Characteristic.FirmwareRevision.DEFAULT_VALUE,
+    const fresh = new h.platform.api.platformAccessory("Unconfigured Controller", h.platform.api.hap.uuid.generate("unconfigured-controller"));
+
+    assert.equal(informationValue(accessory, Characteristic.FirmwareRevision), informationValue(fresh, Characteristic.FirmwareRevision),
       "the firmware is left untouched for the fetch to fill in");
   });
 
@@ -147,7 +160,7 @@ describe("HydrawiseController facts adoption", () => {
   test("adopting hardware writes both characteristics and flushes exactly once", () => {
 
     const h = buildController({ hasV2Client: true });
-    const before = h.flushes.length;
+    const before = h.flushes().length;
 
     h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: now() });
 
@@ -161,8 +174,8 @@ describe("HydrawiseController facts adoption", () => {
      * else moved on this tick - no projection, no availability - so the only thing that can justify the write is hardware arriving against a null baseline, and a
      * comparison written after the overwrite would read the new value on both sides, find no difference, and flush zero times.
      */
-    assert.equal(h.flushes.length - before, 1, "the first arrival carrying hardware flushes the accessory cache exactly once");
-    assert.deepEqual(h.flushes[h.flushes.length - 1], [h.accessory], "the flush names the accessory that changed and nothing else");
+    assert.equal(h.flushes().length - before, 1, "the first arrival carrying hardware flushes the accessory cache exactly once");
+    assert.deepEqual(h.flushes().at(-1), [h.accessory], "the flush names the accessory that changed and nothing else");
   });
 
   test("a tick that moves nothing flushes ZERO times", () => {
@@ -174,31 +187,30 @@ describe("HydrawiseController facts adoption", () => {
 
     h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: now() });
 
-    const settled = h.flushes.length;
+    const settled = h.flushes().length;
 
     h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: now() + 1 });
 
-    assert.equal(h.flushes.length - settled, 0, "an identical second answer is not worth a disk write");
+    assert.equal(h.flushes().length - settled, 0, "an identical second answer is not worth a disk write");
   });
 
   test("hardware still writes unconditionally, with no compare-before-write of its own", () => {
 
-    /* HAP already drops a write whose value matches what the characteristic holds, so a compare there would duplicate the library's own work and add a second
-     * place for the two answers to disagree. The change gate governs the durable FLUSH alone; the characteristic write itself stays unconditional, which is what
-     * this separates.
+    /* HAP sends HomeKit an event only for a value that changed, so a compare there would duplicate HAP's own work and add a second place for the plugin's answer
+     * and HAP's to disagree. The change gate governs the durable FLUSH alone; the characteristic write itself stays unconditional, which is what this separates.
      */
     const h = buildController({ hasV2Client: true });
-    const information = h.accessory.getService(Service.AccessoryInformation);
+    const information = present(h.accessory.getService(Service.AccessoryInformation), "the information service");
 
     h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: now() });
 
-    // The window opens on an accessory that already holds exactly these values, so whatever is recorded below is a write the plugin chose to perform against an
-    // unchanged fact.
-    information?.clearWrites();
+    // The window opens on an accessory that already holds exactly these values. HAP raises a change for every update, an unchanged value included, and the
+    // accessory's change record holds each one, so whatever is recorded below is a write the plugin chose to perform against an unchanged fact.
+    h.accessory.clearObservations();
 
     h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: now() + 1 });
 
-    assert.equal(information?.writesFor(Characteristic.Model, Characteristic.FirmwareRevision).length, 2,
+    assert.equal(h.accessory.changesOn(information, Characteristic.Model, Characteristic.FirmwareRevision).length, 2,
       "an identical second answer still reaches both characteristics rather than being gated in the plugin");
   });
 
@@ -209,12 +221,12 @@ describe("HydrawiseController facts adoption", () => {
 
     h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: now() });
 
-    const settled = h.flushes.length;
+    const settled = h.flushes().length;
 
     h.controller.applyFacts({ facts: makeV2Facts({ hardware: { firmware: "4.99", model: FETCHED.model } }), fetchedAt: now() + 1 });
 
     assert.equal(informationValue(h.accessory, Characteristic.FirmwareRevision), "4.99", "the upgraded firmware replaces the version already on display");
-    assert.equal(h.flushes.length - settled, 1, "a genuine hardware change is worth exactly one write");
+    assert.equal(h.flushes().length - settled, 1, "a genuine hardware change is worth exactly one write");
   });
 
   test("a tick carrying no hardware leaves the values a prior tick established", () => {
@@ -231,7 +243,10 @@ describe("HydrawiseController facts adoption", () => {
 
   test("adopted values survive into the next session untouched", () => {
 
-    // The end of the cache-resident story: what adoption wrote is what a restart reads back, and the credentialed synchronous path leaves it exactly as it found it.
+    /* The end of the cache-resident story: what adoption wrote is what a restart reads back, and the credentialed synchronous path leaves it exactly as it found it.
+     * The firmware is the exception Homebridge makes, stamping its placeholder on every restore before the plugin sees the accessory, so the next session shows
+     * that placeholder until its first refresh lands.
+     */
     const first = buildController({ hasV2Client: true });
 
     first.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: now() });
@@ -245,7 +260,8 @@ describe("HydrawiseController facts adoption", () => {
     } });
 
     assert.equal(informationValue(second.accessory, Characteristic.Model), FETCHED.model, "the next session reads back the adopted model");
-    assert.equal(informationValue(second.accessory, Characteristic.FirmwareRevision), FETCHED.firmware, "and the adopted firmware with it");
+    assert.equal(informationValue(second.accessory, Characteristic.FirmwareRevision), HOMEBRIDGE_UNKNOWN_FIRMWARE,
+      "and the firmware reads Homebridge's restore placeholder until the first refresh lands");
   });
 
   test("each controller's facts land on its own accessory", () => {
@@ -297,8 +313,9 @@ describe("HydrawiseController standalone zone hardware", () => {
   test("a zone accessory restored carrying a stale firmware value is reset, not preserved", async (t) => {
 
     /* The preserve arm exists to protect values an enrichment is about to refresh, and a zone accessory has none coming - nothing will ever write hardware to it.
-     * Left in the preserve arm it would strand whatever the last session put on its firmware characteristic, so it takes the unconditional reset instead, exactly
-     * as it would on an install with no credentials at all.
+     * Left in the preserve arm it would strand whatever model the last session put on it, so it takes the unconditional reset instead, exactly as it would on an
+     * install with no credentials at all. Its firmware reads Homebridge's restore placeholder, which Homebridge stamps on every cached accessory before the
+     * plugin sees it.
      */
     const h = buildController({ hasV2Client: true, program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(), kind: "response" }),
       signalAborted: false, userOptions: [STANDALONE_ON] });
@@ -309,17 +326,20 @@ describe("HydrawiseController standalone zone hardware", () => {
      * reconcile's store BEFORE the poll runs is the only moment that models a restore, since the zone's information service is configured once when its valve is
      * first bound and not again on later polls.
      */
-    const restored = new TestAccessory("Front Lawn", "500001.Zone.700001");
+    const { api } = h.platform;
+    const restored = new api.platformAccessory("Front Lawn", api.hap.uuid.generate(zoneAccessoryId(h.controllerConfig.controller_id, STANDALONE_RELAY_ID)));
     const information = restored.getService(Service.AccessoryInformation);
 
     information?.updateCharacteristic(Characteristic.FirmwareRevision, "9.99");
     information?.updateCharacteristic(Characteristic.Model, "Some Stale Model");
+    restoreCached(api, restored);
     h.zoneAccessories.set(STANDALONE_RELAY_ID, restored);
 
     await waitUntil(() => restored.getServiceById(Service.Valve, STANDALONE_SUBTYPE) !== undefined,
       { description: "the standalone zone's valve on the restored accessory to appear" });
 
-    assert.equal(informationValue(restored, Characteristic.FirmwareRevision), HOMEBRIDGE_UNKNOWN_FIRMWARE, "the stale zone firmware is reset");
+    assert.equal(informationValue(restored, Characteristic.FirmwareRevision), HOMEBRIDGE_UNKNOWN_FIRMWARE,
+      "the stale zone firmware reads Homebridge's restore placeholder");
     assert.equal(informationValue(restored, Characteristic.Model), PLACEHOLDER_MODEL, "and the stale zone model with it");
   });
 });
@@ -350,13 +370,13 @@ describe("HydrawiseController controller availability", () => {
   }
 
   // The irrigation system's Active, the characteristic HomeKit reads the controller accessory's availability from.
-  function primary(h: { accessory: TestAccessory }): TestCharacteristic {
+  function primary(h: { accessory: PlatformAccessory }): HapCharacteristic {
 
     return present(h.accessory.getService(Service.IrrigationSystem), "the irrigation system").getCharacteristic(Characteristic.Active);
   }
 
   // The standalone zone accessory's valve, its own primary characteristic.
-  function standaloneValve(h: BuildControllerResult): TestCharacteristic {
+  function standaloneValve(h: BuildControllerResult): HapCharacteristic {
 
     return present(h.zoneAccessories.get(STANDALONE_RELAY_ID)?.getServiceById(Service.Valve, STANDALONE_SUBTYPE), "the standalone zone's valve")
       .getCharacteristic(Characteristic.Active);
@@ -374,10 +394,10 @@ describe("HydrawiseController controller availability", () => {
     const h = buildController({ userOptions: [SUSPEND_ALL_ON] });
     const suspendAll = present(h.accessory.getServiceById(Service.Switch, "All"), "the suspend-all switch").getCharacteristic(Characteristic.On);
 
-    await assert.rejects(() => primary(h).triggerGet(), isNotResponding, "the irrigation system's Active refuses a read");
-    await assert.rejects(() => primary(h).triggerSet(Characteristic.Active.INACTIVE), isNotResponding, "and a write");
-    await assert.rejects(() => suspendAll.triggerGet(), isNotResponding, "the suspend-all switch refuses a read");
-    await assert.rejects(() => suspendAll.triggerSet(true), isNotResponding, "and a write");
+    await assert.rejects(() => triggerGet(primary(h)), noResponse, "the irrigation system's Active refuses a read");
+    await assert.rejects(() => triggerSet(primary(h), Characteristic.Active.INACTIVE), noResponse, "and a write");
+    await assert.rejects(() => triggerGet(suspendAll), noResponse, "the suspend-all switch refuses a read");
+    await assert.rejects(() => triggerSet(suspendAll, true), noResponse, "and a write");
   });
 
   test("the cloud's word that the controller is offline refuses a standalone valve, and a good poll does not clear it", async (t) => {
@@ -388,16 +408,16 @@ describe("HydrawiseController controller availability", () => {
     t.after(() => h.abort());
 
     await advanceThroughSchedule(clock, []);
-    assert.equal(await standaloneValve(h).triggerGet(), Characteristic.Active.ACTIVE, "the hosted valve answers once the first poll has landed");
+    assert.equal(await triggerGet(standaloneValve(h)), Characteristic.Active.ACTIVE, "the hosted valve answers once the first poll has landed");
 
     h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: seconds(clock) });
-    await assert.rejects(() => standaloneValve(h).triggerGet(), isNotResponding, "the cloud's offline word refuses the valve on its own accessory");
+    await assert.rejects(() => triggerGet(standaloneValve(h)), noResponse, "the cloud's offline word refuses the valve on its own accessory");
 
     // The next poll lands and rewrites the valve's value, which is exactly what a stored refusal could not survive and a handler-served one does.
     await advanceThroughSchedule(clock, [sleep]);
 
     assert.equal(h.retrieve.callsTo("statusschedule.php").length, 2, "the next poll has landed");
-    await assert.rejects(() => standaloneValve(h).triggerGet(), isNotResponding, "and the valve still refuses");
+    await assert.rejects(() => triggerGet(standaloneValve(h)), noResponse, "and the valve still refuses");
   });
 
   test("the cloud's offline word refuses a zone's manual run and its suspension switch as well as its reads", async (t) => {
@@ -418,8 +438,8 @@ describe("HydrawiseController controller availability", () => {
     const suspensionsBefore = h.suspensions.length;
 
     // Every write on the zone's accessory refuses, the manual run and the suspension alike, and neither reaches the wire.
-    await assert.rejects(() => standaloneValve(h).triggerSet(Characteristic.Active.ACTIVE), isNotResponding, "the manual run refuses while the cloud says offline");
-    await assert.rejects(() => zoneSwitch.triggerSet(true), isNotResponding, "and so does the suspension switch");
+    await assert.rejects(() => triggerSet(standaloneValve(h), Characteristic.Active.ACTIVE), noResponse, "the manual run refuses while the cloud says offline");
+    await assert.rejects(() => triggerSet(zoneSwitch, true), noResponse, "and so does the suspension switch");
     assert.equal(h.retrieve.callsTo("setzone.php").length, commandsBefore, "no command reached the API");
     assert.equal(h.suspensions.length, suspensionsBefore, "and no suspension reached the account API");
   });
@@ -436,13 +456,13 @@ describe("HydrawiseController controller availability", () => {
 
     h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: seconds(clock) - HYDRAWISE_V2_FACTS_TTL });
 
-    await assert.rejects(() => primary(h).triggerGet(), isNotResponding, "a snapshot aged exactly its lifetime is still trusted, so it refuses");
+    await assert.rejects(() => triggerGet(primary(h)), noResponse, "a snapshot aged exactly its lifetime is still trusted, so it refuses");
     assert.equal(lastWord(h), "offline", "and the word follows the facts as they land");
 
     // One second later the same snapshot has aged out. Nothing marks that moment, so the handlers answer at once while the word waits for the next poll.
     clock.advance(1000);
 
-    assert.equal(await primary(h).triggerGet(), Characteristic.Active.ACTIVE, "one second older, the snapshot is past its lifetime and refuses nothing");
+    assert.equal(await triggerGet(primary(h)), Characteristic.Active.ACTIVE, "one second older, the snapshot is past its lifetime and refuses nothing");
     assert.equal(lastWord(h), "offline", "the word has had no event to re-judge it");
 
     await advanceThroughSchedule(clock, [sleep - 1000]);
@@ -462,8 +482,8 @@ describe("HydrawiseController controller availability", () => {
     // No client exists here to hand facts over, so this states what one would have said; the verdict reads the cloud's word only where credentials fetch it.
     h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: seconds(clock) });
 
-    assert.equal(await primary(h).triggerGet(), Characteristic.Active.ACTIVE, "the irrigation system answers");
-    assert.equal(await standaloneValve(h).triggerGet(), Characteristic.Active.ACTIVE, "and so does the standalone valve");
+    assert.equal(await triggerGet(primary(h)), Characteristic.Active.ACTIVE, "the irrigation system answers");
+    assert.equal(await triggerGet(standaloneValve(h)), Characteristic.Active.ACTIVE, "and so does the standalone valve");
     assert.equal(lastWord(h), "online", "the word stays online");
   });
 
@@ -475,14 +495,14 @@ describe("HydrawiseController controller availability", () => {
     t.after(() => h.abort());
 
     await advanceThroughSchedule(clock, []);
-    await primary(h).triggerSet(Characteristic.Active.INACTIVE);
+    await triggerSet(primary(h), Characteristic.Active.INACTIVE);
 
     assert.equal(primary(h).value, Characteristic.Active.INACTIVE, "HomeKit's write lands for the beat");
 
     clock.advance(HYDRAWISE_REVERT_DELAY);
 
     assert.equal(primary(h).value, Characteristic.Active.ACTIVE, "and Active is put back after it");
-    assert.equal(await primary(h).triggerGet(), Characteristic.Active.ACTIVE, "a read answers Active");
+    assert.equal(await triggerGet(primary(h)), Characteristic.Active.ACTIVE, "a read answers Active");
   });
 
   test("a cached standalone zone accessory no poll hosts refuses, binds when a poll first hosts it, and refuses again when unhosted", async (t) => {
@@ -501,8 +521,11 @@ describe("HydrawiseController controller availability", () => {
     t.after(() => h.abort());
 
     // The zone's accessory as the cache restores it, carrying its valve. The first poll does not report the zone, so nothing hosts the accessory.
-    const restored = new TestAccessory("Front Lawn", "500001.Zone.700001");
+    const { api } = h.platform;
+    const restored = new api.platformAccessory("Front Lawn", api.hap.uuid.generate(zoneAccessoryId(h.controllerConfig.controller_id, STANDALONE_RELAY_ID)));
     const valve = restored.addService(new Service.Valve("Front Lawn", STANDALONE_SUBTYPE)).getCharacteristic(Characteristic.Active);
+
+    restoreCached(api, restored);
 
     await advanceThroughSchedule(clock, []);
     assert.equal(h.retrieve.callsTo("statusschedule.php").length, 1, "the first poll has landed without the zone");
@@ -512,23 +535,25 @@ describe("HydrawiseController controller availability", () => {
 
     await advanceThroughSchedule(clock, [sleep]);
 
-    assert.equal(await valve.triggerGet(), Characteristic.Active.ACTIVE, "the cached valve answers the value the poll that hosts it projected");
+    assert.equal(await triggerGet(valve), Characteristic.Active.ACTIVE, "the cached valve answers the value the poll that hosts it projected");
 
-    await valve.triggerSet(Characteristic.Active.INACTIVE);
+    await triggerSet(valve, Characteristic.Active.INACTIVE);
 
     assert.equal(h.retrieve.callsTo("setzone.php").length, 1, "a stop reaches the wire, so the valve was bound when a poll first hosted it");
 
     // The zone drops off the wire again, and the accessory is held through its grace with nothing describing it.
     await advanceThroughSchedule(clock, [sleep]);
 
-    await assert.rejects(() => valve.triggerGet(), isNotResponding, "an accessory the last poll did not host refuses");
+    await assert.rejects(() => triggerGet(valve), noResponse, "an accessory the last poll did not host refuses");
   });
 
   test("a cached fault reading is removed on a credentialed restore", () => {
 
     const h = buildController({ hasV2Client: true, seedContext: (seed) => {
 
-      seed.addService(Service.IrrigationSystem).addOptionalCharacteristic(Characteristic.StatusFault);
+      const irrigation = seed.addService(Service.IrrigationSystem).updateCharacteristic(Characteristic.StatusFault, Characteristic.StatusFault.GENERAL_FAULT);
+
+      assert.equal(irrigation.testCharacteristic(Characteristic.StatusFault), true, "the cache carries a fault reading for the restore to remove");
     } });
 
     assert.equal(h.accessory.getService(Service.IrrigationSystem)?.testCharacteristic(Characteristic.StatusFault), false,
@@ -539,7 +564,9 @@ describe("HydrawiseController controller availability", () => {
 
     const h = buildController({ seedContext: (seed) => {
 
-      seed.addService(Service.IrrigationSystem).addOptionalCharacteristic(Characteristic.StatusFault);
+      const irrigation = seed.addService(Service.IrrigationSystem).updateCharacteristic(Characteristic.StatusFault, Characteristic.StatusFault.GENERAL_FAULT);
+
+      assert.equal(irrigation.testCharacteristic(Characteristic.StatusFault), true, "the cache carries a fault reading for the restore to remove");
     } });
 
     assert.equal(h.accessory.getService(Service.IrrigationSystem)?.testCharacteristic(Characteristic.StatusFault), false,
@@ -558,7 +585,7 @@ describe("HydrawiseController controller availability", () => {
     h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: seconds(clock) });
 
     assert.equal(logCount(h.entries, "info", "The controller is offline."), 1, "the controller refuses on this reading, so the log says why");
-    await assert.rejects(() => primary(h).triggerGet(), isNotResponding, "and the controller accessory refuses");
+    await assert.rejects(() => triggerGet(primary(h)), noResponse, "and the controller accessory refuses");
   });
 
   test("a first reading that says online seeds silently, and only a genuine flip is narrated", () => {

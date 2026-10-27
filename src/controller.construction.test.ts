@@ -4,11 +4,10 @@
  * wires its services and subscriptions fully while its polling loop exits silently. Covers the irrigation-system and service-label services, the AccessoryInformation
  * fields, the optional suspend switch and its feature-log line, and the MQTT subscriptions.
  */
-import { Characteristic, Service } from "./testing/hap.helpers.ts";
+import { Characteristic, Service, buildController } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import { expectAt, loggedAt } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
-import { buildController } from "./testing/platform.helpers.ts";
 
 describe("HydrawiseController construction", () => {
 
@@ -22,6 +21,10 @@ describe("HydrawiseController construction", () => {
     assert.equal(irrigation.getCharacteristic(Characteristic.InUse).value, Characteristic.InUse.NOT_IN_USE, "the system should rest not in use");
     assert.equal(irrigation.getCharacteristic(Characteristic.ProgramMode).value, Characteristic.ProgramMode.PROGRAM_SCHEDULED, "the system should rest scheduled");
     assert.equal(retrieve.calls.length, 0, "the pre-aborted polling loop should make no retrieve calls");
+
+    // HAP builds InUse at not in use, so the value alone cannot tell the configuration's write from HAP's own default, and the change record is what can.
+    assert.deepEqual(accessory.changesOn(irrigation, Characteristic.InUse).map(change => change.newValue), [Characteristic.InUse.NOT_IN_USE],
+      "the configuration writes the resting not-in-use itself");
   });
 
   test("adds a service label service enumerated with arabic numerals", () => {

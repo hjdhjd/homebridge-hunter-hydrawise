@@ -9,13 +9,12 @@
 /* eslint-disable camelcase */
 import { HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
 import type { HydrawiseControllerV2Facts, HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
+import { Service, buildController, makeV2Facts, makeZoneV2Facts } from "./testing/platform.helpers.ts";
 import { TestClock, advanceThroughSchedule, assertNoUnhandledRejections, expectAt, logCount, loggedAt, present, waitUntil } from "homebridge-plugin-utils/testing";
-import { buildController, makeV2Facts, makeZoneV2Facts } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
 import type { BuildControllerResult } from "./testing/platform.helpers.ts";
 import { HYDRAWISE_UNSCHEDULED_SENTINEL } from "./types.ts";
-import { Service } from "./testing/hap.helpers.ts";
 import assert from "node:assert/strict";
 import { bareSensors } from "./api.fixtures.ts";
 

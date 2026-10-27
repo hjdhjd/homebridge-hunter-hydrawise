@@ -8,15 +8,15 @@
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { Characteristic, Service, TestAccessory } from "./testing/hap.helpers.ts";
+import { Characteristic, Service, buildController, pollsCompleted, restoreCached } from "./testing/platform.helpers.ts";
 import type { HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
 import { UNSCHEDULED_SENTINEL, bareSensors, rainSensors, syntheticController } from "./api.fixtures.ts";
-import { buildController, pollsCompleted } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
-import { loggedAt, waitUntil } from "homebridge-plugin-utils/testing";
+import { loggedAt, present, triggerSet, waitUntil } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
 import { getServiceName } from "homebridge-plugin-utils";
+import { zoneAccessoryId } from "./types.ts";
 
 const CONTROLLER_SERIAL = "SN0A1B2C3D4";
 const STANDALONE_RELAY_ID = 700001;
@@ -110,11 +110,12 @@ describe("HydrawiseController standalone zones", () => {
     await waitUntil(() => h.zoneAccessories.get(STANDALONE_RELAY_ID)?.getServiceById(Service.Valve, STANDALONE_SUBTYPE) !== undefined,
       { description: "the standalone zone's valve on its own accessory to appear" });
 
-    const valve = h.zoneAccessories.get(STANDALONE_RELAY_ID)?.getServiceById(Service.Valve, STANDALONE_SUBTYPE);
+    const zoneAccessory = present(h.zoneAccessories.get(STANDALONE_RELAY_ID), "the standalone zone's own accessory");
+    const valve = present(zoneAccessory.getServiceById(Service.Valve, STANDALONE_SUBTYPE), "the standalone zone's valve");
 
     // A standalone accessory hosts no ServiceLabel service for an index to enumerate against. The controller-hosted polarity is already asserted by the
     // updateState suite, so only the new signal is asserted here.
-    assert.equal(valve?.writesFor(Characteristic.ServiceLabelIndex).length, 0, "a standalone valve takes no service label index");
+    assert.equal(zoneAccessory.changesOn(valve, Characteristic.ServiceLabelIndex).length, 0, "a standalone valve takes no service label index");
     assert.equal(valve.getCharacteristic(Characteristic.IsConfigured).value, Characteristic.IsConfigured.CONFIGURED, "a standalone valve is still configured");
     assert.equal(valve.getCharacteristic(Characteristic.ValveType).value, Characteristic.ValveType.IRRIGATION, "a standalone valve is still typed as irrigation");
   });
@@ -152,7 +153,7 @@ describe("HydrawiseController standalone zones", () => {
 
     // Program the command reply, then fire the handler the walk attached to the valve on its own accessory.
     h.retrieve.programDefault("setzone.php", { body: { message: "Running zone", message_type: "info" }, kind: "response" });
-    await valve.getCharacteristic(Characteristic.Active).triggerSet(Characteristic.Active.ACTIVE);
+    await triggerSet(valve.getCharacteristic(Characteristic.Active), Characteristic.Active.ACTIVE);
 
     assert.equal(h.accessory.getService(Service.IrrigationSystem)?.getCharacteristic(Characteristic.ProgramMode).value,
       Characteristic.ProgramMode.PROGRAM_SCHEDULED_MANUAL_MODE, "a manual run started from a standalone valve reaches the controller's program mode");
@@ -253,16 +254,12 @@ describe("HydrawiseController standalone zones", () => {
     assert.equal(zoneAccessory?.displayName, WIRE_RENAMED_SANITIZED, "the rename lands on the accessory's display name, sanitized");
     assert.equal(zoneAccessory._associatedHAPAccessory.displayName, WIRE_RENAMED_SANITIZED, "and on the display-name mirror Homebridge maintains beside it");
 
-    // TestService never nominally extends HAP's Service, so getServiceName's Service-typed parameter still needs a cast; "as never" bridges that gap and the
-    // optional result from getService in one step. The cast is safe because TestService implements the two methods getServiceName actually calls at runtime,
-    // testCharacteristic and getCharacteristic.
-    assert.equal(getServiceName(zoneAccessory.getService(Service.AccessoryInformation) as never), WIRE_RENAMED_SANITIZED,
-      "and on the information service's own name");
+    assert.equal(getServiceName(zoneAccessory.getService(Service.AccessoryInformation)), WIRE_RENAMED_SANITIZED, "and on the information service's own name");
 
     await pollsCompleted(h, 4);
     h.abort();
 
-    assert.equal(h.flushes.filter(batch => batch[0] === zoneAccessory).length, 1, "the name change flushes the zone accessory exactly once across the run");
+    assert.equal(h.flushes().filter(batch => batch[0] === zoneAccessory).length, 1, "the name change flushes the zone accessory exactly once across the run");
   });
 
   test("leaves the zone accessory's name alone when synchronization is off", async (t) => {
@@ -279,7 +276,7 @@ describe("HydrawiseController standalone zones", () => {
 
     // The accessory was created under the first poll's name and is never re-touched, so the rename does not reach it.
     assert.equal(h.zoneAccessories.get(STANDALONE_RELAY_ID)?.displayName, WIRE_NAME_SANITIZED, "an opted-out zone keeps the name its accessory was created with");
-    assert.equal(h.flushes.filter(batch => batch[0] === h.zoneAccessories.get(STANDALONE_RELAY_ID)).length, 0, "and nothing flushes the accessory");
+    assert.equal(h.flushes().filter(batch => batch[0] === h.zoneAccessories.get(STANDALONE_RELAY_ID)).length, 0, "and nothing flushes the accessory");
   });
 
   test("attaches the manual-run handler to a cache-restored valve on a warm restart", async (t) => {
@@ -293,20 +290,22 @@ describe("HydrawiseController standalone zones", () => {
      * loop's first fetch awaits before any projection runs, so this lands ahead of the first poll. The pre-built valve is mandatory - without it the valve would
      * be created this pass and the assertion would pass vacuously through the new-valve arm instead of proving the first-run arm covers a restored one.
      */
-    const restored = new TestAccessory(WIRE_NAME_SANITIZED, "500001.Zone.700001");
+    const { api } = h.platform;
+    const restored = new api.platformAccessory(WIRE_NAME_SANITIZED, api.hap.uuid.generate(zoneAccessoryId(h.controllerConfig.controller_id, STANDALONE_RELAY_ID)));
 
     restored.addService(new Service.Valve(WIRE_NAME_SANITIZED, STANDALONE_SUBTYPE));
+    restoreCached(api, restored);
     h.zoneAccessories.set(STANDALONE_RELAY_ID, restored);
 
     await pollsCompleted(h, 1);
 
     const valve = restored.getServiceById(Service.Valve, STANDALONE_SUBTYPE);
 
-    assert.equal(restored.services.filter(service => service.UUID === "Valve").length, 1, "the restored valve is reused rather than duplicated");
+    assert.equal(restored.services.filter(service => service.UUID === Service.Valve.UUID).length, 1, "the restored valve is reused rather than duplicated");
     assert.ok(valve, "the restored valve should still be there");
 
     h.retrieve.programDefault("setzone.php", { body: { message: "Running zone", message_type: "info" }, kind: "response" });
-    await valve.getCharacteristic(Characteristic.Active).triggerSet(Characteristic.Active.ACTIVE);
+    await triggerSet(valve.getCharacteristic(Characteristic.Active), Characteristic.Active.ACTIVE);
 
     assert.equal(valve.getCharacteristic(Characteristic.InUse).value, Characteristic.InUse.IN_USE,
       "the first poll bound a handler to the restored valve, so firing it drives the zone");
@@ -321,9 +320,11 @@ describe("HydrawiseController standalone zones", () => {
 
     // A zone accessory left over for a zone the request does not name. The reconcile answers with no host for it, and the projection has to put its valve back
     // on the controller accessory rather than leaving the zone with no HomeKit surface at all.
-    const stale = new TestAccessory("Side Yard", "500001.Zone.700002");
+    const { api } = h.platform;
+    const stale = new api.platformAccessory("Side Yard", api.hap.uuid.generate(zoneAccessoryId(h.controllerConfig.controller_id, HOSTED_RELAY_ID)));
 
     stale.addService(new Service.Valve("Side Yard", HOSTED_SUBTYPE));
+    restoreCached(api, stale);
     h.zoneAccessories.set(HOSTED_RELAY_ID, stale);
 
     await waitUntil(() => h.accessory.getServiceById(Service.Valve, HOSTED_SUBTYPE) !== undefined, { description: "the hosted zone's valve to appear" });
@@ -348,7 +349,7 @@ describe("HydrawiseController standalone zones", () => {
     assert.equal(h.zoneAccessories.size, 0, "no zone accessory exists");
     assert.ok(h.accessory.getServiceById(Service.Valve, STANDALONE_SUBTYPE), "both zones keep their valves on the controller accessory");
     assert.ok(h.accessory.getServiceById(Service.Valve, HOSTED_SUBTYPE), "both zones keep their valves on the controller accessory");
-    assert.equal(h.flushes.length, 1, "only the first poll's roster seed flushes, exactly as it does without this feature");
+    assert.equal(h.flushes().length, 1, "only the first poll's roster seed flushes, exactly as it does without this feature");
     assert.equal(h.controllerConfig.serial_number, syntheticController.serial_number, "the scenario ran against the synthetic controller");
   });
 

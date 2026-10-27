@@ -8,15 +8,16 @@
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { Characteristic, Service } from "./testing/hap.helpers.ts";
+import { Characteristic, Service, buildController, waitFor } from "./testing/platform.helpers.ts";
 import { HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL } from "./settings.ts";
 import type { HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
-import { TestClock, advanceThroughSchedule, assertNoUnhandledRejections, expectAt, logCount, present, waitUntil } from "homebridge-plugin-utils/testing";
-import { buildController, isNotResponding, waitFor } from "./testing/platform.helpers.ts";
+import { TestClock, advanceThroughSchedule, assertNoUnhandledRejections, expectAt, hapStatus, logCount, present, triggerGet, triggerSet,
+  waitUntil } from "homebridge-plugin-utils/testing";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
 import type { BuildControllerResult } from "./testing/platform.helpers.ts";
-import type { TestAccessory } from "./testing/hap.helpers.ts";
+import { HAPStatus } from "homebridge-plugin-utils";
+import type { PlatformAccessory } from "homebridge";
 import assert from "node:assert/strict";
 import { bareSensors } from "./api.fixtures.ts";
 import { setTimeout as delay } from "node:timers/promises";
@@ -32,6 +33,10 @@ const SEVERAL_CADENCES_MS = 800;
 // How many completed polls the sequencing sampler observes before it renders a verdict. Two would prove the ordering once; a third makes the steady state, rather
 // than the first pass, the thing being sampled.
 const POLLS_OBSERVED = 3;
+
+// The refusal HomeKit renders as No Response: HAP's communication-failure status from a deliberate refusal, which the matcher tells apart from a handler that
+// faulted into the same status.
+const noResponse = hapStatus(HAPStatus.SERVICE_COMMUNICATION_FAILURE);
 
 // A fast-cadence, single-zone schedule with a bare sensor block, so a live-loop test cycles in roughly 250ms.
 function schedule(zones: HydrawiseZoneConfig[]): StatusScheduleResponse {
@@ -69,7 +74,7 @@ function applierCrashingSchedule(): StatusScheduleResponse {
 
 // Seed a cached valve for the zone under test, the shape Homebridge restores when an accessory returns from its cache. The valve exists before the controller is
 // constructed, so the pass that follows finds it rather than creating it.
-function seedCachedValve(accessory: TestAccessory): void {
+function seedCachedValve(accessory: PlatformAccessory): void {
 
   accessory.addService(new Service.Valve("Alpha", ZONE_SUBTYPE));
 }
@@ -148,7 +153,7 @@ describe("HydrawiseController polling loop structure", () => {
     // Waiting for the valve is not enough on its own: the seeded service exists before the first poll ever runs. Waiting for the zone's status line proves the pass
     // that attaches the handler has actually been through.
     await waitUntil(() => logCount(h.entries, "info", "Next run will be") >= 1, { description: "an info line containing \"Next run will be\"" });
-    await valve.getCharacteristic(Characteristic.Active).triggerSet(Characteristic.Active.ACTIVE);
+    await triggerSet(valve.getCharacteristic(Characteristic.Active), Characteristic.Active.ACTIVE);
 
     const command = expectAt(h.retrieve.callsTo("setzone.php"), 0, "setzone call");
 
@@ -208,13 +213,13 @@ describe("HydrawiseController reachability verdict", () => {
   // A read of the irrigation system's Active, the characteristic HomeKit reads the controller accessory's availability from.
   async function primary(h: BuildControllerResult): Promise<unknown> {
 
-    return present(h.accessory.getService(Service.IrrigationSystem), "the irrigation system").getCharacteristic(Characteristic.Active).triggerGet();
+    return triggerGet(present(h.accessory.getService(Service.IrrigationSystem), "the irrigation system").getCharacteristic(Characteristic.Active));
   }
 
   // A read of the suspend-all switch, which answers through the same rule.
   async function suspendAll(h: BuildControllerResult): Promise<unknown> {
 
-    return present(h.accessory.getServiceById(Service.Switch, "All"), "the suspend-all switch").getCharacteristic(Characteristic.On).triggerGet();
+    return triggerGet(present(h.accessory.getServiceById(Service.Switch, "All"), "the suspend-all switch").getCharacteristic(Characteristic.On));
   }
 
   // The availability word's record, read by its full topic so the client's own plugin-level statement can never match it.
@@ -236,14 +241,14 @@ describe("HydrawiseController reachability verdict", () => {
 
     assert.equal(h.retrieve.callsTo("statusschedule.php").length, 2, "two polls have failed");
     assert.equal(logCount(h.entries, "info", "for this controller"), 0, "two failures are not yet a loss, so nothing is said");
-    await assert.rejects(() => primary(h), isNotResponding, "a controller that has not reached Hydrawise this run already refuses");
+    await assert.rejects(() => primary(h), noResponse, "a controller that has not reached Hydrawise this run already refuses");
 
     await advanceThroughSchedule(clock, [firstRunBackoff]);
 
     assert.equal(h.retrieve.callsTo("statusschedule.php").length, 3, "the third poll has failed");
     assert.equal(logCount(h.entries, "info", "Hydrawise is not responding for this controller."), 1, "the loss is said once");
-    await assert.rejects(() => primary(h), isNotResponding, "the irrigation system refuses with the communication failure");
-    await assert.rejects(() => suspendAll(h), isNotResponding, "and so does the suspend-all switch");
+    await assert.rejects(() => primary(h), noResponse, "the irrigation system refuses with the communication failure");
+    await assert.rejects(() => suspendAll(h), noResponse, "and so does the suspend-all switch");
     assert.deepEqual(words(h), [{ payload: "offline", retain: true }], "the word is the retained offline it has held since construction");
   });
 
@@ -262,7 +267,7 @@ describe("HydrawiseController reachability verdict", () => {
     await advanceThroughSchedule(clock, [backoff]);
 
     assert.equal(h.retrieve.callsTo("statusschedule.php").length, 4, "the third failure has run");
-    await assert.rejects(() => primary(h), isNotResponding, "the third failure refuses");
+    await assert.rejects(() => primary(h), noResponse, "the third failure refuses");
     assert.equal(logCount(h.entries, "info", "Hydrawise has stopped responding for this controller."), 1, "the loss is said once");
     assert.deepEqual(words(h), [ { payload: "offline", retain: true }, { payload: "online", retain: true }, { payload: "offline", retain: true } ],
       "the retained word went online on the good poll and ends offline");
@@ -304,7 +309,7 @@ describe("HydrawiseController reachability verdict", () => {
     t.after(() => h.abort());
 
     await advanceThroughSchedule(clock, [ sleep, backoff, backoff ]);
-    await assert.rejects(() => primary(h), isNotResponding, "the controller is lost");
+    await assert.rejects(() => primary(h), noResponse, "the controller is lost");
 
     await advanceThroughSchedule(clock, [backoff]);
 
@@ -332,7 +337,7 @@ describe("HydrawiseController reachability verdict", () => {
       await advanceThroughSchedule(clock, [sleep]);
 
       assert.equal(logCount(h.entries, "error", "stopped unexpectedly"), 1, "the fault reporter says why the loop ended");
-      await assert.rejects(() => primary(h), isNotResponding, "a loop that has ended vouches for nothing");
+      await assert.rejects(() => primary(h), noResponse, "a loop that has ended vouches for nothing");
       assert.equal(logCount(h.entries, "info", "for this controller"), 0, "and the controller adds no line of its own about the same fault");
       assert.deepEqual(words(h).at(-1), { payload: "offline", retain: true }, "the retained word is offline");
     });

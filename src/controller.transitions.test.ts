@@ -10,13 +10,12 @@
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
 /* eslint-disable camelcase */
 import type { HydrawiseControllerV2Facts, HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
+import { Service, buildController, makeV2Facts, makeZoneV2Facts } from "./testing/platform.helpers.ts";
 import { bareSensors, rainSensors } from "./api.fixtures.ts";
-import { buildController, makeV2Facts, makeZoneV2Facts } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
 import { formatLogEntry, logCount, loggedAt, waitUntil } from "homebridge-plugin-utils/testing";
 import { HYDRAWISE_UNSCHEDULED_SENTINEL } from "./types.ts";
-import { Service } from "./testing/hap.helpers.ts";
 import assert from "node:assert/strict";
 
 // Compose a fast-cadence schedule from a zone list and an optional sensor block (the bare, non-referencing sensor by default).
@@ -67,10 +66,12 @@ describe("HydrawiseController updateState transitions", () => {
 
   test("suppresses a zone's start log when Log.Zone is disabled for that zone", async (t) => {
 
+    // A sibling zone left at Log.Zone's enabled default starts on the same poll, so its start line is the control that this run narrates a start where allowed.
+    const sibling: Partial<HydrawiseZoneConfig> = { name: "Bravo", relay: 2, relay_id: 700002 };
     const h = buildController({ program: (recorder) => {
 
-      recorder.program("statusschedule.php", { body: schedule([scheduledZone()]), kind: "response" });
-      recorder.programDefault("statusschedule.php", { body: schedule([runningZone()]), kind: "response" });
+      recorder.program("statusschedule.php", { body: schedule([ scheduledZone(), scheduledZone(sibling) ]), kind: "response" });
+      recorder.programDefault("statusschedule.php", { body: schedule([ runningZone(), runningZone(sibling) ]), kind: "response" });
     }, signalAborted: false, userOptions: ["Disable.Log.Zone.700001"] });
 
     t.after(() => h.abort());
@@ -78,7 +79,8 @@ describe("HydrawiseController updateState transitions", () => {
     // Wait until at least two polls have run so the on-transition has certainly been processed, then confirm it produced no start log.
     await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 3, { description: "the third status poll" });
 
-    assert.ok(!loggedAt(h.entries, "info", "Started"), "a zone with Log.Zone disabled should not log its start");
+    assert.ok(loggedAt(h.entries, "info", "Bravo [Zone 2]: Started"), "the sibling whose Log.Zone is at its default logs the start the same poll made");
+    assert.ok(!loggedAt(h.entries, "info", "Alpha [Zone 1]: Started"), "a zone with Log.Zone disabled should not log its start");
   });
 
   test("logs the rain sensor stopping and then allowing irrigation", async (t) => {
@@ -317,6 +319,8 @@ describe("HydrawiseController suspension transitions", () => {
     await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
     await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 2, { description: "the second status poll" });
 
+    // The status sentence is the control that the facts landed before the first sighting, so the zone was seeded reading as suspended rather than never classified.
+    assert.ok(loggedAt(h.entries, "info", "Watering is suspended until"), "the zone's first-sighting status names the suspension it was sighted under");
     assert.equal(logCount(h.entries, "info", "Suspended until"), 0, "a zone sighted already suspended announces nothing");
   });
 

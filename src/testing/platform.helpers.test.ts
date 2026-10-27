@@ -1,25 +1,18 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * platform.helpers.test.ts: Self-test for the platform harness. Asserts the programmable retrieve recorder's record-and-program semantics, the MQTT recorder's
- * capture and invoke knobs, the MockAgent installer's snapshot-and-restore discipline, the API double's capture-and-invoke event contract, and the platform
- * double's mutable debug channel and signal lifecycle - pre-aborted by default, abortable when requested.
+ * platform.helpers.test.ts: Self-test for the platform harness. Asserts the programmable retrieve recorder's record-and-program semantics, the MockAgent
+ * installer's snapshot-and-restore discipline, the call views that read the Homebridge API double's record live, and the platform double's mutable debug channel
+ * and signal lifecycle - pre-aborted by default, abortable when requested.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { RetrieveRecorder, installMockDispatcher, makeTestApi, makeTestPlatform } from "./platform.helpers.ts";
+import { PLATFORM_NAME, PLUGIN_NAME } from "../settings.ts";
+import { RetrieveRecorder, buildController, buildPlatform, installMockDispatcher, makeTestPlatform } from "./platform.helpers.ts";
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { getGlobalDispatcher } from "undici";
 import { loggedAt } from "homebridge-plugin-utils/testing";
-
-// The subset of the API double's surface this self-test drives directly. The harness returns the api as an opaque value for the platform constructor cast; here
-// we describe just the methods we exercise.
-interface ApiDouble {
-
-  on: (event: string, handler: () => void) => unknown;
-  registerPlatformAccessories: (plugin: string, platform: string, accessories: unknown[]) => void;
-}
 
 describe("RetrieveRecorder", () => {
 
@@ -80,29 +73,28 @@ describe("installMockDispatcher", () => {
   });
 });
 
-describe("makeTestApi", () => {
+describe("the harness's call views", () => {
 
-  test("captures event handlers and invokes them on emit", () => {
+  test("read the API double's record when called, so a call made after a result was built and destructured is seen", (t) => {
 
-    const { api, emit } = makeTestApi();
-    let ran = 0;
+    // Each result is destructured before any call is made, the way every suite holds one, and buildController's result is itself a spread of the platform
+    // double's.
+    const { api, emit, registered, unregistered, updated } = buildPlatform();
+    const { accessory, flushes, platform } = buildController();
 
-    (api as ApiDouble).on("did-finish", () => { ran++; });
-    emit("did-finish");
-    emit("did-finish");
+    t.after(() => emit("shutdown"));
 
-    assert.equal(ran, 2, "each emit should invoke the captured handler");
-  });
+    const fresh = new api.platformAccessory("Views", api.hap.uuid.generate("platform-helpers-test.views"));
 
-  test("records registered accessories", () => {
+    api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [fresh]);
+    api.updatePlatformAccessories([fresh]);
+    api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [fresh]);
+    platform.api.updatePlatformAccessories([accessory]);
 
-    const { api, makeAccessory, registered } = makeTestApi();
-    const accessory = makeAccessory("Test", "u1");
-
-    (api as ApiDouble).registerPlatformAccessories("plugin", "platform", [accessory]);
-
-    assert.equal(registered.length, 1, "the registered accessory should be recorded");
-    assert.equal(registered[0]?.UUID, "u1", "the recorded accessory should carry its UUID");
+    assert.deepEqual(registered(), [fresh], "the registration view reads the registration made after the result was built");
+    assert.deepEqual(updated(), [[fresh]], "the cache flush view reads the flush made after it");
+    assert.deepEqual(unregistered(), [fresh], "the unregistration view reads the unregistration made after it");
+    assert.deepEqual(flushes(), [[accessory]], "and the controller harness's flush view reads a flush made after its result was spread and destructured");
   });
 });
 

@@ -9,14 +9,13 @@
 
 // The Hydrawise API wire shapes use snake_case keys such as controller_id, so camelcase is disabled here to let the controller fixture mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { Characteristic, Service } from "./testing/hap.helpers.ts";
-import { HydrawiseReservedNames, suspendZoneSubtype, zoneAccessoryId } from "./types.ts";
-import { MqttClient, onAbort } from "homebridge-plugin-utils";
-import type { TestAccessory, TestCharacteristic } from "./testing/hap.helpers.ts";
-import { TestMqttClient, buildPlatform, dispatcherOf, installMockDispatcher, isNotResponding, programJsonReply, programStatusReply, seedAccessory,
+import { Characteristic, Service, TestMqttClient, buildPlatform, dispatcherOf, installMockDispatcher, programJsonReply, programStatusReply, seedAccessory,
   v2DispatcherOf } from "./testing/platform.helpers.ts";
+import { HAPStatus, MqttClient, onAbort } from "homebridge-plugin-utils";
+import type { Characteristic as HapCharacteristic, PlatformAccessory } from "homebridge";
+import { HydrawiseReservedNames, suspendZoneSubtype, zoneAccessoryId } from "./types.ts";
 import { describe, test } from "node:test";
-import { logCount, loggedAt, present, settle, waitUntil } from "homebridge-plugin-utils/testing";
+import { hapStatus, logCount, loggedAt, present, settle, triggerGet, triggerSet, waitUntil } from "homebridge-plugin-utils/testing";
 import { makeCustomerDetails, normalSchedule } from "./api.helpers.ts";
 import { HYDRAWISE_SHUTDOWN_GRACE } from "./settings.ts";
 import type { MqttConnectHandler } from "homebridge-plugin-utils";
@@ -28,6 +27,10 @@ const SUSPEND_ALL_SUBTYPE: string = HydrawiseReservedNames.SWITCH_SUSPEND_ALL;
 
 const DID_FINISH_LAUNCHING = "didFinishLaunching";
 const SHUTDOWN = "shutdown";
+
+// The refusal HomeKit renders as No Response: HAP's communication-failure status from a deliberate refusal, which the matcher tells apart from a handler that
+// faulted into the same status.
+const noResponse = hapStatus(HAPStatus.SERVICE_COMMUNICATION_FAILURE);
 
 // The customer-details body carrying a single synthetic controller whose name has surrounding whitespace, so discovery's name trim is observable.
 function untrimmedCustomerDetails(): ReturnType<typeof makeCustomerDetails> {
@@ -68,10 +71,10 @@ describe("HydrawisePlatform configure", () => {
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => registered.length >= 1, { description: "the first accessory registration" });
+    await waitUntil(() => registered().length >= 1, { description: "the first accessory registration" });
 
-    assert.equal(registered.length, 1, "the single discovered controller should be registered once");
-    assert.equal(registered[0]?.displayName, "Test Controller", "the controller name should be trimmed of surrounding whitespace");
+    assert.equal(registered().length, 1, "the single discovered controller should be registered once");
+    assert.equal(registered()[0]?.displayName, "Test Controller", "the controller name should be trimmed of surrounding whitespace");
     assert.ok(loggedAt(entries, "info", "Discovered irrigation controller"), "discovery should log the controller it found");
   });
 
@@ -90,9 +93,9 @@ describe("HydrawisePlatform configure", () => {
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => registered.length >= 1, { description: "the first accessory registration" });
+    await waitUntil(() => registered().length >= 1, { description: "the first accessory registration" });
 
-    assert.equal(registered[0]?.displayName, "Garden Controller", "a fresh accessory carries the name the user configured rather than the wire's");
+    assert.equal(registered()[0]?.displayName, "Garden Controller", "a fresh accessory carries the name the user configured rather than the wire's");
   });
 
   test("leaves a cached accessory's display name alone at discovery, whatever the Name option says", async (t) => {
@@ -108,7 +111,7 @@ describe("HydrawisePlatform configure", () => {
 
     t.after(() => emit(SHUTDOWN));
     await using dispatcher = installMockDispatcher();
-    const cached = seedAccessory(platform, "Test Controller", "500001");
+    const cached = seedAccessory(platform, "Test Controller", platform.hap.uuid.generate("500001"));
 
     programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
@@ -116,7 +119,7 @@ describe("HydrawisePlatform configure", () => {
     emit(DID_FINISH_LAUNCHING);
     await waitUntil(() => cached.getService(Service.IrrigationSystem) !== undefined, { description: "the cached accessory's irrigation system to appear" });
 
-    assert.equal(registered.length, 0, "the cached accessory is reused rather than registered anew");
+    assert.equal(registered().length, 0, "the cached accessory is reused rather than registered anew");
     assert.equal(cached.displayName, "Test Controller", "and discovery does not rename it");
   });
 
@@ -135,7 +138,7 @@ describe("HydrawisePlatform configure", () => {
     emit(DID_FINISH_LAUNCHING);
     await waitUntil(() => logCount(entries, "info", "Successfully connected") >= 2, { description: "the second info line containing \"Successfully connected\"" });
 
-    assert.equal(registered.length, 1, "the short-circuiting second pass should not register the controller again");
+    assert.equal(registered().length, 1, "the short-circuiting second pass should not register the controller again");
   });
 
   test("reuses a cached accessory rather than registering a new one", async (t) => {
@@ -144,33 +147,34 @@ describe("HydrawisePlatform configure", () => {
 
     t.after(() => emit(SHUTDOWN));
     await using dispatcher = installMockDispatcher();
-    const cached = seedAccessory(platform, "Test Controller", "500001");
+    const cached = seedAccessory(platform, "Test Controller", platform.hap.uuid.generate("500001"));
 
     programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => updated.length >= 1, { description: "the first accessory cache update" });
+    await waitUntil(() => updated().length >= 1, { description: "the first accessory cache update" });
 
-    assert.equal(registered.length, 0, "a cached accessory should be reused, not registered anew");
+    assert.equal(registered().length, 0, "a cached accessory should be reused, not registered anew");
     assert.ok(cached.getService(Service.IrrigationSystem), "the reused accessory should be configured with an irrigation system service");
   });
 
   test("prunes an orphaned accessory that no discovered controller claims", async (t) => {
 
-    const { emit, platform, unregistered } = buildPlatform();
+    const { emit, entries, platform, unregistered } = buildPlatform();
 
     t.after(() => emit(SHUTDOWN));
     await using dispatcher = installMockDispatcher();
-    seedAccessory(platform, "Orphan", "999999");
+    seedAccessory(platform, "Orphan", platform.hap.uuid.generate("999999"));
 
     programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => unregistered.length >= 1, { description: "the first accessory unregistration" });
+    await waitUntil(() => unregistered().length >= 1, { description: "the first accessory unregistration" });
 
-    assert.equal(unregistered[0]?.UUID, "999999", "the orphaned accessory should be unregistered");
+    assert.equal(unregistered()[0]?.UUID, platform.hap.uuid.generate("999999"), "the orphaned accessory should be unregistered");
+    assert.ok(!loggedAt(entries, "error", "stopped unexpectedly"), "and the bridge accepted the unregistration, so discovery ran on past the sweep");
   });
 
   test("a Disable.Device option keyed on the serial excludes the controller (the bug 16 fix)", async (t) => {
@@ -187,16 +191,16 @@ describe("HydrawisePlatform configure", () => {
     // accessory is registered.
     await waitUntil(() => logCount(entries, "info", "Successfully connected") >= 1, { description: "an info line containing \"Successfully connected\"" });
 
-    assert.equal(registered.length, 0, "a serial-keyed device disable should exclude the controller");
+    assert.equal(registered().length, 0, "a serial-keyed device disable should exclude the controller");
   });
 
   test("a serial-keyed disable removes an already-cached accessory (the bug 16 fix)", async (t) => {
 
-    const { emit, platform, unregistered } = buildPlatform({ options: ["Disable.Device.SN0A1B2C3D4"] });
+    const { emit, entries, platform, unregistered } = buildPlatform({ options: ["Disable.Device.SN0A1B2C3D4"] });
 
     t.after(() => emit(SHUTDOWN));
     await using dispatcher = installMockDispatcher();
-    seedAccessory(platform, "Test Controller", "500001");
+    seedAccessory(platform, "Test Controller", platform.hap.uuid.generate("500001"));
 
     programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
 
@@ -204,9 +208,10 @@ describe("HydrawisePlatform configure", () => {
 
     // The cached accessory matches the discovered controller's UUID, but the serial-keyed device gate excludes it, so configureController removes the cached
     // accessory rather than leaving it stranded.
-    await waitUntil(() => unregistered.length >= 1, { description: "the first accessory unregistration" });
+    await waitUntil(() => unregistered().length >= 1, { description: "the first accessory unregistration" });
 
-    assert.equal(unregistered[0]?.UUID, "500001", "the disabled controller's cached accessory should be unregistered");
+    assert.equal(unregistered()[0]?.UUID, platform.hap.uuid.generate("500001"), "the disabled controller's cached accessory should be unregistered");
+    assert.ok(!loggedAt(entries, "error", "stopped unexpectedly"), "and the bridge accepted the unregistration, so discovery ran on past it");
   });
 
   test("a Disable.Device option keyed on the controller id does not exclude the controller (the bug 16 fix)", async (t) => {
@@ -219,9 +224,9 @@ describe("HydrawisePlatform configure", () => {
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => registered.length >= 1, { description: "the first accessory registration" });
+    await waitUntil(() => registered().length >= 1, { description: "the first accessory registration" });
 
-    assert.equal(registered.length, 1, "a controller-id-keyed disable does not match the serial-scoped gate, so the controller is still configured");
+    assert.equal(registered().length, 1, "a controller-id-keyed disable does not match the serial-scoped gate, so the controller is still configured");
   });
 
   test("logs an error and configures nothing when no API key is set", (t) => {
@@ -233,7 +238,7 @@ describe("HydrawisePlatform configure", () => {
     // With no API key the constructor returns before wiring the discovery event, so firing it is a no-op.
     emit(DID_FINISH_LAUNCHING);
 
-    assert.equal(registered.length, 0, "no accessories should be configured without an API key");
+    assert.equal(registered().length, 0, "no accessories should be configured without an API key");
     assert.ok(loggedAt(entries, "error", "no Hunter Hydrawise API key"), "the missing key should be reported");
   });
 
@@ -287,7 +292,7 @@ describe("HydrawisePlatform configure", () => {
     emit(DID_FINISH_LAUNCHING);
     await waitUntil(() => loggedAt(entries, "error", "Invalid API key"), { description: "an error line containing \"Invalid API key\"" });
 
-    assert.equal(registered.length, 0, "a failed discovery fetch should configure no controller while it retries");
+    assert.equal(registered().length, 0, "a failed discovery fetch should configure no controller while it retries");
   });
 
   test("propagates a discovery parse failure into the retry loop", async (t) => {
@@ -302,7 +307,7 @@ describe("HydrawisePlatform configure", () => {
     await waitUntil(() => loggedAt(entries, "error", "Unable to retrieve the list of controllers"),
       { description: "an error line containing \"Unable to retrieve the list of controllers\"" });
 
-    assert.equal(registered.length, 0, "a discovery parse failure should configure no controller while it retries");
+    assert.equal(registered().length, 0, "a discovery parse failure should configure no controller while it retries");
   });
 
   test("aborts the shutdown signal when Homebridge shuts down", async () => {
@@ -314,7 +319,7 @@ describe("HydrawisePlatform configure", () => {
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => registered.length >= 1, { description: "the first accessory registration" });
+    await waitUntil(() => registered().length >= 1, { description: "the first accessory registration" });
 
     assert.equal(platform.signal.aborted, false, "the platform signal is live before shutdown");
     assert.equal(dispatcherOf(platform)?.destroyed, false, "the dispatcher is live before shutdown");
@@ -337,7 +342,7 @@ describe("HydrawisePlatform configure", () => {
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => registered.length >= 1, { description: "the first accessory registration" });
+    await waitUntil(() => registered().length >= 1, { description: "the first accessory registration" });
 
     let destroyedAtAbort: boolean | undefined;
 
@@ -447,7 +452,7 @@ describe("HydrawisePlatform configure", () => {
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => registered.length >= 1, { description: "the first accessory registration" });
+    await waitUntil(() => registered().length >= 1, { description: "the first accessory registration" });
 
     // The broker session is gone, so the word is refused at once, as the library's client refuses a publish it holds no session for.
     mqtt.connected = false;
@@ -516,9 +521,9 @@ describe("HydrawisePlatform restore-time refusal and unconfigured availability",
   const DISABLED = { ...syntheticController, controller_id: 500002, name: "Second Controller", serial_number: "SN9Z8Y7X6W5" };
 
   // Restore the controller accessory a previous session left: its irrigation system and one cached valve, under the identity it persisted.
-  function restoreController(platform: Parameters<typeof seedAccessory>[0], identity = OWNER): TestAccessory {
+  function restoreController(platform: Parameters<typeof seedAccessory>[0], identity = OWNER): PlatformAccessory {
 
-    return seedAccessory(platform, identity.name, identity.controllerId.toString(), (seed) => {
+    return seedAccessory(platform, identity.name, platform.hap.uuid.generate(identity.controllerId.toString()), (seed) => {
 
       seed.context = { controller: identity };
       seed.addService(new Service.IrrigationSystem(identity.name));
@@ -528,9 +533,9 @@ describe("HydrawisePlatform restore-time refusal and unconfigured availability",
   }
 
   // Restore a standalone zone accessory a previous session left: its valve, its suspension switch, and the identity pair the platform stamped on it.
-  function restoreZone(platform: Parameters<typeof seedAccessory>[0]): TestAccessory {
+  function restoreZone(platform: Parameters<typeof seedAccessory>[0]): PlatformAccessory {
 
-    return seedAccessory(platform, "Front Lawn South", zoneAccessoryId(OWNER.controllerId, 700002), (seed) => {
+    return seedAccessory(platform, "Front Lawn South", platform.hap.uuid.generate(zoneAccessoryId(OWNER.controllerId, 700002)), (seed) => {
 
       seed.context = { ownerController: OWNER, zone: { name: "Front Lawn South", relay: 2, relayId: 700002 } };
       seed.addService(new Service.Valve("Front Lawn South", "700002"));
@@ -539,13 +544,13 @@ describe("HydrawisePlatform restore-time refusal and unconfigured availability",
   }
 
   // One restored suspension switch's On characteristic, located by its subtype.
-  function suspend(accessory: TestAccessory, subtype: string): TestCharacteristic {
+  function suspend(accessory: PlatformAccessory, subtype: string): HapCharacteristic {
 
     return present(accessory.getServiceById(Service.Switch, subtype), "the restored suspension switch").getCharacteristic(Characteristic.On);
   }
 
   // One restored service's Active characteristic, located by its subtype or as the accessory's bare irrigation system.
-  function active(accessory: TestAccessory, subtype?: string): TestCharacteristic {
+  function active(accessory: PlatformAccessory, subtype?: string): HapCharacteristic {
 
     const service = (subtype === undefined) ? accessory.getService(Service.IrrigationSystem) : accessory.getServiceById(Service.Valve, subtype);
 
@@ -561,13 +566,13 @@ describe("HydrawisePlatform restore-time refusal and unconfigured availability",
     const controller = restoreController(platform);
     const zone = restoreZone(platform);
 
-    await assert.rejects(() => active(controller).triggerGet(), isNotResponding, "the irrigation system refuses a read");
-    await assert.rejects(() => active(controller).triggerSet(Characteristic.Active.INACTIVE), isNotResponding, "and a write");
-    await assert.rejects(() => active(controller, "700001").triggerSet(Characteristic.Active.ACTIVE), isNotResponding, "a cached valve on it refuses a write");
-    await assert.rejects(() => active(zone, "700002").triggerGet(), isNotResponding, "the zone accessory's valve refuses a read");
-    await assert.rejects(() => active(zone, "700002").triggerSet(Characteristic.Active.ACTIVE), isNotResponding, "and a write");
-    await assert.rejects(() => suspend(controller, SUSPEND_ALL_SUBTYPE).triggerSet(true), isNotResponding, "the cached suspend-all switch refuses a write");
-    await assert.rejects(() => suspend(zone, suspendZoneSubtype(700002)).triggerSet(true), isNotResponding, "and so does the cached per-zone switch");
+    await assert.rejects(() => triggerGet(active(controller)), noResponse, "the irrigation system refuses a read");
+    await assert.rejects(() => triggerSet(active(controller), Characteristic.Active.INACTIVE), noResponse, "and a write");
+    await assert.rejects(() => triggerSet(active(controller, "700001"), Characteristic.Active.ACTIVE), noResponse, "a cached valve on it refuses a write");
+    await assert.rejects(() => triggerGet(active(zone, "700002")), noResponse, "the zone accessory's valve refuses a read");
+    await assert.rejects(() => triggerSet(active(zone, "700002"), Characteristic.Active.ACTIVE), noResponse, "and a write");
+    await assert.rejects(() => triggerSet(suspend(controller, SUSPEND_ALL_SUBTYPE), true), noResponse, "the cached suspend-all switch refuses a write");
+    await assert.rejects(() => triggerSet(suspend(zone, suspendZoneSubtype(700002)), true), noResponse, "and so does the cached per-zone switch");
   });
 
   test("once discovery claims a restored controller accessory, it answers with its controller's verdict", async (t) => {
@@ -583,9 +588,10 @@ describe("HydrawisePlatform restore-time refusal and unconfigured availability",
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => platform.configuredDevices[OWNER.controllerId.toString()]?.unavailable === false, { description: "the controller's first poll to land" });
+    await waitUntil(() => platform.configuredDevices[platform.hap.uuid.generate(OWNER.controllerId.toString())]?.unavailable === false,
+      { description: "the controller's first poll to land" });
 
-    assert.equal(await active(controller).triggerGet(), Characteristic.Active.ACTIVE, "the claimed accessory answers once its controller reaches Hydrawise");
+    assert.equal(await triggerGet(active(controller)), Characteristic.Active.ACTIVE, "the claimed accessory answers once its controller reaches Hydrawise");
   });
 
   test("a discovery that never answers, as with a revoked key, leaves every restored accessory refusing", async (t) => {
@@ -603,8 +609,8 @@ describe("HydrawisePlatform restore-time refusal and unconfigured availability",
     emit(DID_FINISH_LAUNCHING);
     await waitUntil(() => loggedAt(entries, "error", "Invalid API key"), { description: "an error line containing \"Invalid API key\"" });
 
-    await assert.rejects(() => active(controller).triggerGet(), isNotResponding, "the controller accessory still refuses");
-    await assert.rejects(() => active(zone, "700002").triggerGet(), isNotResponding, "and so does the zone accessory");
+    await assert.rejects(() => triggerGet(active(controller)), noResponse, "the controller accessory still refuses");
+    await assert.rejects(() => triggerGet(active(zone, "700002")), noResponse, "and so does the zone accessory");
   });
 
   test("a restored accessory whose context names no controller refuses, even while the controller its UUID resembles is reachable", async (t) => {
@@ -615,7 +621,7 @@ describe("HydrawisePlatform restore-time refusal and unconfigured availability",
     await using dispatcher = installMockDispatcher();
 
     // A zone-shaped UUID under the synthetic controller, carrying a controller field that is no identity at all, so the context classifies as no zone of anyone's.
-    const malformed = seedAccessory(platform, "Malformed", zoneAccessoryId(OWNER.controllerId, 700003), (seed) => {
+    const malformed = seedAccessory(platform, "Malformed", platform.hap.uuid.generate(zoneAccessoryId(OWNER.controllerId, 700003)), (seed) => {
 
       seed.context = { controller: "not an identity" };
       seed.addService(new Service.IrrigationSystem("Malformed"));
@@ -625,9 +631,10 @@ describe("HydrawisePlatform restore-time refusal and unconfigured availability",
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => platform.configuredDevices[OWNER.controllerId.toString()]?.unavailable === false, { description: "the controller's first poll to land" });
+    await waitUntil(() => platform.configuredDevices[platform.hap.uuid.generate(OWNER.controllerId.toString())]?.unavailable === false,
+      { description: "the controller's first poll to land" });
 
-    await assert.rejects(() => active(malformed).triggerGet(), isNotResponding, "an accessory nothing in this run vouches for refuses");
+    await assert.rejects(() => triggerGet(active(malformed)), noResponse, "an accessory nothing in this run vouches for refuses");
   });
 
   test("a restored controller this run does not build is stated offline, retained, on connect and after discovery, and a built one is not", async (t) => {

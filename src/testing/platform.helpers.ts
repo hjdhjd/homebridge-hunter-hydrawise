@@ -1,8 +1,14 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * platform.helpers.ts: The plugin-specific test harness - the platform double for controller tests, the API double for real-platform construction, the recording
- * MQTT client, the programmable retrieve recorder, the undici MockAgent installer, and the buildController / buildPlatform construction workhorses. Every cast
- * that bridges a double to a production constructor's parameter type is confined to a workhorse, so test bodies stay cast-free.
+ * platform.helpers.ts: The plugin-specific test harness - the Homebridge runtime every suite runs on, the platform double for controller tests, real-platform
+ * construction over HBPU's Homebridge API double, the recording MQTT client, the programmable retrieve recorder, the undici MockAgent installer, and the
+ * buildController / buildPlatform construction workhorses. Every cast that bridges a double to a production constructor's parameter type is confined to a
+ * workhorse, so test bodies stay cast-free.
+ *
+ * Every accessory a suite reads is Homebridge's own PlatformAccessory over the hap-nodejs copy Homebridge loads, made through HBPU's Homebridge test double, so
+ * HAP's own defaults, UUID validation, bridge and read and write paths apply to every row. Each accessory the harness builds reaches the double's bridge the way
+ * Homebridge puts it there: one that stands for what the cache carried is restored, in Homebridge's restore order, and one that stands for a fresh accessory is
+ * registered. Every view of the accessory calls a suite reads is derived from the double's one record of them.
  *
  * The wire boundaries are by design. Controller tests never touch undici: the platform double's retrieve is a programmable recorder that records every call and
  * returns fixture-programmed response shapes. Platform tests construct a REAL HydrawisePlatform and drive its retrieve() through a MockAgent installed as the
@@ -13,22 +19,31 @@
 // a Node below the release that ships them. It is a no-op on a runtime that already has them, and the runtime-floor conformance test enumerates it among the lines
 // the sunset deletes.
 import "homebridge-plugin-utils/polyfills";
-import { Characteristic, Service, TestAccessory, TestHapStatusError, makeTestAccessory } from "./hap.helpers.ts";
+import type { API, PlatformAccessory } from "homebridge";
 import type { Clock, HomebridgePluginLogging, Nullable, RateBudget } from "homebridge-plugin-utils";
-import { FeatureOptions, HAPStatus, TimerRegistry, sanitizeName, systemClock } from "homebridge-plugin-utils";
+import { FeatureOptions, TimerRegistry, sanitizeName, systemClock } from "homebridge-plugin-utils";
+import { HYDRAWISE_API_BASE_URL, PLATFORM_NAME, PLUGIN_NAME } from "../settings.ts";
 import type { HydrawiseAccessory, HydrawiseControllerConfig, HydrawiseControllerHardware, HydrawiseControllerIdentity, HydrawiseControllerV2Facts,
   HydrawiseV2MutationResult, HydrawiseZoneSuspensionResult, HydrawiseZoneV2Facts } from "../types.ts";
 import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
-import { TestMqttClient, capturingLog, present, waitUntil } from "homebridge-plugin-utils/testing";
+import { TestHomebridgeApi, TestMqttClient, capturingLog, loadHomebridge, present, waitUntil } from "homebridge-plugin-utils/testing";
+import type { TestHomebridgeApiCall, TestLogEntry, TestPlatformAccessory } from "homebridge-plugin-utils/testing";
 import { featureOptionCategories, featureOptions } from "../options.ts";
 import type { Dispatcher } from "undici";
-import { HYDRAWISE_API_BASE_URL } from "../settings.ts";
 import { HydrawiseController } from "../controller.ts";
 import type { HydrawiseOptions } from "../options.ts";
 import { HydrawisePlatform } from "../platform.ts";
-import type { TestLogEntry } from "homebridge-plugin-utils/testing";
 import { syntheticController } from "../api.fixtures.ts";
 import { zoneAccessoryId } from "../types.ts";
+
+/* The Homebridge runtime every suite runs on, loaded once from this repository's tree: Homebridge's own PlatformAccessory class and the hap-nodejs copy Homebridge
+ * loads, so the handlers the plugin binds meet the HAP they meet at runtime, its status error class included. Loading it as this module evaluates is what keeps
+ * every workhorse below synchronous, so a suite builds a controller or a platform in one call however it is shaped.
+ */
+const runtime = await loadHomebridge(import.meta.url);
+
+// The runtime's HAP Service and Characteristic namespaces, the one source every suite reads HAP's service and characteristic classes and their constants from.
+export const { Characteristic, Service } = runtime.hap;
 
 /* The library's recording MqttClient double, re-exported so every suite reaches it through this one harness module, exactly as it reaches every other double
  * here. It mirrors the real client's observable behavior - the suffix the client appends to a get or set registration, the republish a get answers with, the
@@ -116,32 +131,11 @@ export class RetrieveRecorder {
   }
 }
 
-/* The HAP namespace shape every double in this file exposes: the Service / Characteristic test namespaces, the status enum and the status error class a refusal is
- * built from, and a deterministic uuid generator that echoes its input, so an accessory's UUID is simply the controller id string production hands it. The enum is
- * the library's own mirror of HAP's, so a refusal row compares against the very values production throws with.
- */
-interface TestHap {
+// The accessories each of an API double's calls of one kind carried, one list per call in arrival order. Every call view a workhorse returns reads through here
+// at the moment it is asked, so the double's record is the one source a view answers from, and a view reads a call made after the result holding it was copied.
+function callsOf(api: TestHomebridgeApi, kind: TestHomebridgeApiCall["kind"]): (readonly PlatformAccessory[])[] {
 
-  Characteristic: typeof Characteristic;
-  HAPStatus: typeof HAPStatus;
-  HapStatusError: typeof TestHapStatusError;
-  Service: typeof Service;
-  uuid: { generate: (data: string) => string };
-}
-
-const testHap: TestHap = { Characteristic, HAPStatus, HapStatusError: TestHapStatusError, Service, uuid: { generate: (data: string): string => data } };
-
-/**
- * Whether a thrown value is the refusal the Not Responding rule throws: the status error double carrying the communication-failure status, the one HomeKit
- * renders as No Response. A refusal row hands this to `assert.rejects`, so it asserts the class and the status together rather than only that something threw.
- *
- * @param error - The value a refused read or write rejected with.
- *
- * @returns True when the value is that refusal.
- */
-export function isNotResponding(error: unknown): boolean {
-
-  return (error instanceof TestHapStatusError) && (error.hapStatus === HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+  return api.calls.filter(call => call.kind === kind).map(call => call.accessories);
 }
 
 // One recorded reconcileZoneAccessories call: the whole argument object the controller passed. Typed off the production signature, so a test reads the request the
@@ -149,18 +143,18 @@ export function isNotResponding(error: unknown): boolean {
 export type RecordedReconcileCall = Parameters<HydrawisePlatform["reconcileZoneAccessories"]>[0];
 
 // The platform double's read surface, as the controller and its configure chain consume it. The construction-boundary cast to HydrawisePlatform happens in
-// buildController. The api carries updatePlatformAccessories because the controller flushes its persisted zone roster through it; the double records each flush.
-// reconcileZoneAccessories is typed by indexed access against the real method, so a signature drift is a compile error here rather than a silent mismatch.
+// buildController. The api is HBPU's Homebridge API double, through which the controller reaches HAP and flushes its persisted state, and whose record of those
+// flushes is what the harness reads back. reconcileZoneAccessories is typed by indexed access against the real method, so a signature drift is a compile error here
+// rather than a silent mismatch.
 export interface TestPlatform {
 
-  api: { hap: TestHap; updatePlatformAccessories: (accessories: TestAccessory[]) => void };
+  api: TestHomebridgeApi;
 
   // The time source every wait and stamp a controller takes reads, standing in for the production platform's own clock. Typed as the production Clock because that is
   // the whole of what a controller consumes; a test that drives time holds its own TestClock handle.
   clock: Clock;
   config: HydrawiseOptions;
   featureOptions: FeatureOptions;
-  hap: TestHap;
   hasV2Client: boolean;
   log: HomebridgePluginLogging;
   mqtt: Nullable<TestMqttClient>;
@@ -203,8 +197,7 @@ export interface MakeTestPlatformOptions {
   userOptions?: string[];
 }
 
-// The handles makeTestPlatform returns: the platform double plus the doubles and capture buffers a test asserts against and the lever to abort a live signal. The
-// flushes buffer records every updatePlatformAccessories call the controller makes, so a test asserts on the zone-roster flush cadence.
+// The handles makeTestPlatform returns: the platform double plus the doubles and capture buffers a test asserts against and the lever to abort a live signal.
 export interface MakeTestPlatformResult {
 
   abort: (reason?: string) => void;
@@ -214,7 +207,10 @@ export interface MakeTestPlatformResult {
 
   // Every line the platform double logged, read live: the array grows as the code under test logs, so a read always sees everything logged so far.
   entries: readonly TestLogEntry[];
-  flushes: TestAccessory[][];
+
+  // The accessories each updatePlatformAccessories call the controller made carried, one list per call, read from the API double's record when called, so a test
+  // asserts on the flush cadence however it holds this result.
+  flushes: () => (readonly PlatformAccessory[])[];
   mqtt: Nullable<TestMqttClient>;
   platform: TestPlatform;
 
@@ -228,7 +224,7 @@ export interface MakeTestPlatformResult {
 
   // The zone accessories the reconcile stub owns, keyed by relay id. It is both the stub's own store and the seeding hook a warm-restart test pre-populates, so a
   // test can hand the first poll an accessory that already carries a cache-restored valve.
-  zoneAccessories: Map<number, TestAccessory>;
+  zoneAccessories: Map<number, TestPlatformAccessory>;
 }
 
 /* Build a platform double around a REAL FeatureOptions engine seeded with the supplied userOptions, so the production feature-option logic (test / logFeature)
@@ -255,10 +251,13 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
    * double's own clock, so a revert a row drives on a virtual timeline fires when that row advances it.
    */
   const timers = new TimerRegistry({ clock, signal: signalController.signal });
+
+  // HBPU's Homebridge API double, one per platform double, because its accessory cache, its bridge and its record of accessory calls belong to the one platform
+  // a row builds.
+  const api = new TestHomebridgeApi(runtime);
   const retrieve = new RetrieveRecorder();
-  const flushes: TestAccessory[][] = [];
   const reconciles: RecordedReconcileCall[] = [];
-  const zoneAccessories = new Map<number, TestAccessory>();
+  const zoneAccessories = new Map<number, TestPlatformAccessory>();
   const featureOpts = new FeatureOptions(featureOptionCategories, featureOptions, options.userOptions);
   const suspensions: RecordedSuspensionCall[] = [];
 
@@ -289,6 +288,9 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
    * the context writes, and the promotion-failure containment are the platform's contract and are asserted in its own suite, so nothing of them is reimplemented
    * here: the stub honors exactly what each call asks for.
    *
+   * An accessory the stub mints is registered with the API double, as the platform registers a fresh zone accessory, so it sits on the bridge where every zone
+   * accessory the platform holds sits.
+   *
    * It NEVER calls updatePlatformAccessories. The roster suite asserts exact flush counts across multi-poll runs, so a stub that flushed would break that net
    * without any production change behind it.
    */
@@ -310,15 +312,20 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
 
     for(const zone of request.zones) {
 
-      // The display name is sanitized on creation exactly as the production reconcile sanitizes it, so a test measuring name-synchronization writes sees the same
-      // starting state the real platform would hand the controller.
-      const accessory = zoneAccessories.get(zone.identity.relayId) ??
-        new TestPlatformAccessory(sanitizeName(zone.displayName), zoneAccessoryId(request.controller.controller_id, zone.identity.relayId));
+      let accessory = zoneAccessories.get(zone.identity.relayId);
+
+      // The display name is sanitized on creation and the UUID derived from the compound identity, exactly as the production reconcile mints them, so a test
+      // measuring name-synchronization writes sees the same starting state the real platform would hand the controller.
+      if(!accessory) {
+
+        accessory = new api.platformAccessory(sanitizeName(zone.displayName), api.hap.uuid.generate(zoneAccessoryId(request.controller.controller_id,
+          zone.identity.relayId)));
+
+        api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+      }
 
       zoneAccessories.set(zone.identity.relayId, accessory);
-
-      // The double-to-production cast is confined to this workhorse, exactly as the construction-boundary casts below are.
-      hosts.set(zone.identity.relayId, accessory as unknown as HydrawiseAccessory);
+      hosts.set(zone.identity.relayId, accessory);
     }
 
     return hosts;
@@ -334,11 +341,10 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
 
   const platform: TestPlatform = {
 
-    api: { hap: testHap, updatePlatformAccessories: (accessories: TestAccessory[]): void => { flushes.push(accessories); } },
+    api,
     clock,
     config,
     featureOptions: featureOpts,
-    hap: testHap,
     hasV2Client: options.hasV2Client ?? false,
     log,
     mqtt,
@@ -359,7 +365,8 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
     mqtt?.abort();
   };
 
-  return { abort, clock, entries: log.entries, flushes, mqtt, platform, reconciles, retrieve, signalController, suspensions, zoneAccessories };
+  return { abort, clock, entries: log.entries, flushes: () => callsOf(api, "update"), mqtt, platform, reconciles, retrieve, signalController, suspensions,
+    zoneAccessories };
 }
 
 // Options for buildController: the controller-config overrides, an optional program hook, and everything makeTestPlatform accepts.
@@ -381,161 +388,102 @@ export interface BuildControllerOptions extends MakeTestPlatformOptions {
   // so a test that does not care about siblings gets a sensible self-only roster; a multi-controller test supplies its own.
   roster?: HydrawiseControllerIdentity[];
 
-  // Seed the accessory context before construction, as Homebridge does when it restores a cached accessory. Runs before the controller constructs, so a test can
-  // prove configureDevice's wipe-then-seed preserves (or shape-degrades) a prior persisted zone roster.
-  seedContext?: (accessory: TestAccessory) => void;
+  // Seed the accessory with what the cache carried - its context, and any services and values a previous session left - as Homebridge restores a cached
+  // accessory. Runs before the controller constructs, so a test can prove configureDevice's wipe-then-seed preserves (or shape-degrades) a prior persisted zone
+  // roster. A seeded accessory is restored and an unseeded one registered, so a row without a seed starts from the fresh accessory discovery registers.
+  seedContext?: (accessory: TestPlatformAccessory) => void;
 }
 
 // The handles buildController returns: the constructed production controller plus the underlying doubles and capture buffers a test asserts against.
 export interface BuildControllerResult extends MakeTestPlatformResult {
 
-  accessory: TestAccessory;
+  accessory: TestPlatformAccessory;
   controller: HydrawiseController;
   controllerConfig: HydrawiseControllerConfig;
 }
 
 /* Construct a REAL HydrawiseController against the doubles - the controller-test workhorse. The construction-boundary casts (platform, accessory) bridge the
  * doubles to the production constructor's parameter types; everything the controller then does runs the real production code against the doubles. Returns
- * the constructed controller plus every handle a test asserts on: the TestAccessory (to read services and characteristics), the capture buffers, the
- * recording MQTT double, and the retrieve recorder.
+ * the constructed controller plus every handle a test asserts on: the accessory (to read services, characteristics and the changes HAP raised on them), the
+ * capture buffers, the recording MQTT double, and the retrieve recorder.
  */
 export function buildController(options: BuildControllerOptions = {}): BuildControllerResult {
 
   const platformResult = makeTestPlatform(options);
+  const { api } = platformResult.platform;
   const controllerConfig: HydrawiseControllerConfig = { ...syntheticController, ...options.controller };
-  const accessory = makeTestAccessory(options.accessoryName ?? controllerConfig.name, testHap.uuid.generate(controllerConfig.controller_id.toString()));
+
+  // The accessory takes the UUID the platform's discovery derives from the controller id, the one HAP's constructor accepts.
+  const accessory = new api.platformAccessory(options.accessoryName ?? controllerConfig.name, api.hap.uuid.generate(controllerConfig.controller_id.toString()));
   const roster: HydrawiseControllerIdentity[] = options.roster ?? [{ controllerId: controllerConfig.controller_id, name: controllerConfig.name,
     serialNumber: controllerConfig.serial_number }];
 
-  // Seed the accessory context before construction, as Homebridge restores a cached accessory ahead of configure, so a test can drive the preservation path.
-  options.seedContext?.(accessory);
+  /* Seed the accessory with what the cache carried, then restore it onto the API double's bridge, as Homebridge restores a cached accessory ahead of configure,
+   * so a test can drive the preservation path. An accessory with nothing seeded stands for a fresh one, which discovery registers rather than restores. Neither
+   * call is a cache flush, so every flush a row counts is the controller's own.
+   */
+  if(options.seedContext) {
+
+    options.seedContext(accessory);
+    restoreCached(api, accessory);
+  } else {
+
+    api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+  }
 
   // Seed the recorder before construction, because the controller's polling loop issues its first retrieve synchronously as the constructor runs.
   options.program?.(platformResult.retrieve);
 
-  // The construction-boundary casts (platform, accessory) bridge the doubles to the production constructor's parameter types.
-  const controller = new HydrawiseController(platformResult.platform as unknown as ConstructorParameters<typeof HydrawiseController>[0],
-    accessory as unknown as ConstructorParameters<typeof HydrawiseController>[1], controllerConfig, roster);
+  // The construction-boundary cast bridges the platform double to the production constructor's parameter type. The accessory needs none, since it is
+  // Homebridge's own.
+  const controller = new HydrawiseController(platformResult.platform as unknown as ConstructorParameters<typeof HydrawiseController>[0], accessory,
+    controllerConfig, roster);
 
   return { accessory, controller, controllerConfig, ...platformResult };
 }
 
-// A double of Homebridge's PlatformAccessory constructor: `new api.platformAccessory(name, uuid, category)` yields a TestAccessory, exactly what the real
-// platform's one accessory-creation path does.
-class TestPlatformAccessory extends TestAccessory {}
-
-// A recorded HAP event handler registered through api.on. The platform stores its DID_FINISH_LAUNCHING and SHUTDOWN handlers here; a test fires them explicitly.
-type ApiEventHandler = () => void;
-
-// The API double's surface and the capture buffers a platform test asserts against.
-export interface TestApiResult {
-
-  api: unknown;
-  emit: (event: string) => void;
-
-  // The UUIDs whose registration should throw, so a test can drive production's promotion-failure containment. Empty by default, which leaves every registration
-  // succeeding exactly as before.
-  failRegistrationUuids: Set<string>;
-
-  // The UUIDs whose cache flush should throw, so a test can drive the arm where an accessory registers and then fails to persist - the one path that reaches
-  // production's promotion undo. Empty by default, which leaves every flush recording exactly as before.
-  failUpdateUuids: Set<string>;
-  makeAccessory: (displayName: string, uuid: string, category?: number) => TestAccessory;
-  registered: TestAccessory[];
-  unregistered: TestAccessory[];
-  updated: TestAccessory[][];
-}
-
-/* Build the API double for real-platform construction. hap carries the double namespaces and the deterministic uuid generator; platformAccessory is the
- * constructable accessory double; register / update / unregister record their accessories; on captures each handler by event name so a test fires
- * DID_FINISH_LAUNCHING (to run the private configureHydrawise) and SHUTDOWN (to drive teardown) explicitly. emit invokes every handler registered for an event.
+/**
+ * Restore a cached accessory onto a controller harness's API double, as Homebridge restores one ahead of discovery: Homebridge's FirmwareRevision placeholder, then
+ * the platform's configureAccessory, then the bridge. The controller harness builds no platform, and the controller binds every handler a row reads as it
+ * configures each service, so the stand-in configureAccessory binds nothing.
+ *
+ * @param api       - The controller harness's API double, the one the accessory was made through.
+ * @param accessory - The accessory standing for what the cache carried, its services and context already in place.
  */
-export function makeTestApi(): TestApiResult {
+export function restoreCached(api: TestHomebridgeApi, accessory: PlatformAccessory): void {
 
-  const handlers = new Map<string, ApiEventHandler[]>();
-  const failRegistrationUuids = new Set<string>();
-  const failUpdateUuids = new Set<string>();
-  const registered: TestAccessory[] = [];
-  const unregistered: TestAccessory[] = [];
-  const updated: TestAccessory[][] = [];
-
-  /* The one check-before-record gate the recording closures answer to: any accessory the fail set names throws before a single entry lands in a buffer, so a
-   * rejected call leaves the recorded state exactly as a real failure would. The knobs share this check rather than each closure carrying its own mirrored
-   * loop, so they can never drift apart in what "rejected" means.
-   */
-  const rejectNamed = (failUuids: Set<string>, accessories: TestAccessory[], action: string): void => {
-
-    for(const accessory of accessories) {
-
-      if(failUuids.has(accessory.UUID)) {
-
-        throw new Error(action + " rejected for " + accessory.UUID + ".");
-      }
-    }
-  };
-
-  const api = {
-
-    hap: testHap,
-    on: (event: string, handler: ApiEventHandler): unknown => {
-
-      const list = handlers.get(event) ?? [];
-
-      list.push(handler);
-      handlers.set(event, list);
-
-      return api;
-    },
-    platformAccessory: TestPlatformAccessory,
-    registerPlatformAccessories: (_plugin: string, _platform: string, accessories: TestAccessory[]): void => {
-
-      rejectNamed(failRegistrationUuids, accessories, "Registration");
-
-      registered.push(...accessories);
-    },
-    unregisterPlatformAccessories: (_plugin: string, _platform: string, accessories: TestAccessory[]): void => { unregistered.push(...accessories); },
-    updatePlatformAccessories: (accessories: TestAccessory[]): void => {
-
-      rejectNamed(failUpdateUuids, accessories, "Cache flush");
-
-      updated.push(accessories);
-    }
-  };
-
-  const emit = (event: string): void => {
-
-    for(const handler of handlers.get(event) ?? []) {
-
-      handler();
-    }
-  };
-
-  return { api, emit, failRegistrationUuids, failUpdateUuids,
-    makeAccessory: (displayName: string, uuid: string, category?: number): TestAccessory => new TestPlatformAccessory(displayName, uuid, category), registered,
-    unregistered, updated };
+  api.restorePlatformAccessories({ accessories: [accessory], platform: { configureAccessory: (): void => undefined }, platformName: PLATFORM_NAME,
+    pluginIdentifier: PLUGIN_NAME });
 }
 
 /**
- * Seed a cached accessory onto a real platform through its configureAccessory path, as Homebridge does when it restores accessories before DID_FINISH_LAUNCHING.
- * The construction-boundary cast to the PlatformAccessory parameter type is confined here so a configure test's body stays cast-free.
+ * Seed a cached accessory onto a real platform the way Homebridge restores one before DID_FINISH_LAUNCHING: the accessory is made through the platform's API
+ * double and restored through it, which stamps Homebridge's FirmwareRevision placeholder, hands the accessory to the platform's configureAccessory, and bridges
+ * it, so a later unregister of it is one HAP's bridge accepts. The cast that reads the platform's API as that double is confined here so a configure test's body
+ * stays cast-free.
  *
  * The optional setup runs on the fresh accessory BEFORE the platform sees it, which is where Homebridge's cache restore puts the services and the context a
  * previous session left behind. That ordering is what lets a restore row reach the handlers the platform binds on the primary characteristic at restore.
  *
- * @param platform    - The real HydrawisePlatform to seed.
+ * @param platform    - The real HydrawisePlatform to seed, built by buildPlatform.
  * @param displayName - The cached accessory's display name.
- * @param uuid        - The cached accessory's UUID (the platform matches this against the generated controller UUID to reuse it).
- * @param setup       - Optionally, what the cache carried: the services, and a zone accessory's context, added before the platform is handed the accessory.
+ * @param uuid        - The cached accessory's UUID, generated by the caller from the identity it stands for, as the platform generates the controller UUID it
+ *                      matches this against to reuse it.
+ * @param setup       - Optionally, what the cache carried: the services, built from the runtime's Service namespace, and the accessory's context, added before
+ *                      the platform is handed the accessory.
  *
- * @returns The seeded TestAccessory, so a test can read its services after discovery reuses it.
+ * @returns The seeded accessory, so a test can read its services after discovery reuses it.
  */
-export function seedAccessory(platform: HydrawisePlatform, displayName: string, uuid: string, setup?: (accessory: TestAccessory) => void): TestAccessory {
+export function seedAccessory(platform: HydrawisePlatform, displayName: string, uuid: string,
+  setup?: (accessory: TestPlatformAccessory) => void): TestPlatformAccessory {
 
-  const accessory = new TestPlatformAccessory(displayName, uuid);
+  // Every platform buildPlatform builds runs over a TestHomebridgeApi, which is what this cast states.
+  const api = platform.api as unknown as TestHomebridgeApi;
+  const accessory = new api.platformAccessory(displayName, uuid);
 
   setup?.(accessory);
 
-  platform.configureAccessory(accessory as unknown as Parameters<HydrawisePlatform["configureAccessory"]>[0]);
+  api.restorePlatformAccessories({ accessories: [accessory], platform, platformName: PLATFORM_NAME, pluginIdentifier: PLUGIN_NAME });
 
   return accessory;
 }
@@ -732,23 +680,80 @@ export interface BuildPlatformOptions {
   options?: string[];
 }
 
-// The handles buildPlatform returns: the constructed production platform plus the API double's capture buffers and the log capture.
-export interface BuildPlatformResult extends TestApiResult {
+// The handles buildPlatform returns: the constructed production platform, the API double with the knobs and views a test drives and reads it through, and the
+// log capture. Each view is a function that reads the double's record when called, so it stays current however the result is destructured or copied.
+export interface BuildPlatformResult {
+
+  api: TestHomebridgeApi;
+
+  // Emit a Homebridge lifecycle event on the API double, which is how a test fires DID_FINISH_LAUNCHING (to run the private configureHydrawise) and SHUTDOWN (to
+  // drive teardown) explicitly.
+  emit: (event: string) => void;
 
   // Every line the platform logged, read live, on the same terms as the controller harness reads its own.
   entries: readonly TestLogEntry[];
+
+  // The UUIDs whose registration should throw, so a test can drive production's promotion-failure containment. Empty by default, which leaves every registration
+  // reaching the API double.
+  failRegistrationUuids: Set<string>;
+
+  // The UUIDs whose cache flush should throw, so a test can drive the arm where an accessory registers and then fails to persist - the one path that reaches
+  // production's promotion undo. Empty by default, which leaves every flush reaching the API double.
+  failUpdateUuids: Set<string>;
   platform: HydrawisePlatform;
+
+  // Every accessory a registration the API double accepted carried, in call order.
+  registered: () => PlatformAccessory[];
+
+  // Every accessory an unregistration the API double accepted carried, in call order.
+  unregistered: () => PlatformAccessory[];
+
+  // The accessories each cache flush the API double accepted carried, one list per flush.
+  updated: () => (readonly PlatformAccessory[])[];
 }
 
-/* Construct a REAL HydrawisePlatform against the API double - the platform-test workhorse. The construction-boundary casts (log, api) bridge the doubles to
- * the production constructor's parameter types: Homebridge's Logging is a callable with prefix / success / log members, so the plain-object capturing log
- * bridges by cast rather than being reshaped into a callable. The platform's constructor runs its full networking and MQTT setup; a test installs a
- * MockAgent afterward to drive retrieve().
+/* The one check-before-delegate gate the fail sets answer to: any accessory a set names throws before the API double is called at all, so a rejected call leaves
+ * the double's record exactly as a call Homebridge refused would. Registration and the cache flush share this check rather than each carrying its own loop, so
+ * they can never drift apart in what "rejected" means.
+ */
+function rejectNamed(failUuids: ReadonlySet<string>, accessories: readonly PlatformAccessory[], action: string): void {
+
+  for(const accessory of accessories) {
+
+    if(failUuids.has(accessory.UUID)) {
+
+      throw new Error(action + " rejected for " + accessory.UUID + ".");
+    }
+  }
+}
+
+/* Construct a REAL HydrawisePlatform against HBPU's Homebridge API double - the platform-test workhorse. The construction-boundary casts (log, config, api)
+ * bridge the doubles and the config literal to the production constructor's parameter types: Homebridge's Logging is a callable with prefix / success / log
+ * members, so the plain-object capturing log bridges by cast rather than being reshaped into a callable, and the API double answers only the part of Homebridge's
+ * API a plugin reaches. The platform's constructor runs its full networking and MQTT setup; a test installs a MockAgent afterward to drive retrieve().
  */
 export function buildPlatform(options: BuildPlatformOptions = {}): BuildPlatformResult {
 
   const log = capturingLog();
-  const apiResult = makeTestApi();
+  const api = new TestHomebridgeApi(runtime);
+  const failRegistrationUuids = new Set<string>();
+  const failUpdateUuids = new Set<string>();
+  const register = api.registerPlatformAccessories.bind(api);
+  const update = api.updatePlatformAccessories.bind(api);
+
+  // The fail sets wrap the API double's own methods on this instance, consulting the sets before delegating, because the workhorse holds no test context to mock
+  // through.
+  api.registerPlatformAccessories = (pluginIdentifier, platformName, accessories): void => {
+
+    rejectNamed(failRegistrationUuids, accessories, "Registration");
+    register(pluginIdentifier, platformName, accessories);
+  };
+
+  api.updatePlatformAccessories = (accessories): void => {
+
+    rejectNamed(failUpdateUuids, accessories, "Cache flush");
+    update(accessories);
+  };
 
   // The topic and the debug flag pass through exactly as the caller supplied them, with no default of their own, because a synthesized legacy value would
   // satisfy the platform's resolver on every build and put the catalog-default arm out of reach of any test. A setting left unnamed still resolves to the same
@@ -762,11 +767,12 @@ export function buildPlatform(options: BuildPlatformOptions = {}): BuildPlatform
     options: options.options ?? []
   };
 
-  // The construction-boundary casts (log, api) bridge the doubles to the production constructor's parameter types.
+  // The construction-boundary casts (log, config, api) bridge the doubles and the config literal to the production constructor's parameter types.
   const platform = new HydrawisePlatform(log as unknown as ConstructorParameters<typeof HydrawisePlatform>[0],
-    config as unknown as ConstructorParameters<typeof HydrawisePlatform>[1], apiResult.api as ConstructorParameters<typeof HydrawisePlatform>[2]);
+    config as unknown as ConstructorParameters<typeof HydrawisePlatform>[1], api as unknown as API);
 
-  return { entries: log.entries, platform, ...apiResult };
+  return { api, emit: (event: string): void => void api.emit(event), entries: log.entries, failRegistrationUuids, failUpdateUuids, platform,
+    registered: () => callsOf(api, "register").flat(), unregistered: () => callsOf(api, "unregister").flat(), updated: () => callsOf(api, "update") };
 }
 
 // The Hydrawise API origin every retrieve() request targets. The MockAgent intercepts against this origin, derived from the same base URL production assembles its

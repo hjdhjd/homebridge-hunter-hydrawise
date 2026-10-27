@@ -13,12 +13,11 @@
  */
 // The Hydrawise API wire shapes use snake_case keys such as controller_id, so camelcase is disabled here to let the controller fixture mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { Characteristic, Service } from "./testing/hap.helpers.ts";
-import type { CharacteristicType, TestAccessory } from "./testing/hap.helpers.ts";
+import { Characteristic, Service, buildPlatform, installMockDispatcher, installV2Client, makeTestV2Client, makeV2Facts, programJsonReply, refreshV2FactsOnce,
+  v2BudgetOf, waitFor } from "./testing/platform.helpers.ts";
 import { HOMEBRIDGE_UNKNOWN_FIRMWARE, HYDRAWISE_V2_BUDGET_CALLS } from "./settings.ts";
+import type { Characteristic as HapCharacteristic, PlatformAccessory, WithUUID } from "homebridge";
 import type { HydrawiseAccessoryContext, HydrawiseControllerHardware } from "./types.ts";
-import { buildPlatform, installMockDispatcher, installV2Client, makeTestV2Client, makeV2Facts, programJsonReply, refreshV2FactsOnce, v2BudgetOf,
-  waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeCustomerDetails, normalSchedule } from "./api.helpers.ts";
 import { logCount, loggedAt, waitUntil } from "homebridge-plugin-utils/testing";
@@ -56,20 +55,20 @@ function loggedAnywhere(entries: readonly TestLogEntry[], text: string): boolean
 
 // One accessory's information characteristic, which is what HomeKit shows the user for it. Every assertion below reads through here, so no test body has to
 // re-derive where a model or a firmware version lives.
-function informationValue(accessory: TestAccessory, characteristic: CharacteristicType): unknown {
+function informationValue(accessory: PlatformAccessory, characteristic: WithUUID<new () => HapCharacteristic>): unknown {
 
   return accessory.getService(Service.AccessoryInformation)?.getCharacteristic(characteristic).value;
 }
 
 // The name carried by a single-controller identity a persisted context can hold - a controller accessory's own, or a zone accessory's owner stamp - read
 // through the same confined cast every context reader in this suite's siblings uses.
-function identityName(accessory: TestAccessory | undefined, field: "controller" | "ownerController"): string | undefined {
+function identityName(accessory: PlatformAccessory | undefined, field: "controller" | "ownerController"): string | undefined {
 
   return (accessory?.context as HydrawiseAccessoryContext | undefined)?.[field]?.name;
 }
 
 // The names in the denormalized account roster a controller accessory carries, in the account's own order.
-function rosterNames(accessory: TestAccessory | undefined): string[] {
+function rosterNames(accessory: PlatformAccessory | undefined): string[] {
 
   return ((accessory?.context as HydrawiseAccessoryContext | undefined)?.controllers ?? []).map(entry => entry.name);
 }
@@ -137,10 +136,10 @@ describe("HydrawisePlatform hardware distribution", () => {
     emit(DID_FINISH_LAUNCHING);
 
     // The refresh loop's first tick runs on its own schedule, so each wait is on the characteristic actually landing rather than on discovery returning.
-    const first = await waitFor(() => registered.find(accessory => accessory.UUID === syntheticController.controller_id.toString()),
-      { description: "the first controller's accessory to register" });
-    const second = await waitFor(() => registered.find(accessory => accessory.UUID === SECOND_CONTROLLER.controller_id.toString()),
-      { description: "the second controller's accessory to register" });
+    const firstUuid = platform.hap.uuid.generate(syntheticController.controller_id.toString());
+    const secondUuid = platform.hap.uuid.generate(SECOND_CONTROLLER.controller_id.toString());
+    const first = await waitFor(() => registered().find(accessory => accessory.UUID === firstUuid), { description: "the first controller's accessory to register" });
+    const second = await waitFor(() => registered().find(accessory => accessory.UUID === secondUuid), { description: "the second controller's accessory to register" });
 
     await waitUntil(() => informationValue(first, Characteristic.Model) === FIRST_HARDWARE.model, { description: "the first controller's model to apply" });
     await waitUntil(() => informationValue(second, Characteristic.Model) === SECOND_HARDWARE.model, { description: "the second controller's model to apply" });
@@ -150,8 +149,8 @@ describe("HydrawisePlatform hardware distribution", () => {
 
     // The durable half of the same claim: the characteristics ARE the store, so each accessory was flushed once with its own values and the next restart reads
     // them straight back.
-    assert.ok(updated.some(batch => batch.includes(first)), "the first controller's accessory was flushed to the disk cache");
-    assert.ok(updated.some(batch => batch.includes(second)), "the second controller's accessory was flushed to the disk cache");
+    assert.ok(updated().some(batch => batch.includes(first)), "the first controller's accessory was flushed to the disk cache");
+    assert.ok(updated().some(batch => batch.includes(second)), "the second controller's accessory was flushed to the disk cache");
   });
 
   test("the account's controller name reaches every persisted identity at once", async (t) => {
@@ -173,10 +172,11 @@ describe("HydrawisePlatform hardware distribution", () => {
 
     emit(DID_FINISH_LAUNCHING);
 
-    const zoneUuid = zoneAccessoryId(syntheticController.controller_id, STANDALONE_RELAY_ID);
-    const controllerAccessory = await waitFor(() => registered.find(accessory => accessory.UUID === syntheticController.controller_id.toString()),
+    const controllerUuid = platform.hap.uuid.generate(syntheticController.controller_id.toString());
+    const zoneUuid = platform.hap.uuid.generate(zoneAccessoryId(syntheticController.controller_id, STANDALONE_RELAY_ID));
+    const controllerAccessory = await waitFor(() => registered().find(accessory => accessory.UUID === controllerUuid),
       { description: "the first controller's accessory to register" });
-    const zoneAccessory = await waitFor(() => registered.find(accessory => accessory.UUID === zoneUuid), { description: "the zone accessory to register" });
+    const zoneAccessory = await waitFor(() => registered().find(accessory => accessory.UUID === zoneUuid), { description: "the zone accessory to register" });
 
     // Each surface is waited on where it is written, so a slower cadence cannot make a faster one's assertion read a value that had not landed yet.
     await waitUntil(() => identityName(controllerAccessory, "controller") === ACCOUNT_CONTROLLER_NAME,
@@ -204,7 +204,7 @@ describe("HydrawisePlatform hardware distribution", () => {
 
     emit(DID_FINISH_LAUNCHING);
 
-    const accessory = await waitFor(() => registered[0], { description: "the first accessory registration" });
+    const accessory = await waitFor(() => registered()[0], { description: "the first accessory registration" });
 
     await waitUntil(() => fetches() >= 1, { description: "the first account fetch" });
 
@@ -212,7 +212,10 @@ describe("HydrawisePlatform hardware distribution", () => {
      * credential gate falls back to, and it persists nothing it did not learn.
      */
     assert.equal(informationValue(accessory, Characteristic.Model), "Hydrawise", "a failed fetch leaves the product-line placeholder in place");
-    assert.equal(informationValue(accessory, Characteristic.FirmwareRevision), Characteristic.FirmwareRevision.DEFAULT_VALUE,
+    // A freshly made accessory carries the firmware HAP constructs every information service with, which is what "never written" reads as.
+    const fresh = new platform.api.platformAccessory("Unconfigured Controller", platform.hap.uuid.generate("unconfigured-controller"));
+
+    assert.equal(informationValue(accessory, Characteristic.FirmwareRevision), informationValue(fresh, Characteristic.FirmwareRevision),
       "a failed fetch leaves the firmware exactly as HAP constructed it, because the credentialed path never writes it");
   });
 
@@ -261,7 +264,7 @@ describe("HydrawisePlatform hardware distribution", () => {
 
     emit(DID_FINISH_LAUNCHING);
 
-    const accessory = await waitFor(() => registered[0], { description: "the first accessory registration" });
+    const accessory = await waitFor(() => registered()[0], { description: "the first accessory registration" });
 
     await waitUntil(() => fetches() >= 1, { description: "the first account fetch" });
     assert.equal(informationValue(accessory, Characteristic.Model), "Hydrawise", "the failed first tick enriched nothing and left the placeholder standing");
@@ -315,7 +318,7 @@ describe("HydrawisePlatform hardware distribution", () => {
 
     emit(DID_FINISH_LAUNCHING);
 
-    const accessory = await waitFor(() => registered[0], { description: "the first accessory registration" });
+    const accessory = await waitFor(() => registered()[0], { description: "the first accessory registration" });
 
     /* The parity case stated as an assertion: an install with no credentials shows exactly what it always has. The MockAgent has net connect disabled and
      * intercepts only the two key-based endpoints, so a request escaping the credential gate would fail this test loudly rather than reaching the network.
@@ -407,7 +410,7 @@ describe("HydrawisePlatform connection reporting", () => {
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => registered[0] !== undefined, { description: "the first accessory registration" });
+    await waitUntil(() => registered()[0] !== undefined, { description: "the first accessory registration" });
 
     assert.ok(loggedAt(entries, "info", "Successfully connected to the Hydrawise API using your API key."), "the key-based line still reports");
     assert.ok(!loggedAnywhere(entries, "account API"), "and nothing claims an account connection that was never made");

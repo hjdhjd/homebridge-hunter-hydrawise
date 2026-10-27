@@ -7,12 +7,11 @@
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { Characteristic, Service } from "./testing/hap.helpers.ts";
+import { Characteristic, Service, buildController } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone, normalSchedule } from "./api.helpers.ts";
 import { HYDRAWISE_UNSCHEDULED_SENTINEL } from "./types.ts";
 import assert from "node:assert/strict";
-import { buildController } from "./testing/platform.helpers.ts";
 import { rainSensors } from "./api.fixtures.ts";
 import { waitUntil } from "homebridge-plugin-utils/testing";
 
@@ -28,7 +27,7 @@ describe("HydrawiseController updateState (single poll)", () => {
     // The last zone's valve appears only after the per-zone loop has processed every zone, so waiting on it confirms the whole first pass ran.
     await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700019") !== undefined, { description: "the valve for zone 700019 to appear" });
 
-    const valves = h.accessory.services.filter(service => service.UUID === "Valve");
+    const valves = h.accessory.services.filter(service => service.UUID === Service.Valve.UUID);
 
     assert.equal(valves.length, 19, "a valve should be created for each of the 19 enabled zones");
 
@@ -38,6 +37,10 @@ describe("HydrawiseController updateState (single poll)", () => {
     assert.equal(firstValve.getCharacteristic(Characteristic.ServiceLabelIndex).value, 1, "the valve label index should match the zone relay number");
     assert.equal(firstValve.getCharacteristic(Characteristic.IsConfigured).value, Characteristic.IsConfigured.CONFIGURED, "a new valve should be configured");
     assert.equal(firstValve.getCharacteristic(Characteristic.ValveType).value, Characteristic.ValveType.IRRIGATION, "a valve should be typed as irrigation");
+
+    // HAP builds the label index at its minimum of 1, so only the change record tells the creation's own write from HAP's default.
+    assert.deepEqual(h.accessory.changesOn(firstValve, Characteristic.ServiceLabelIndex).map(change => change.newValue), [1],
+      "the valve's creation writes its label index itself");
   });
 
   test("maps a running zone to Active and InUse with its remaining duration", async (t) => {
@@ -72,6 +75,10 @@ describe("HydrawiseController updateState (single poll)", () => {
     assert.ok(boundary, "the boundary zone's valve should exist");
     assert.equal(boundary.getCharacteristic(Characteristic.Active).value, Characteristic.Active.ACTIVE, "a zone at the 3600s boundary should be active");
     assert.equal(boundary.getCharacteristic(Characteristic.InUse).value, Characteristic.InUse.NOT_IN_USE, "a queued-but-not-running zone should not be in use");
+
+    // HAP builds InUse at not in use, so only the change record tells the poll's own write from HAP's default.
+    assert.ok(h.accessory.changesOn(boundary, Characteristic.InUse).some(change => change.newValue === Characteristic.InUse.NOT_IN_USE),
+      "the poll writes the queued zone's not-in-use itself");
   });
 
   test("marks a zone one second past the active window inactive", async (t) => {
@@ -88,6 +95,10 @@ describe("HydrawiseController updateState (single poll)", () => {
 
     assert.ok(justOver, "the just-past-window zone's valve should exist");
     assert.equal(justOver.getCharacteristic(Characteristic.Active).value, Characteristic.Active.INACTIVE, "a zone past the active window should be inactive");
+
+    // HAP builds Active at inactive, so only the change record tells the poll's own write from HAP's default.
+    assert.ok(h.accessory.changesOn(justOver, Characteristic.Active).some(change => change.newValue === Characteristic.Active.INACTIVE),
+      "the poll writes the zone's inactive itself");
   });
 
   test("aggregates the system into in-use with the scheduled program mode", async (t) => {

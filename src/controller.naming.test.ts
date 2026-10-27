@@ -8,20 +8,18 @@
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { Characteristic, Service } from "./testing/hap.helpers.ts";
+import { Characteristic, Service, buildController, makeV2Facts, makeZoneV2Facts, waitFor } from "./testing/platform.helpers.ts";
 import { FeatureOptions, getServiceName } from "homebridge-plugin-utils";
 import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
+import type { Service as HapService, PlatformAccessory } from "homebridge";
 import type { HydrawiseAccessoryContext, HydrawiseControllerIdentity, HydrawiseControllerV2Facts, HydrawiseZoneConfig, HydrawiseZoneIdentity,
   StatusScheduleResponse } from "./types.ts";
 import type { HydrawiseControllerOption, HydrawiseControllerValueOption, HydrawiseZoneOption, HydrawiseZoneValueOption } from "./options.ts";
 import { HydrawiseReservedNames, scheduleStatus } from "./types.ts";
-import type { TestAccessory, TestService } from "./testing/hap.helpers.ts";
-import { buildController, makeV2Facts, makeZoneV2Facts, waitFor } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
 import { featureOptionCategories, featureOptions } from "./options.ts";
 import type { BuildControllerResult } from "./testing/platform.helpers.ts";
-import type { Service as HapService } from "homebridge";
 import assert from "node:assert/strict";
 import { bareSensors } from "./api.fixtures.ts";
 import { waitUntil } from "homebridge-plugin-utils/testing";
@@ -115,37 +113,31 @@ function zone(name: string): HydrawiseZoneConfig {
 
 // Seed a cached valve already bearing a name, the shape Homebridge restores when an accessory returns from its cache carrying a rename the user made in the Home
 // app. The name lands on ConfiguredName, which is the characteristic a Home-app rename writes and the one the name helpers read first.
-function seedNamedValve(name: string): (accessory: TestAccessory) => void {
+function seedNamedValve(name: string): (accessory: PlatformAccessory) => void {
 
-  return (accessory: TestAccessory): void => {
+  return (accessory: PlatformAccessory): void => {
 
     accessory.addService(new Service.Valve(name, ZONE_SUBTYPE)).updateCharacteristic(Characteristic.ConfiguredName, name);
   };
 }
 
-// The double-to-HAP cast the real name helper requires, confined here so the test bodies stay cast-free.
-function asHapService(service: object): HapService {
-
-  return service as unknown as HapService;
-}
-
 // Wait for the zone's valve to exist, then hand it back.
-async function valveOf(h: BuildControllerResult): Promise<TestService> {
+async function valveOf(h: BuildControllerResult): Promise<HapService> {
 
   return waitFor(() => h.accessory.getServiceById(Service.Valve, ZONE_SUBTYPE), { description: "the zone valve to appear" });
 }
 
 // The name the valve presents to HomeKit, read through the same helper production reads it through.
-function nameOf(valve: TestService): string | undefined {
+function nameOf(valve: HapService): string | undefined {
 
-  return getServiceName(asHapService(valve));
+  return getServiceName(valve);
 }
 
-// The values written to either name characteristic. A valve takes routine writes on every poll - Active and its neighbors - so a claim about naming filters those
-// out rather than reading the whole write log.
-function nameWrites(valve: TestService): unknown[] {
+// The values written to the name characteristics of one service, read from the accessory's change record. A valve takes routine writes on every poll - Active
+// and its neighbors - so a claim about naming filters those out rather than reading every change the service raised.
+function nameChanges(h: BuildControllerResult, service: HapService): unknown[] {
 
-  return valve.writesFor(Characteristic.ConfiguredName, Characteristic.Name).map(write => write.value);
+  return h.accessory.changesOn(service, Characteristic.ConfiguredName, Characteristic.Name).map(change => change.newValue);
 }
 
 // One refresh tick's facts for the CONTROLLER itself, carrying its account name and nothing else to say.
@@ -155,7 +147,7 @@ function controllerV2Facts(name: string): HydrawiseControllerV2Facts {
 }
 
 // The irrigation system service: this controller's primary HomeKit label, and the service every other controller rename is gated on.
-function irrigationOf(h: BuildControllerResult): TestService {
+function irrigationOf(h: BuildControllerResult): HapService {
 
   const service = h.accessory.getService(Service.IrrigationSystem);
 
@@ -165,7 +157,7 @@ function irrigationOf(h: BuildControllerResult): TestService {
 }
 
 // The accessory information service, whose name is the half of the accessory's display pair that lives on a service.
-function informationOf(h: BuildControllerResult): TestService {
+function informationOf(h: BuildControllerResult): HapService {
 
   const service = h.accessory.getService(Service.AccessoryInformation);
 
@@ -174,18 +166,8 @@ function informationOf(h: BuildControllerResult): TestService {
   return service;
 }
 
-// The service label service, acquired beside the irrigation system and carrying the same name, which is what the rename step brings along with it.
-function labelOf(h: BuildControllerResult): TestService {
-
-  const service = h.accessory.getService(Service.ServiceLabel);
-
-  assert.ok(service, "the controller accessory carries a service label service");
-
-  return service;
-}
-
 // The suspend-all switch, whose name is composed from the controller's own and therefore tracks it.
-function suspendSwitchOf(h: BuildControllerResult): TestService {
+function suspendSwitchOf(h: BuildControllerResult): HapService {
 
   const service = h.accessory.getServiceById(Service.Switch, HydrawiseReservedNames.SWITCH_SUSPEND_ALL);
 
@@ -248,9 +230,13 @@ describe("zone naming at creation", () => {
     await pollPast(h);
     h.abort();
 
-    // Creation applies the effective name once, through each name characteristic the kind supports. Nothing in the pass that created the valve, and nothing in the
-    // passes after it, applies it again.
-    assert.deepEqual(nameWrites(valve), [ OVERRIDE_NAME, OVERRIDE_NAME ], "the creating pass writes the name once per name characteristic and never again");
+    /* Creation applies the effective name through each name characteristic the kind supports before the valve joins the accessory, which is where the accessory's
+     * change record for the valve begins. The names the valve carries are what that creation wrote, and the record holds every name write after it: nothing in the
+     * pass that created the valve, and nothing in the passes after it, applies the name again.
+     */
+    assert.equal(valve.getCharacteristic(Characteristic.ConfiguredName).value, OVERRIDE_NAME, "the creating pass writes the override to the configured name");
+    assert.equal(valve.getCharacteristic(Characteristic.Name).value, OVERRIDE_NAME, "and to the name");
+    assert.deepEqual(nameChanges(h, valve), [], "and nothing after it writes the name again");
     assert.equal(nameOf(valve), OVERRIDE_NAME, "the valve carries the override");
   });
 });
@@ -313,13 +299,14 @@ describe("zone name synchronization at its default", () => {
 
     const valve = await valveOf(h);
 
-    valve.clearWrites();
+    h.accessory.clearObservations();
 
     await pollPast(h);
     h.abort();
 
-    assert.deepEqual(nameWrites(valve), [], "a poll finding the name already correct performs no name write");
-    assert.ok(valve.writes.length > 0, "the same poll still performs its routine writes, so the empty name-filtered view is a real skip");
+    // The plugin's own compare stands between this poll and a write, and so does HBPU's compare-first name helper, so the claim is that no name write reaches HAP.
+    assert.deepEqual(nameChanges(h, valve), [], "a poll finding the name already correct performs no name write");
+    assert.ok(h.accessory.changesOn(valve).length > 0, "the same poll still performs its routine writes on the valve, so the empty name-filtered view is a real skip");
   });
 
   test("does not rewrite an override whose HomeKit name differs from the configured value", async (t) => {
@@ -333,12 +320,14 @@ describe("zone name synchronization at its default", () => {
 
     const valve = await valveOf(h);
 
-    valve.clearWrites();
+    h.accessory.clearObservations();
 
     await pollPast(h);
     h.abort();
 
-    assert.deepEqual(nameWrites(valve), [], "a sanitized name that already matches is not rewritten on every poll");
+    // The plugin's sanitizing compare stands between this poll and a write, and so does HBPU's compare-first name helper, so the claim is that no name write
+    // reaches HAP.
+    assert.deepEqual(nameChanges(h, valve), [], "a sanitized name that already matches is not rewritten on every poll");
     assert.equal(nameOf(valve), FREE_FORM_SANITIZED, "the valve still carries the sanitized override");
   });
 });
@@ -358,12 +347,12 @@ describe("zone name synchronization opted out", () => {
 
       const valve = await valveOf(h);
 
-      valve.clearWrites();
+      h.accessory.clearObservations();
 
       await pollPast(h);
       h.abort();
 
-      assert.deepEqual(nameWrites(valve), [], "no poll re-asserts a name while synchronization is disabled");
+      assert.deepEqual(nameChanges(h, valve), [], "no poll re-asserts a name while synchronization is disabled");
       assert.equal(nameOf(valve), HOME_APP_NAME, "the rename made in the Home app stands");
     });
   }
@@ -379,12 +368,12 @@ describe("zone name synchronization opted out", () => {
 
     assert.equal(nameOf(valve), OVERRIDE_NAME, "creation carries the override even with synchronization disabled");
 
-    valve.clearWrites();
+    h.accessory.clearObservations();
 
     await pollPast(h);
     h.abort();
 
-    assert.deepEqual(nameWrites(valve), [], "nothing re-asserts the name after creation");
+    assert.deepEqual(nameChanges(h, valve), [], "nothing re-asserts the name after creation");
   });
 });
 
@@ -629,8 +618,7 @@ describe("the name carry across a restart", () => {
 
     const valve = await valveOf(h);
 
-    valve.clearWrites();
-    irrigationOf(h).clearWrites();
+    h.accessory.clearObservations();
 
     await pollPast(h);
     h.abort();
@@ -642,9 +630,9 @@ describe("the name carry across a restart", () => {
     /* The cardinality half, which is the half the user actually sees. Composing the same names the roster already holds means the first poll finds nothing
      * moved, so it renames nothing and writes nothing - where a fall-through would have paid one write to truncate every label and another to heal them.
      */
-    assert.deepEqual(nameWrites(valve), [], "no rename touches the valve");
-    assert.deepEqual(nameWrites(irrigationOf(h)), [], "nor the controller's own service");
-    assert.equal(h.flushes.length, 0, "and the restart costs no cache write at all");
+    assert.deepEqual(nameChanges(h, valve), [], "no rename touches the valve");
+    assert.deepEqual(nameChanges(h, irrigationOf(h)), [], "nor the controller's own service");
+    assert.equal(h.flushes().length, 0, "and the restart costs no cache write at all");
   });
 
   test("the controller's prior identity survives the context wipe and is what its carry reads", async (t) => {
@@ -872,13 +860,22 @@ describe("controller naming", () => {
 
     const bareIrrigation = irrigationOf(bare);
 
-    bareIrrigation.clearWrites();
+    bare.accessory.clearObservations();
+
+    // The first poll seeds the roster and the schedule projection through the one flush the chokepoint performs, so a flush past it can only be a rename.
+    await waitUntil(() => bare.flushes().length >= 1, { description: "the first accessory flush" });
+
+    const bareFlushesAfterFirstPoll = bare.flushes().length;
 
     await pollPast(bare);
     bare.abort();
 
-    // The promise to an install carrying only an API key: nothing about this pass touches a name it has always had.
-    assert.deepEqual(nameWrites(bareIrrigation), [], "an install with no credentials performs no controller rename at all");
+    /* The promise to an install carrying only an API key: nothing about this pass touches a name it has always had. HBPU's compare-first name helper would hold
+     * back an unchanged name write on its own, so the flush count is what tests the plugin's own compare: a rename joins the poll's cache write.
+     */
+    assert.deepEqual(nameChanges(bare, bareIrrigation), [], "an install with no credentials performs no controller rename at all");
+    assert.equal(bareFlushesAfterFirstPoll, 1, "the first poll costs exactly one cache write");
+    assert.equal(bare.flushes().length, bareFlushesAfterFirstPoll, "and the polls after it rename nothing, so they write the cache no second time");
     assert.equal(nameOf(bareIrrigation), CONTROLLER_WIRE_NAME, "and keeps the name the wire reports");
 
     const h = buildController({ hasV2Client: true,
@@ -918,20 +915,19 @@ describe("controller naming", () => {
     const suspendSwitch = suspendSwitchOf(h);
 
     // The first poll seeds the roster and the schedule projection through the one flush the chokepoint performs; what this asserts is the poll after it.
-    await waitUntil(() => h.flushes.length >= 1, { description: "the first accessory flush" });
+    await waitUntil(() => h.flushes().length >= 1, { description: "the first accessory flush" });
 
-    const flushesAfterFirstPoll = h.flushes.length;
+    const flushesAfterFirstPoll = h.flushes().length;
 
-    irrigation.clearWrites();
-    suspendSwitch.clearWrites();
+    h.accessory.clearObservations();
 
     await pollPast(h);
     h.abort();
 
     assert.equal(flushesAfterFirstPoll, 1, "the first poll costs exactly one cache write");
-    assert.equal(h.flushes.length, 1, "and a poll that moved no name writes the cache no second time");
-    assert.deepEqual(nameWrites(irrigation), [], "the sanitized compare finds the controller's name already correct and rewrites nothing");
-    assert.deepEqual(nameWrites(suspendSwitch), [], "and the switch composed from it is left alone too");
+    assert.equal(h.flushes().length, 1, "and a poll that moved no name writes the cache no second time");
+    assert.deepEqual(nameChanges(h, irrigation), [], "the sanitized compare finds the controller's name already correct and rewrites nothing");
+    assert.deepEqual(nameChanges(h, suspendSwitch), [], "and the switch composed from it is left alone too");
   });
 
   test("a rename joins the poll's single cache write, and costs none when nothing moved", async (t) => {
@@ -950,11 +946,11 @@ describe("controller naming", () => {
 
     const irrigation = irrigationOf(h);
 
-    await waitUntil(() => h.flushes.length >= 1, { description: "the first accessory flush" });
+    await waitUntil(() => h.flushes().length >= 1, { description: "the first accessory flush" });
     await pollPast(h);
 
     // The steady state: the seeding poll has paid its one write and the polls after it pay nothing.
-    const settled = h.flushes.length;
+    const settled = h.flushes().length;
 
     h.platform.featureOptions.configuredOptions = ["Enable.Device.Name." + CONTROLLER_SERIAL + "=" + CONTROLLER_OVERRIDE_NAME];
 
@@ -963,7 +959,7 @@ describe("controller naming", () => {
     h.abort();
 
     assert.equal(h.accessory.displayName, CONTROLLER_OVERRIDE_NAME, "the rename reaches the accessory's own display name");
-    assert.equal(h.flushes.length, settled + 1, "and costs exactly one cache write, which the polls after it do not repeat");
+    assert.equal(h.flushes().length, settled + 1, "and costs exactly one cache write, which the polls after it do not repeat");
   });
 
   test("does not rewrite a controller name whose HomeKit form differs from the configured value", async (t) => {
@@ -980,12 +976,22 @@ describe("controller naming", () => {
 
     await waitUntil(() => nameOf(irrigation) === CONTROLLER_FREE_FORM_SANITIZED, { description: "the irrigation system to take the sanitized free-form name" });
 
-    irrigation.clearWrites();
+    // The first poll seeds the roster and the schedule projection through the one flush the chokepoint performs, so a flush past it can only be a rename.
+    await waitUntil(() => h.flushes().length >= 1, { description: "the first accessory flush" });
+
+    const flushesAfterFirstPoll = h.flushes().length;
+
+    h.accessory.clearObservations();
 
     await pollPast(h);
     h.abort();
 
-    assert.deepEqual(nameWrites(irrigation), [], "a sanitized name that already matches is not rewritten on every poll");
+    /* HBPU's compare-first name helper would hold back an unchanged name write on its own, so the flush count is what tests the plugin's own sanitizing compare: a
+     * compare that read the configured value raw would call every poll a rename, and every rename joins the poll's cache write.
+     */
+    assert.deepEqual(nameChanges(h, irrigation), [], "a sanitized name that already matches is not rewritten on every poll");
+    assert.equal(flushesAfterFirstPoll, 1, "the first poll costs exactly one cache write");
+    assert.equal(h.flushes().length, flushesAfterFirstPoll, "and the polls after it rename nothing, so they write the cache no second time");
     assert.equal(nameOf(irrigation), CONTROLLER_FREE_FORM_SANITIZED, "and the controller still carries the sanitized override");
     assert.equal(nameOf(suspendSwitchOf(h)), CONTROLLER_FREE_FORM_SANITIZED + SUSPEND_ALL_SUFFIX, "with the switch composed from the same name");
   });
@@ -1041,9 +1047,10 @@ describe("controller naming", () => {
 
   test("a name that sanitizes to nothing leaves every surface the controller names standing", async (t) => {
 
-    /* HomeKit's naming rules can empty a name outright, and a service has to answer to something. The library's accessory helper declines a blank rename on its
-     * own, but the service helper writes whatever it is handed, so every service this step renames needs the emptiness decided before the write - otherwise an
-     * unusable name blanks the very labels the user navigates by. This asserts all of them against a name every character of which HomeKit's rules discard.
+    /* HomeKit's naming rules can empty a name outright, and a service has to answer to something. HBPU's name helpers decline a blank name on their own, but the
+     * suspend-all switch composes its name from the controller's, and the composed form keeps its suffix after sanitizing - so the emptiness has to be decided on
+     * the controller's half before any surface is renamed, or the switch would be renamed to a label naming no controller. This asserts every surface against a
+     * name every character of which HomeKit's rules discard.
      */
     const h = buildController({ hasV2Client: true,
       program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }), signalAborted: false,
@@ -1056,23 +1063,19 @@ describe("controller naming", () => {
 
     await waitUntil(() => h.accessory.displayName === CONTROLLER_ACCOUNT_NAME, { description: "the accessory to take the account name" });
 
-    /* Clear the name-write log on every surface before the unusable name arrives. The claim is that the step writes NOTHING, which is stronger than any value
-     * comparison and is the only claim available for the service label, whose name characteristic the HAP double does not model.
+    /* Clear the accessory's change record before the unusable name arrives, so it holds only what the step does with it. The claim is that the step writes
+     * NOTHING, which is stronger than any value comparison. The switch line is the one the plugin's own blank-name gate answers for: HBPU refuses the blank name
+     * on the irrigation system and its label by itself, while the composed switch name survives sanitizing and would be written without the gate.
      */
-    const label = labelOf(h);
-
-    irrigationOf(h).clearWrites();
-    label.clearWrites();
-    suspendSwitchOf(h).clearWrites();
+    h.accessory.clearObservations();
 
     h.controller.applyFacts({ facts: controllerV2Facts(UNUSABLE_NAME), fetchedAt: nowSeconds() });
 
     await pollPast(h);
     h.abort();
 
-    assert.deepEqual(nameWrites(irrigationOf(h)), [], "the irrigation system service takes no name write at all");
-    assert.deepEqual(nameWrites(label), [], "nor does the service label enumerating the zones");
-    assert.deepEqual(nameWrites(suspendSwitchOf(h)), [], "nor the switch composed from the controller's name");
+    assert.deepEqual(nameChanges(h, irrigationOf(h)), [], "the irrigation system service takes no name write at all");
+    assert.deepEqual(nameChanges(h, suspendSwitchOf(h)), [], "nor the switch composed from the controller's name");
     assert.equal(h.accessory.displayName, CONTROLLER_ACCOUNT_NAME, "the accessory keeps the display name it had");
     assert.equal(nameOf(informationOf(h)), CONTROLLER_ACCOUNT_NAME, "and the information service beneath it keeps its own");
     assert.equal(nameOf(irrigationOf(h)), CONTROLLER_ACCOUNT_NAME, "the irrigation system service keeps the label the user navigates by");

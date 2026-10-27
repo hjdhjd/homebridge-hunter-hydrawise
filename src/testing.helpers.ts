@@ -15,8 +15,8 @@
  * adapter port.
  *
  * Add additional thematic submodules as the project grows (e.g., a `network.helpers.ts` for HTTP-fake utilities), keeping the one-concern-per-file discipline.
- * The plugin-specific HAP double lives in src/testing/hap.helpers.ts, and the platform double, the recording MQTT client, and the retrieve recorder live
- * together in src/testing/platform.helpers.ts; each is imported directly rather than through this canonical barrel.
+ * The Homebridge runtime the suites run on, the platform double, the recording MQTT client, and the retrieve recorder live together in
+ * src/testing/platform.helpers.ts, which is imported directly rather than through this canonical barrel.
  */
 export { assertSameShape, declareKeysOf } from "./testing/parity.helpers.ts";
 export { TMPDIR_PREFIX, withTempDir } from "./testing/fs.helpers.ts";

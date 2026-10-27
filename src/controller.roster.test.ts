@@ -85,7 +85,7 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
 
     t.after(() => h.abort());
 
-    await waitUntil(() => h.flushes.length >= 1, { description: "the first accessory flush" });
+    await waitUntil(() => h.flushes().length >= 1, { description: "the first accessory flush" });
 
     const zones = contextOf(h.accessory).zones;
 
@@ -109,7 +109,7 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
     await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 3, { description: "the third status poll" });
     h.abort();
 
-    assert.equal(h.flushes.length, 1, "only the first poll flushes; an unchanged poll does not re-flush");
+    assert.equal(h.flushes().length, 1, "only the first poll flushes; an unchanged poll does not re-flush");
   });
 
   test("the schedule seed and a zone rename each flush exactly once", async (t) => {
@@ -129,7 +129,7 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
     await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 3, { description: "the third status poll" });
     h.abort();
 
-    assert.equal(h.flushes.length, 2, "the matching first poll flushes the schedule seed alone; the rename then flushes exactly once");
+    assert.equal(h.flushes().length, 2, "the matching first poll flushes the schedule seed alone; the rename then flushes exactly once");
     assert.equal(expectAt(contextOf(h.accessory).zones ?? [], 0, "zone").name, "Beta", "the persisted roster adopted the renamed zone");
   });
 
@@ -150,7 +150,7 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
     await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 3, { description: "the third status poll" });
     h.abort();
 
-    assert.equal(h.flushes.length, 2, "the matching first poll flushes the schedule seed alone; the vanished zone then flushes exactly once");
+    assert.equal(h.flushes().length, 2, "the matching first poll flushes the schedule seed alone; the vanished zone then flushes exactly once");
     assert.equal(contextOf(h.accessory).zones?.length, 1, "the persisted roster dropped the vanished zone");
   });
 
@@ -161,7 +161,7 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
 
     t.after(() => h.abort());
 
-    await waitUntil(() => h.flushes.length >= 1, { description: "the first accessory flush" });
+    await waitUntil(() => h.flushes().length >= 1, { description: "the first accessory flush" });
 
     const context = contextOf(h.accessory);
     const referenceController: HydrawiseControllerIdentity = { controllerId: 0, name: "", serialNumber: "" };

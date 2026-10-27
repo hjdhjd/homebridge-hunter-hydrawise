@@ -7,13 +7,12 @@
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { Characteristic, Service } from "./testing/hap.helpers.ts";
+import { Characteristic, Service, buildController, makeV2Facts, makeZoneV2Facts } from "./testing/platform.helpers.ts";
 import { HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL } from "./settings.ts";
 import type { HydrawiseControllerV2Facts, HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
-import { TestClock, advanceThroughSchedule, assertNoUnhandledRejections, expectAt, loggedAt, waitUntil } from "homebridge-plugin-utils/testing";
+import { TestClock, advanceThroughSchedule, assertNoUnhandledRejections, expectAt, loggedAt, triggerSet, waitUntil } from "homebridge-plugin-utils/testing";
 import { allSuspended, fastPolling, makeStatusSchedule, makeZone, rainStopped } from "./api.helpers.ts";
 import { bareSensors, sentinelZoneMatrix } from "./api.fixtures.ts";
-import { buildController, makeV2Facts, makeZoneV2Facts } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import type { BuildControllerResult } from "./testing/platform.helpers.ts";
 import assert from "node:assert/strict";
@@ -78,7 +77,7 @@ describe("HydrawiseController updateState defect assertions", () => {
     const firstValve = h.accessory.getServiceById(Service.Valve, "700001");
 
     assert.ok(firstValve, "the zone valve should exist after the first poll");
-    await firstValve.getCharacteristic(Characteristic.Active).triggerSet(Characteristic.Active.ACTIVE);
+    await triggerSet(firstValve.getCharacteristic(Characteristic.Active), Characteristic.Active.ACTIVE);
 
     // Poll 2 drops the zone (valve pruned; the empty domain recomputes the program mode to no-program-scheduled), and the prune drops the zone's hint entry with
     // it. The default poll brings the zone back still running.
@@ -409,7 +408,7 @@ describe("HydrawiseController suspend switch with account facts", () => {
     assert.ok(service, "the suspend switch should exist");
 
     // The user commands a suspend-all, which stamps the instant every later snapshot is judged against.
-    await service.getCharacteristic(Characteristic.On).triggerSet(true);
+    await triggerSet(service.getCharacteristic(Characteristic.On), true);
 
     // A fetch that was already in flight when that command landed answers with facts that predate it, and so cannot know about it.
     h.controller.applyFacts({ facts: makeV2Facts({ zones: sentinelZoneMatrix.map(zone => [ zone.relay_id, makeZoneV2Facts() ]) }),
