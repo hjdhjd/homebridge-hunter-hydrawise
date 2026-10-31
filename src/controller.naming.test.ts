@@ -1,29 +1,32 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * controller.naming.test.ts: Zone and controller naming, and the synchronization behind both. Asserts the effective name a valve is created with (the user's Name
- * option when set, otherwise the name Hydrawise reports), the synchronization that keeps it current while SyncName holds, the exact-compare that keeps a matching
- * name from being rewritten on every poll, the set Name option that applies whatever SyncName says, the creation-only behavior a SyncName opt-out restores where no
- * Name is set, the same contract applied to the controller's own surfaces - its irrigation system service, its accessory, and its suspend-all switch - the
- * scopes the framework enforces for the Name option at either grain, and the kind's word a name HomeKit cannot carry falls back to, with the warning it draws.
+ * controller.naming.test.ts: Zone and controller naming, and the ownership rule behind both. Asserts the effective name a valve is created with (the user's Name
+ * option when set, otherwise the name Hydrawise reports), the rule that decides who owns a name once its service exists - a set Name whatever SyncName says, else
+ * SyncName, whose default the suite holds off, else the user - the renames that keep an owned name current, the exact-compare that keeps a matching name from
+ * being rewritten on every poll, the creation-only behavior a name the user owns keeps, the watches that put an owned name back the moment the Home app renames
+ * it and the lifetime each pass and each removal gives them, the same contract applied to the controller's own surfaces - its irrigation system service, its
+ * accessory, and its suspend-all switch - the scopes the framework enforces for the Name option at either grain, the kind's word a name HomeKit cannot carry
+ * falls back to, with the warning it draws, and the log prefix, which names the controller as its tile does.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { Characteristic, Service, buildController, makeV2Facts, makeZoneV2Facts, seedEstablished, waitFor } from "./testing/platform.helpers.ts";
-import { FeatureOptions, acquireService, getServiceName, setAccessoryName, setServiceName } from "homebridge-plugin-utils";
+import { Characteristic, Service, buildController, makeV2Facts, makeZoneV2Facts, pollsCompleted, seedEstablished, waitFor } from "./testing/platform.helpers.ts";
+import { FeatureOptions, ServiceEventTypes, acquireService, getServiceName, setAccessoryName, setServiceName } from "homebridge-plugin-utils";
 import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
 import { HYDRAWISE_CONTROLLER_FALLBACK_NAME, HYDRAWISE_ZONE_FALLBACK_NAME, HydrawiseReservedNames, scheduleStatus } from "./types.ts";
 import type { Service as HapService, PlatformAccessory } from "homebridge";
-import type { HydrawiseAccessoryContext, HydrawiseControllerIdentity, HydrawiseControllerV2Facts, HydrawiseZoneConfig, HydrawiseZoneIdentity,
-  StatusScheduleResponse } from "./types.ts";
+import type { HydrawiseAccessory, HydrawiseAccessoryContext, HydrawiseControllerIdentity, HydrawiseControllerV2Facts, HydrawiseZoneConfig,
+  HydrawiseZoneIdentity, StatusScheduleResponse } from "./types.ts";
 import type { HydrawiseControllerOption, HydrawiseControllerValueOption, HydrawiseZoneOption, HydrawiseZoneValueOption } from "./options.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
 import { featureOptionCategories, featureOptions } from "./options.ts";
-import { logCount, present, triggerSet, waitUntil } from "homebridge-plugin-utils/testing";
+import { logCount, present, settle, triggerSet, waitUntil } from "homebridge-plugin-utils/testing";
 import type { BuildControllerResult } from "./testing/platform.helpers.ts";
 import assert from "node:assert/strict";
 import { bareSensors } from "./api.fixtures.ts";
+import { getEventListeners } from "node:events";
 
 // The single zone every scenario here works against, and the names standing in for each source a valve's name can come from: what the wire reports, what a user
 // renamed it to in the Home app, and what the Name option configures.
@@ -93,6 +96,23 @@ const ZONE_SUSPEND_SUFFIX = " Suspend";
 
 const ZONE_SUSPEND_SUBTYPE = "Suspend." + ZONE_SUBTYPE;
 
+// Synchronization turned on account-wide, which every row about a rename Hydrawise drives, or a pass that decides under synchronization, names for itself.
+const SYNC_NAME_ON = "Enable.Device.SyncName";
+
+// The entries that give the zone under test its own accessory and a companion suspension switch, the latter needing the account credentials a row also states.
+const STANDALONE_ON = "Enable.Device.Standalone." + ZONE_SUBTYPE;
+
+const SUSPEND_ZONE_ON = "Enable.Device.Suspend.Zone." + CONTROLLER_SERIAL;
+
+// The line each restore writes at info, as HBPU's watch states it.
+const RESTORED_LINE = "Restored the name the plugin owns for a service after the Home app renamed it.";
+
+/* The change listeners a service on an accessory the test double made carries with no watch on it: the HAP accessory's own, which forwards each change toward
+ * the bridge, and the double's observer, which records it for the suite. A watch adds exactly one more, so every count below is stated against this, and the rows
+ * asserting a service carries no watch hold the figure itself to what HAP and the double attach.
+ */
+const UNWATCHED_LISTENERS = 2;
+
 // The persisted zone roster, read through the same confined cast the roster suite reads it through.
 function rosterOf(h: BuildControllerResult): HydrawiseZoneIdentity[] {
 
@@ -122,6 +142,22 @@ function schedule(name: string): StatusScheduleResponse {
 function zone(name: string): HydrawiseZoneConfig {
 
   return makeZone({ name, relay: 1, relay_id: ZONE_RELAY_ID, run: 480, time: 68000, timestr: "16:00" });
+}
+
+// A second zone, scheduled as the first is and left on the controller accessory, so one controller can host a zone on each kind of accessory at once.
+const SECOND_RELAY_ID = 700002;
+const SECOND_SUBTYPE = "700002";
+const SECOND_WIRE_NAME = "Back Beds";
+
+function secondZone(): HydrawiseZoneConfig {
+
+  return makeZone({ name: SECOND_WIRE_NAME, relay: 2, relay_id: SECOND_RELAY_ID, run: 480, time: 68000, timestr: "16:00" });
+}
+
+// A fast-cadence schedule around any zones, for the rows that host more than the one zone the single-zone schedule above carries.
+function zonesSchedule(zones: HydrawiseZoneConfig[]): StatusScheduleResponse {
+
+  return fastPolling(makeStatusSchedule({ relays: zones, sensors: bareSensors }));
 }
 
 /* Seed a cached valve already bearing a name, the shape Homebridge restores when an accessory returns from its cache carrying a rename the user made in the Home
@@ -207,6 +243,33 @@ async function pollPast(h: BuildControllerResult): Promise<void> {
   await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= (seen + 2), { description: "the second status poll past the one in flight" });
 }
 
+// Rename a service in the Home app, the way a HomeKit controller's write reaches it, and let the event loop's next turn pass, which is when a watch restores.
+async function renameInHomeApp(service: HapService, name: string): Promise<void> {
+
+  await triggerSet(service.getCharacteristic(Characteristic.ConfiguredName), name);
+  await settle();
+}
+
+// The change listeners a service carries, read against UNWATCHED_LISTENERS above.
+function listenersOn(service: HapService): number {
+
+  return service.listenerCount(ServiceEventTypes.CHARACTERISTIC_CHANGE);
+}
+
+/* The registrations the platform signal holds, each watch holding one beside the polling loop's own. The loop's share moves as it sleeps and retries, so a row
+ * compares a reading before its change with one after it, each taken straight after a completed poll, where the loop is asleep until its next fetch.
+ */
+function signalRegistrations(h: BuildControllerResult): number {
+
+  return getEventListeners(h.platform.signal, "abort").length;
+}
+
+// The number of status polls the controller has begun, which a row hands to pollsCompleted to read its next sample at the same point of the loop.
+function pollsBegun(h: BuildControllerResult): number {
+
+  return h.retrieve.callsTo("statusschedule.php").length;
+}
+
 describe("zone naming at creation", () => {
 
   test("creates a zone's valve with the name Hydrawise reports when no override is configured", async (t) => {
@@ -257,12 +320,13 @@ describe("zone naming at creation", () => {
   });
 });
 
-describe("zone name synchronization at its default", () => {
+describe("zone names the plugin owns", () => {
 
-  test("re-asserts the effective name over a rename made in the Home app", async (t) => {
+  // A rename the cache carried back was made before this run began, so no watch saw it, and a row seeding one leaves it to the poll to put right.
+  test("re-asserts the synchronized name over a Home-app rename the cache restored", async (t) => {
 
     const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }),
-      seedContext: seedNamedValve(HOME_APP_NAME), signalAborted: false });
+      seedContext: seedNamedValve(HOME_APP_NAME), signalAborted: false, userOptions: [SYNC_NAME_ON] });
 
     t.after(() => h.abort());
 
@@ -273,7 +337,7 @@ describe("zone name synchronization at its default", () => {
     assert.equal(nameOf(valve), WIRE_NAME, "a Home-app rename yields to the name Hydrawise reports");
   });
 
-  test("re-asserts a configured override over a rename made in the Home app", async (t) => {
+  test("re-asserts a configured override over a Home-app rename the cache restored", async (t) => {
 
     const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }),
       seedContext: seedNamedValve(HOME_APP_NAME), signalAborted: false, userOptions: ["Enable.Device.Name." + ZONE_SUBTYPE + "=" + OVERRIDE_NAME] });
@@ -295,7 +359,7 @@ describe("zone name synchronization at its default", () => {
 
       recorder.program("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" });
       recorder.programDefault("statusschedule.php", { body: schedule(WIRE_RENAMED), kind: "response" });
-    }, seedContext: seedNamedValve(WIRE_NAME), signalAborted: false });
+    }, seedContext: seedNamedValve(WIRE_NAME), signalAborted: false, userOptions: [SYNC_NAME_ON] });
 
     t.after(() => h.abort());
 
@@ -309,7 +373,7 @@ describe("zone name synchronization at its default", () => {
   test("does not rewrite a name that already matches", async (t) => {
 
     const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }),
-      seedContext: seedNamedValve(WIRE_NAME), signalAborted: false });
+      seedContext: seedNamedValve(WIRE_NAME), signalAborted: false, userOptions: [SYNC_NAME_ON] });
 
     t.after(() => h.abort());
 
@@ -379,14 +443,17 @@ describe("zone name synchronization saves", () => {
 
 describe("zone name synchronization opted out", () => {
 
-  // The opt-out is honored wherever it is written: a single zone, or the controller the zone lives under.
+  /* The opt-out is honored wherever it is written: a single zone, or the controller the zone lives under. Each scoped Disable carves out of synchronization
+   * turned on for the whole account, because the default leaves it off...without the enabled whole, a row reads the same with its Disable entry as without one,
+   * and cannot tell a scoped opt-out from no entry at all.
+   */
   for(const { label, option } of [ { label: "the zone", option: "Disable.Device.SyncName." + ZONE_SUBTYPE },
     { label: "the controller", option: "Disable.Device.SyncName." + CONTROLLER_SERIAL } ]) {
 
     test("leaves a Home-app rename standing when synchronization is disabled at " + label, async (t) => {
 
       const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }),
-        seedContext: seedNamedValve(HOME_APP_NAME), signalAborted: false, userOptions: [option] });
+        seedContext: seedNamedValve(HOME_APP_NAME), signalAborted: false, userOptions: [ SYNC_NAME_ON, option ] });
 
       t.after(() => h.abort());
 
@@ -504,7 +571,7 @@ describe("the zone name option's declared scope", () => {
      */
     const h = buildController({ hasV2Client: true,
       program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }), signalAborted: false,
-      userOptions: ["Enable.Device.Name." + ZONE_SUBTYPE + "=" + OVERRIDE_NAME] });
+      userOptions: [ SYNC_NAME_ON, "Enable.Device.Name." + ZONE_SUBTYPE + "=" + OVERRIDE_NAME ] });
 
     t.after(() => h.abort());
 
@@ -515,7 +582,7 @@ describe("the zone name option's declared scope", () => {
     assert.equal(nameOf(valve), OVERRIDE_NAME, "the user's own name outranks everything, account name included");
 
     // Drop the override and let a poll re-resolve. The account's name is what remains, and it beats the truncated form the wire is still reporting.
-    h.platform.featureOptions.configuredOptions = [];
+    h.platform.featureOptions.configuredOptions = [SYNC_NAME_ON];
 
     await waitUntil(() => nameOf(valve) === ACCOUNT_NAME, { description: "the valve to take the account name" });
 
@@ -535,7 +602,8 @@ describe("the zone name option's declared scope", () => {
     assert.notEqual(ACCOUNT_NAME, WIRE_NAME, "and the two must differ, or holding one would be indistinguishable from falling back to the other");
 
     const h = buildController({ hasV2Client: true,
-      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }), signalAborted: false });
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }), signalAborted: false,
+      userOptions: [SYNC_NAME_ON] });
 
     t.after(() => h.abort());
 
@@ -566,7 +634,7 @@ describe("the zone name option's declared scope", () => {
 
       recorder.program("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" });
       recorder.programDefault("statusschedule.php", { body: schedule(WIRE_UNRELATED), kind: "response" });
-    }, signalAborted: false });
+    }, signalAborted: false, userOptions: [SYNC_NAME_ON] });
 
     t.after(() => h.abort());
 
@@ -617,7 +685,7 @@ describe("the zone name option's declared scope", () => {
 
     assert.equal(engine.isValue("Device.Name"), true, "the name option carries a value");
     assert.equal(engine.isValue("Device.SyncName"), false, "the synchronization option is a plain toggle");
-    assert.equal(engine.test("Device.SyncName", ZONE_SUBTYPE, CONTROLLER_SERIAL), true, "synchronization is on by default");
+    assert.equal(engine.test("Device.SyncName", ZONE_SUBTYPE, CONTROLLER_SERIAL), false, "synchronization is off by default, so a name is the user's to keep");
   });
 
   test("names every scoped option in the union the runtime narrows against", () => {
@@ -658,7 +726,7 @@ describe("the name carry across a restart", () => {
         setServiceName(seed.addService(Service.IrrigationSystem, CONTROLLER_ACCOUNT_EXTENDED), CONTROLLER_ACCOUNT_EXTENDED);
         setServiceName(seed.addService(Service.Valve, ACCOUNT_NAME, ZONE_SUBTYPE), ACCOUNT_NAME);
         setAccessoryName(seed, CONTROLLER_ACCOUNT_EXTENDED);
-      }, signalAborted: false });
+      }, signalAborted: false, userOptions: [SYNC_NAME_ON] });
 
     t.after(() => h.abort());
 
@@ -691,7 +759,7 @@ describe("the name carry across a restart", () => {
     const h = buildController({ hasV2Client: true,
       program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }),
       seedContext: (seed) => { seed.context = { controller: { controllerId: 500001, name: CONTROLLER_ACCOUNT_EXTENDED, serialNumber: CONTROLLER_SERIAL } }; },
-      signalAborted: false });
+      signalAborted: false, userOptions: [SYNC_NAME_ON] });
 
     t.after(() => h.abort());
 
@@ -715,7 +783,8 @@ describe("the name carry across a restart", () => {
      */
     const h = buildController({ hasV2Client: true,
       program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }),
-      seedContext: (seed) => { seed.context = { zones: [{ name: ACCOUNT_NAME, relay: 1, relayId: ZONE_RELAY_ID }] }; }, signalAborted: false });
+      seedContext: (seed) => { seed.context = { zones: [{ name: ACCOUNT_NAME, relay: 1, relayId: ZONE_RELAY_ID }] }; }, signalAborted: false,
+      userOptions: [SYNC_NAME_ON] });
 
     t.after(() => h.abort());
 
@@ -744,7 +813,7 @@ describe("the name carry across a restart", () => {
 
         seed.context = { controller: { controllerId: 500001, name: CONTROLLER_ACCOUNT_EXTENDED, serialNumber: CONTROLLER_SERIAL },
           zones: [{ name: ACCOUNT_NAME, relay: 1, relayId: ZONE_RELAY_ID }] };
-      }, signalAborted: false });
+      }, signalAborted: false, userOptions: [SYNC_NAME_ON] });
 
     t.after(() => h.abort());
 
@@ -788,7 +857,7 @@ describe("controller naming", () => {
      */
     const h = buildController({ hasV2Client: true,
       program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }), signalAborted: false,
-      userOptions: ["Enable.Device.Suspend.All"] });
+      userOptions: [ SYNC_NAME_ON, "Enable.Device.Suspend.All" ] });
 
     t.after(() => h.abort());
 
@@ -900,7 +969,7 @@ describe("controller naming", () => {
   test("holds the wire's name on an install with no account credentials, and the account's through a refresh outage", async (t) => {
 
     const bare = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }),
-      signalAborted: false });
+      signalAborted: false, userOptions: [SYNC_NAME_ON] });
 
     t.after(() => bare.abort());
 
@@ -908,9 +977,9 @@ describe("controller naming", () => {
 
     bare.accessory.clearObservations();
 
-    // The first poll's marks - the roster and schedule seeds, the valve it attaches, the name its information service gains - reach the cache as one save, so a
-    // save past it can only be a rename.
-    await waitUntil(() => bare.flushes().length >= 1, { description: "the first accessory flush" });
+    // Construction saves the ConfiguredName the controller's setup gives its information service, and the first poll's marks - the roster and schedule seeds and
+    // the valve it attaches - reach the cache as one save after it, so a save past construction's and the first poll's can only be a rename.
+    await waitUntil(() => bare.flushes().length >= 2, { description: "the first poll's accessory flush, after construction's" });
 
     const bareFlushesAfterFirstPoll = bare.flushes().length;
 
@@ -921,12 +990,13 @@ describe("controller naming", () => {
      * and only a write marks the accessory, so the save count reads what they answered: an unchanged name costs no save.
      */
     assert.deepEqual(nameChanges(bare, bareIrrigation), [], "an install with no credentials performs no controller rename at all");
-    assert.equal(bareFlushesAfterFirstPoll, 1, "the first poll costs exactly one cache write");
+    assert.equal(bareFlushesAfterFirstPoll, 2, "construction and the first poll each cost exactly one cache write");
     assert.equal(bare.flushes().length, bareFlushesAfterFirstPoll, "and the polls after it rename nothing, so they write the cache no second time");
     assert.equal(nameOf(bareIrrigation), CONTROLLER_WIRE_NAME, "and keeps the name the wire reports");
 
     const h = buildController({ hasV2Client: true,
-      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }), signalAborted: false });
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }), signalAborted: false,
+      userOptions: [SYNC_NAME_ON] });
 
     t.after(() => h.abort());
 
@@ -954,15 +1024,15 @@ describe("controller naming", () => {
   test("a second poll under an unchanged name renames nothing and writes nothing", async (t) => {
 
     const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }),
-      signalAborted: false, userOptions: ["Enable.Device.Suspend.All"] });
+      signalAborted: false, userOptions: [ SYNC_NAME_ON, "Enable.Device.Suspend.All" ] });
 
     t.after(() => h.abort());
 
     const irrigation = irrigationOf(h);
     const suspendSwitch = suspendSwitchOf(h);
 
-    // The first poll's marks reach the cache as one save; what this asserts is the poll after it.
-    await waitUntil(() => h.flushes().length >= 1, { description: "the first accessory flush" });
+    // Construction's ConfiguredName add and the first poll's marks reach the cache as one save each; what this asserts is the poll after them.
+    await waitUntil(() => h.flushes().length >= 2, { description: "the first poll's accessory flush, after construction's" });
 
     const flushesAfterFirstPoll = h.flushes().length;
 
@@ -971,8 +1041,8 @@ describe("controller naming", () => {
     await pollPast(h);
     await h.abort();
 
-    assert.equal(flushesAfterFirstPoll, 1, "the first poll costs exactly one cache write");
-    assert.equal(h.flushes().length, 1, "and a poll that moved no name writes the cache no second time");
+    assert.equal(flushesAfterFirstPoll, 2, "construction and the first poll each cost exactly one cache write");
+    assert.equal(h.flushes().length, 2, "and a poll that moved no name adds no cache write");
     assert.deepEqual(nameChanges(h, irrigation), [], "the sanitized compare finds the controller's name already correct and rewrites nothing");
     assert.deepEqual(nameChanges(h, suspendSwitch), [], "and the switch composed from it is left alone too");
   });
@@ -993,7 +1063,7 @@ describe("controller naming", () => {
 
     const irrigation = irrigationOf(h);
 
-    await waitUntil(() => h.flushes().length >= 1, { description: "the first accessory flush" });
+    await waitUntil(() => h.flushes().length >= 2, { description: "the first poll's accessory flush, after construction's" });
     await pollPast(h);
 
     // The steady state: the seeding poll has paid its one write and the polls after it pay nothing.
@@ -1009,31 +1079,82 @@ describe("controller naming", () => {
     assert.equal(h.flushes().length, settled + 1, "and costs exactly one cache write, which the polls after it do not repeat");
   });
 
-  test("an accessory missing its information service's ConfiguredName gains it on its first synced poll, saved once and not again", async (t) => {
+  /* The setup's ConfiguredName rule runs ahead of its hardware arms, and on an install with account credentials the arm that preserves the controller's own model
+   * and firmware returns early, so only the rule's place ahead of that return gives a credentialed install's tile the add. The row runs with the credentials and
+   * without them, because each install walks the setup down a different arm.
+   */
+  for(const { hasV2Client, label } of [ { hasV2Client: false, label: "with no account credentials" },
+    { hasV2Client: true, label: "with account credentials" } ]) {
 
-    /* A cached accessory carries the characteristic only once the rename step has written it, because HAP declares it optional on the information service and
-     * builds none. The accessory's display name already matches, and the context and the valve are restored as a warm restart restores them, so the information
-     * service's half of the name is the only thing the first poll writes.
+    test("a cached accessory missing its information service's ConfiguredName gains one equal to its Name at construction, with no Name or SyncName set, " +
+      "on an install " + label, async (t) => {
+
+      /* HAP declares the characteristic optional on the information service and builds none, so an accessory restored from a cache that never carried it comes
+       * back with its Name alone. The controller's setup adds it at construction whoever owns the name, and here the user owns it, with neither a Name nor SyncName
+       * set, so no pass after construction writes a name. The context and the valve are restored as a warm restart restores them, so the add is the only thing the
+       * run saves.
+       */
+      const h = buildController({ hasV2Client, program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }),
+        seedContext: (seed) => {
+
+          seed.context = { schedule: scheduleStatus(schedule(WIRE_NAME), HYDRAWISE_ACTIVE_ZONE_INDICATOR),
+            zones: [{ name: WIRE_NAME, relay: 1, relayId: ZONE_RELAY_ID }] };
+          acquireService({ accessory: seed, name: WIRE_NAME, serviceType: Service.Valve, subtype: ZONE_SUBTYPE });
+
+          assert.equal(seed.getService(Service.AccessoryInformation)?.testCharacteristic(Characteristic.ConfiguredName), false,
+            "the cached information service carries no ConfiguredName");
+        }, signalAborted: false });
+
+      t.after(() => h.abort());
+
+      const information = informationOf(h);
+
+      // Read before any poll can land: the first status fetch is still in flight when construction returns, so what the service carries here is construction's.
+      assert.equal(information.testCharacteristic(Characteristic.ConfiguredName), true, "construction adds a ConfiguredName before any poll");
+      assert.equal(information.getCharacteristic(Characteristic.ConfiguredName).value, information.getCharacteristic(Characteristic.Name).value,
+        "carrying the name the service's Name holds");
+      assert.equal(information.getCharacteristic(Characteristic.ConfiguredName).value, CONTROLLER_WIRE_NAME, "which is the controller's");
+
+      await pollPast(h);
+      await pollPast(h);
+      await h.abort();
+
+      assert.equal(information.getCharacteristic(Characteristic.ConfiguredName).value, CONTROLLER_WIRE_NAME, "the polls after it leave the name as it stands");
+      assert.equal(h.flushes().length, 1, "and the add saves the accessory once, the polls after it saving nothing");
+    });
+  }
+
+  test("a cached information service whose ConfiguredName a Home app rename set keeps it through construction and a poll, its Name untouched", async (t) => {
+
+    /* The setup adds a ConfiguredName only where an information service carries none, and writes over none it carries. The accessory comes back from the cache
+     * renamed in the Home app, its ConfiguredName apart from its Name, and with neither a Name nor SyncName set the user owns the name, so neither construction
+     * nor a poll may write a name characteristic. The seed's own name writes are counted where it makes them, so the record past that count is the controller's.
      */
+    let seedNameChanges = 0;
+
     const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }),
       seedContext: (seed) => {
 
-        seed.context = { schedule: scheduleStatus(schedule(WIRE_NAME), HYDRAWISE_ACTIVE_ZONE_INDICATOR), zones: [{ name: WIRE_NAME, relay: 1, relayId: ZONE_RELAY_ID }] };
-        acquireService({ accessory: seed, name: WIRE_NAME, serviceType: Service.Valve, subtype: ZONE_SUBTYPE });
+        const seeded = present(seed.getService(Service.AccessoryInformation), "the cached information service");
+
+        setAccessoryName(seed, CONTROLLER_WIRE_NAME);
+        seeded.getCharacteristic(Characteristic.ConfiguredName).updateValue(HOME_APP_NAME);
+        seedNameChanges = seed.changesOn(seeded, Characteristic.ConfiguredName, Characteristic.Name).length;
       }, signalAborted: false });
 
     t.after(() => h.abort());
 
     const information = informationOf(h);
 
-    assert.equal(information.testCharacteristic(Characteristic.ConfiguredName), false, "the restored information service carries no ConfiguredName");
+    assert.equal(information.getCharacteristic(Characteristic.ConfiguredName).value, HOME_APP_NAME, "construction keeps the Home app's ConfiguredName");
 
-    await pollPast(h);
+    await valveOf(h);
     await pollPast(h);
     await h.abort();
 
-    assert.equal(information.getCharacteristic(Characteristic.ConfiguredName).value, CONTROLLER_WIRE_NAME, "the first synced poll writes the controller's name to it");
-    assert.equal(h.flushes().length, 1, "and saves the accessory once for it, the polls after it saving nothing");
+    assert.equal(information.getCharacteristic(Characteristic.ConfiguredName).value, HOME_APP_NAME, "and so does the poll after it");
+    assert.equal(information.getCharacteristic(Characteristic.Name).value, CONTROLLER_WIRE_NAME, "while the Name characteristic keeps the name it carried");
+    assert.deepEqual(nameChanges(h, information).slice(seedNameChanges), [], "and no name change is recorded on the information service after the seed");
   });
 
   test("a stale persisted identity is rewritten on the first poll, the run's only save", async (t) => {
@@ -1075,8 +1196,8 @@ describe("controller naming", () => {
 
     await waitUntil(() => nameOf(irrigation) === CONTROLLER_FREE_FORM_SANITIZED, { description: "the irrigation system to take the sanitized free-form name" });
 
-    // The first poll's marks reach the cache as one save, so a save past it can only be a rename.
-    await waitUntil(() => h.flushes().length >= 1, { description: "the first accessory flush" });
+    // Construction's ConfiguredName add and the first poll's marks reach the cache as one save each, so a save past them can only be a rename.
+    await waitUntil(() => h.flushes().length >= 2, { description: "the first poll's accessory flush, after construction's" });
 
     const flushesAfterFirstPoll = h.flushes().length;
 
@@ -1089,7 +1210,7 @@ describe("controller naming", () => {
      * a compare that read it raw would call every poll a rename, and every rename marks the accessory for a save.
      */
     assert.deepEqual(nameChanges(h, irrigation), [], "a sanitized name that already matches is not rewritten on every poll");
-    assert.equal(flushesAfterFirstPoll, 1, "the first poll costs exactly one cache write");
+    assert.equal(flushesAfterFirstPoll, 2, "construction and the first poll each cost exactly one cache write");
     assert.equal(h.flushes().length, flushesAfterFirstPoll, "and the polls after it rename nothing, so they write the cache no second time");
     assert.equal(nameOf(irrigation), CONTROLLER_FREE_FORM_SANITIZED, "and the controller still carries the sanitized override");
     assert.equal(nameOf(suspendSwitchOf(h)), CONTROLLER_FREE_FORM_SANITIZED + SUSPEND_ALL_SUFFIX, "with the switch composed from the same name");
@@ -1155,7 +1276,7 @@ describe("controller naming", () => {
      */
     const h = buildController({ hasV2Client: true,
       program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }), signalAborted: false,
-      userOptions: ["Enable.Device.Suspend.All"] });
+      userOptions: [ SYNC_NAME_ON, "Enable.Device.Suspend.All" ] });
 
     t.after(() => h.abort());
 
@@ -1185,7 +1306,7 @@ describe("controller naming", () => {
 
       recorder.program("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" });
       recorder.programDefault("statusschedule.php", { body: schedule(UNUSABLE_NAME), kind: "response" });
-    }, signalAborted: false, userOptions: ["Enable.Device.Suspend.Zone." + CONTROLLER_SERIAL] });
+    }, signalAborted: false, userOptions: [ SYNC_NAME_ON, SUSPEND_ZONE_ON ] });
 
     t.after(() => h.abort());
 
@@ -1204,13 +1325,13 @@ describe("controller naming", () => {
 
 describe("the naming rule", () => {
 
-  test("with synchronization disabled, a set Name option reaches every surface and a rename made in the Home app yields to it", async (t) => {
+  test("with synchronization disabled, a set Name option reaches every surface and a rename made in the Home app is put back at once", async (t) => {
 
-    /* The family rule: a Name the user set applies on every pass, whatever synchronization says. Every surface the Home app can rename is renamed there, the
+    /* The family rule: a Name the user set owns the name on every pass, whatever synchronization says. Every surface the Home app can rename is renamed there, the
      * controller accessory and its suspend-all switch at the controller, and the valve, its companion switch and the accessory hosting them at the zone, so a
-     * gate that still read synchronization alone at the controller or at the zone leaves its half standing under the Home app's name. HomeKit carries no
-     * ConfiguredName on an irrigation system, so a rename of the controller lands on its accessory's information service, and the irrigation system, read
-     * through its Name characteristic, carries the Name it was created under.
+     * gate that still read synchronization alone at the controller or at the zone leaves its half unwatched and standing under the Home app's name. Each is put
+     * back by its watch the moment the rename lands, with no poll between. HomeKit carries no ConfiguredName on an irrigation system, so a rename of the controller
+     * lands on its accessory's information service, and the irrigation system, read through its Name characteristic, carries the Name it was created under.
      */
     const h = buildController({ accessoryName: CONTROLLER_OVERRIDE_NAME, hasV2Client: true,
       program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }), signalAborted: false,
@@ -1228,24 +1349,24 @@ describe("the naming rule", () => {
 
     const hostInformation = present(host.getService(Service.AccessoryInformation), "the zone accessory's information service");
     const surfaces = [ informationOf(h), suspendSwitchOf(h), valve, zoneSwitch, hostInformation ];
+    const polls = pollsBegun(h);
 
     for(const service of surfaces) {
 
       // eslint-disable-next-line no-await-in-loop
-      await triggerSet(service.getCharacteristic(Characteristic.ConfiguredName), HOME_APP_NAME);
+      await renameInHomeApp(service, HOME_APP_NAME);
     }
 
-    assert.ok(surfaces.every(service => nameOf(service) === HOME_APP_NAME), "every surface carries the Home app's name before the next poll");
-
-    await pollPast(h);
     await h.abort();
 
+    assert.equal(pollsBegun(h), polls, "no poll ran across the renames, so every name below was put back by its surface's watch");
     assert.equal(nameOf(informationOf(h)), CONTROLLER_OVERRIDE_NAME, "the controller accessory takes the controller's Name back");
     assert.equal(irrigationOf(h).getCharacteristic(Characteristic.Name).value, CONTROLLER_OVERRIDE_NAME, "the irrigation system carries it");
     assert.equal(nameOf(suspendSwitchOf(h)), CONTROLLER_OVERRIDE_NAME + SUSPEND_ALL_SUFFIX, "and so does the suspend-all switch composed from it");
     assert.equal(nameOf(valve), OVERRIDE_NAME, "the valve takes the zone's Name back");
     assert.equal(nameOf(zoneSwitch), OVERRIDE_NAME + ZONE_SUSPEND_SUFFIX, "and so does its companion switch");
     assert.equal(nameOf(hostInformation), OVERRIDE_NAME, "and so does the accessory hosting them");
+    assert.equal(logCount(h.entries, "info", RESTORED_LINE), surfaces.length, "each rename is put back with one line of its own");
   });
 
   test("with synchronization disabled and no Name set, a rename made in the Home app stands across polls", async (t) => {
@@ -1253,8 +1374,7 @@ describe("the naming rule", () => {
     /* The other half of the rule: with nothing set, the opt-out means a name is written once, when its service is created, so nothing writes over the user's own.
      * The controller's rename lands on its accessory's information service, as the Home app renames it, and the irrigation system, which carries no
      * ConfiguredName, is read through the Name its creation wrote. The accessory is seeded as an earlier synced session left it, named through HBPU's
-     * setAccessoryName, so its information service carries the ConfiguredName the Home app writes...with the opt-out and no Name set, nothing this session
-     * writes would add it.
+     * setAccessoryName, so its information service carries the ConfiguredName the Home app writes, and the controller's setup keeps it as it stands.
      */
     const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }),
       seedContext: (seed) => setAccessoryName(seed, CONTROLLER_WIRE_NAME), signalAborted: false,
@@ -1287,6 +1407,33 @@ describe("the naming rule", () => {
     assert.equal(nameOf(valve), HOME_APP_NAME, "and so does the valve");
     assert.equal(irrigationOf(h).getCharacteristic(Characteristic.Name).value, CONTROLLER_WIRE_NAME, "while the irrigation system keeps the name it was created with");
   });
+
+  test("with neither a Name nor SyncName set, a controller's log line names it as its tile does after a rename made in the Home app", async (t) => {
+
+    /* The log prefix reads the controller accessory's information service, the tile the Home app renames, rather than the irrigation system, which carries Name
+     * alone and keeps the name it was created with, so a line the controller writes names the controller as the Home app shows it. The user owns the name, so the
+     * rename stands, and the accessory is seeded as an earlier synced session left it, so its information service carries the ConfiguredName the Home app writes,
+     * and the controller's setup keeps it as it stands.
+     */
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }),
+      seedContext: (seed) => setAccessoryName(seed, CONTROLLER_WIRE_NAME), signalAborted: false });
+
+    t.after(() => h.abort());
+
+    await valveOf(h);
+    await pollPast(h);
+    await renameInHomeApp(informationOf(h), HOME_APP_NAME);
+
+    // The account's word that the controller is offline draws a line from the controller at once, written through the same prefixed logger as every line it writes.
+    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: nowSeconds() });
+
+    await h.abort();
+
+    assert.equal(nameOf(informationOf(h)), HOME_APP_NAME, "the tile carries the Home app's name");
+    assert.equal(irrigationOf(h).getCharacteristic(Characteristic.Name).value, CONTROLLER_WIRE_NAME, "while the irrigation system keeps the name it was created with");
+    assert.equal(logCount(h.entries, "info", HOME_APP_NAME + ": The controller is offline."), 1, "and the controller's line opens with the tile's name");
+  });
 });
 
 describe("names HomeKit cannot carry", () => {
@@ -1299,7 +1446,7 @@ describe("names HomeKit cannot carry", () => {
      */
     const h = buildController({ accessoryName: HYDRAWISE_CONTROLLER_FALLBACK_NAME, controller: { name: EMOJI_NAME },
       program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }), signalAborted: false,
-      userOptions: ["Enable.Device.Suspend.All"] });
+      userOptions: [ SYNC_NAME_ON, "Enable.Device.Suspend.All" ] });
 
     t.after(() => h.abort());
 
@@ -1322,7 +1469,7 @@ describe("names HomeKit cannot carry", () => {
       recorder.program("statusschedule.php", { body: schedule(UNUSABLE_NAME), kind: "response" });
       recorder.program("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" });
       recorder.programDefault("statusschedule.php", { body: schedule(UNUSABLE_NAME), kind: "response" });
-    }, signalAborted: false });
+    }, signalAborted: false, userOptions: [SYNC_NAME_ON] });
 
     t.after(() => h.abort());
 
@@ -1350,7 +1497,7 @@ describe("names HomeKit cannot carry", () => {
       recorder.program("statusschedule.php", { body: schedule(UNUSABLE_NAME), kind: "response" });
       recorder.program("statusschedule.php", { body: fastPolling(makeStatusSchedule({ relays: [other], sensors: bareSensors })), kind: "response" });
       recorder.programDefault("statusschedule.php", { body: schedule(UNUSABLE_NAME), kind: "response" });
-    }, signalAborted: false });
+    }, signalAborted: false, userOptions: [SYNC_NAME_ON] });
 
     t.after(() => h.abort());
 
@@ -1366,7 +1513,7 @@ describe("names HomeKit cannot carry", () => {
 
     // The previous session left the valve under the word, so this run's first pass finds nothing to write, and the warning it still says is the run's own.
     const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(UNUSABLE_NAME), kind: "response" }),
-      seedContext: seedNamedValve(ZONE_FALLBACK_NAME), signalAborted: false });
+      seedContext: seedNamedValve(ZONE_FALLBACK_NAME), signalAborted: false, userOptions: [SYNC_NAME_ON] });
 
     t.after(() => h.abort());
 
@@ -1498,5 +1645,409 @@ describe("names HomeKit cannot carry", () => {
 
     assert.equal(nameOf(valve), HOME_APP_NAME, "the valve keeps the Home app's name");
     assert.equal(nameOf(zoneSwitch), HOME_APP_NAME, "and so does its companion switch");
+  });
+});
+
+describe("name watches", () => {
+
+  // Synchronization on, every suspension switch the plugin offers, and the zone under test on its own accessory beside the second zone on the controller's, so
+  // one pass owns a surface of every kind the Home app can rename.
+  function buildOwningEverything(options: { userOptions?: string[] } = {}): BuildControllerResult {
+
+    return buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: zonesSchedule([ zone(WIRE_NAME), secondZone() ]), kind: "response" }),
+      signalAborted: false, userOptions: options.userOptions ?? [ SYNC_NAME_ON, STANDALONE_ON, SUSPEND_ZONE_ON, "Enable.Device.Suspend.All" ] });
+  }
+
+  // Every surface of that layout the Home app can rename, each beside the name the plugin gives it under synchronization and a label for the assertions.
+  function renameableSurfaces(h: BuildControllerResult): { label: string; owned: string; service: HapService }[] {
+
+    const host = present(h.zoneAccessories.get(ZONE_RELAY_ID), "the zone's own accessory");
+
+    return [
+
+      { label: "the controller accessory's information service", owned: CONTROLLER_WIRE_NAME, service: informationOf(h) },
+      { label: "the suspend-all switch", owned: CONTROLLER_WIRE_NAME + SUSPEND_ALL_SUFFIX, service: suspendSwitchOf(h) },
+      { label: "a valve on the controller accessory", owned: SECOND_WIRE_NAME,
+        service: present(h.accessory.getServiceById(Service.Valve, SECOND_SUBTYPE), "the second zone's valve") },
+      { label: "a companion switch on the controller accessory", owned: SECOND_WIRE_NAME + ZONE_SUSPEND_SUFFIX,
+        service: present(h.accessory.getServiceById(Service.Switch, "Suspend." + SECOND_SUBTYPE), "the second zone's switch") },
+      { label: "a valve on a zone's own accessory", owned: WIRE_NAME, service: present(host.getServiceById(Service.Valve, ZONE_SUBTYPE), "the zone's own valve") },
+      { label: "a companion switch on a zone's own accessory", owned: WIRE_NAME + ZONE_SUSPEND_SUFFIX,
+        service: present(host.getServiceById(Service.Switch, ZONE_SUSPEND_SUBTYPE), "the zone's own switch") },
+      { label: "a zone accessory's information service", owned: WIRE_NAME,
+        service: present(host.getService(Service.AccessoryInformation), "the zone accessory's information service") }
+    ];
+  }
+
+  test("under SyncName, a rename made in the Home app is put back at once on every kind of surface the plugin owns, each with one line", async (t) => {
+
+    // Each surface is renamed in turn and read straight after the restore's turn, with no poll between, so the name it carries then is its own watch's work.
+    const h = buildOwningEverything();
+
+    t.after(() => h.abort());
+
+    await waitFor(() => h.zoneAccessories.get(ZONE_RELAY_ID), { description: "the zone's own accessory to appear" });
+    await pollPast(h);
+
+    const polls = pollsBegun(h);
+
+    for(const [ index, { label, owned, service } ] of renameableSurfaces(h).entries()) {
+
+      // eslint-disable-next-line no-await-in-loop
+      await renameInHomeApp(service, HOME_APP_NAME);
+
+      assert.equal(nameOf(service), owned, label + " takes the name the plugin owns back at once");
+      assert.equal(logCount(h.entries, "info", RESTORED_LINE), index + 1, label + "'s restore is said in one line");
+    }
+
+    await h.abort();
+
+    assert.equal(pollsBegun(h), polls, "no poll ran across the renames");
+  });
+
+  test("after a rename on the Hydrawise side, a rename made in the Home app is put back to the new name", async (t) => {
+
+    // The watch answers the name the latest pass decided, so a valve created under one name and renamed by Hydrawise since is held to the second.
+    const h = buildController({ program: (recorder) => {
+
+      recorder.program("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" });
+      recorder.programDefault("statusschedule.php", { body: schedule(WIRE_RENAMED), kind: "response" });
+    }, signalAborted: false, userOptions: [SYNC_NAME_ON] });
+
+    t.after(() => h.abort());
+
+    const valve = await valveOf(h);
+
+    await waitUntil(() => nameOf(valve) === WIRE_RENAMED, { description: "the valve to take the renamed wire name" });
+    await pollPast(h);
+    await renameInHomeApp(valve, HOME_APP_NAME);
+    await h.abort();
+
+    assert.equal(nameOf(valve), WIRE_RENAMED, "the rename is put back to the name Hydrawise reports now, not the one the valve was created under");
+    assert.equal(logCount(h.entries, "info", RESTORED_LINE), 1, "in one line");
+  });
+
+  test("a rename made in the Home app after a facts arrival and before the next poll is put back to the name the last pass wrote", async (t) => {
+
+    // The account's longer name arrives between polls, so a watch composing its name at the rename would put the valve back under a name no pass has written.
+    const h = buildController({ hasV2Client: true, program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }),
+      signalAborted: false, userOptions: [SYNC_NAME_ON] });
+
+    t.after(() => h.abort());
+
+    const valve = await valveOf(h);
+
+    await pollPast(h);
+
+    const polls = pollsBegun(h);
+
+    h.controller.applyFacts({ facts: v2Facts(ACCOUNT_NAME), fetchedAt: nowSeconds() });
+    await renameInHomeApp(valve, HOME_APP_NAME);
+
+    const name = nameOf(valve);
+    const begun = pollsBegun(h);
+
+    await h.abort();
+
+    assert.equal(begun, polls, "no poll ran across the facts arrival and the rename");
+    assert.equal(name, WIRE_NAME, "the restore writes the name the last pass wrote, not one composed from the newer facts");
+  });
+
+  test("a rename of the controller's tile made after a facts arrival and before the next poll is put back to the name the last pass wrote", async (t) => {
+
+    // The account's name for the controller arrives between polls, so a watch composing the controller's name at the rename would put the tile back under a name
+    // no pass has written.
+    const h = buildController({ hasV2Client: true, program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }),
+      signalAborted: false, userOptions: [SYNC_NAME_ON] });
+
+    t.after(() => h.abort());
+
+    await valveOf(h);
+    await pollPast(h);
+
+    const polls = pollsBegun(h);
+
+    h.controller.applyFacts({ facts: controllerV2Facts(CONTROLLER_ACCOUNT_NAME), fetchedAt: nowSeconds() });
+    await renameInHomeApp(informationOf(h), HOME_APP_NAME);
+
+    const name = nameOf(informationOf(h));
+    const begun = pollsBegun(h);
+
+    await h.abort();
+
+    assert.equal(begun, polls, "no poll ran across the facts arrival and the rename");
+    assert.equal(name, CONTROLLER_WIRE_NAME, "the restore writes the name the last pass wrote, not one composed from the newer facts");
+  });
+
+  test("with neither a Name nor SyncName set, a rename made in the Home app stands at once and across polls, and nothing is put back", async (t) => {
+
+    /* The default: the user owns every name, so no surface carries a watch and no pass writes over a rename. The controller accessory is seeded as an earlier
+     * session that owned its name left it, so its information service carries the ConfiguredName the Home app writes, and the controller's setup keeps it as it
+     * stands, while the zone's own accessory gains one at its first binding.
+     */
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }),
+      seedContext: (seed) => setAccessoryName(seed, CONTROLLER_WIRE_NAME), signalAborted: false,
+      userOptions: [ STANDALONE_ON, SUSPEND_ZONE_ON, "Enable.Device.Suspend.All" ] });
+
+    t.after(() => h.abort());
+
+    const host = await waitFor(() => h.zoneAccessories.get(ZONE_RELAY_ID), { description: "the zone's own accessory to appear" });
+
+    await pollPast(h);
+
+    const surfaces = [ informationOf(h), suspendSwitchOf(h), present(host.getServiceById(Service.Valve, ZONE_SUBTYPE), "the zone's own valve"),
+      present(host.getServiceById(Service.Switch, ZONE_SUSPEND_SUBTYPE), "the zone's own switch"),
+      present(host.getService(Service.AccessoryInformation), "the zone accessory's information service") ];
+
+    for(const service of surfaces) {
+
+      // eslint-disable-next-line no-await-in-loop
+      await renameInHomeApp(service, HOME_APP_NAME);
+    }
+
+    assert.ok(surfaces.every(service => nameOf(service) === HOME_APP_NAME), "every rename stands once the turn a restore would take has passed");
+
+    await pollPast(h);
+    await pollPast(h);
+    await h.abort();
+
+    assert.ok(surfaces.every(service => nameOf(service) === HOME_APP_NAME), "and stands across the polls after it");
+    assert.equal(logCount(h.entries, "info", RESTORED_LINE), 0, "and nothing is put back");
+  });
+
+  test("after two polls, every surface the plugin owns carries one watch, and the irrigation system and its service label carry none", async (t) => {
+
+    // A pass that registered without letting go of the last pass's watches would leave a second watch on each surface here.
+    const h = buildOwningEverything();
+
+    t.after(() => h.abort());
+
+    await waitFor(() => h.zoneAccessories.get(ZONE_RELAY_ID), { description: "the zone's own accessory to appear" });
+    await pollPast(h);
+    await pollPast(h);
+
+    for(const { label, service } of renameableSurfaces(h)) {
+
+      assert.equal(listenersOn(service), UNWATCHED_LISTENERS + 1, label + " carries one watch");
+    }
+
+    assert.equal(listenersOn(irrigationOf(h)), UNWATCHED_LISTENERS, "the irrigation system, which carries Name alone, carries no watch");
+    assert.equal(listenersOn(present(h.accessory.getService(Service.ServiceLabel), "the service label")), UNWATCHED_LISTENERS,
+      "and the service label, which carries no name characteristic, carries none");
+  });
+
+  test("a surface the user owns carries no watch, the valves, the switches and the information services alike", async (t) => {
+
+    const h = buildOwningEverything({ userOptions: [ STANDALONE_ON, SUSPEND_ZONE_ON, "Enable.Device.Suspend.All" ] });
+
+    t.after(() => h.abort());
+
+    await waitFor(() => h.zoneAccessories.get(ZONE_RELAY_ID), { description: "the zone's own accessory to appear" });
+    await pollPast(h);
+    await pollPast(h);
+
+    for(const { label, service } of renameableSurfaces(h)) {
+
+      assert.equal(listenersOn(service), UNWATCHED_LISTENERS, label + " carries no watch");
+    }
+  });
+
+  test("a zone disabled mid-run lets go of its valve's and its switch's watches with the poll that removes them", async (t) => {
+
+    // HAP strips every listener off a service it removes, so the registrations the platform signal holds are where a watch left behind would show.
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }), signalAborted: false,
+      userOptions: [ SYNC_NAME_ON, SUSPEND_ZONE_ON ] });
+
+    t.after(() => h.abort());
+
+    await valveOf(h);
+    await pollsCompleted(h, pollsBegun(h));
+
+    const watched = signalRegistrations(h);
+
+    h.platform.featureOptions.configuredOptions = [ SYNC_NAME_ON, SUSPEND_ZONE_ON, "Disable.Device." + ZONE_SUBTYPE ];
+
+    await pollsCompleted(h, pollsBegun(h) + 1);
+
+    assert.equal(h.accessory.getServiceById(Service.Valve, ZONE_SUBTYPE), undefined, "the poll removed the disabled zone's valve");
+    assert.equal(h.accessory.getServiceById(Service.Switch, ZONE_SUSPEND_SUBTYPE), undefined, "and its companion switch");
+    assert.equal(signalRegistrations(h), watched - 2, "and each released its watch's registration on the platform signal");
+  });
+
+  test("a zone the wire stops reporting lets go of its valve's and its switch's watches with the poll that removes them", async (t) => {
+
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: zonesSchedule([ zone(WIRE_NAME), secondZone() ]), kind: "response" }),
+      signalAborted: false, userOptions: [ SYNC_NAME_ON, SUSPEND_ZONE_ON ] });
+
+    t.after(() => h.abort());
+
+    await valveOf(h);
+    await pollsCompleted(h, pollsBegun(h));
+
+    const watched = signalRegistrations(h);
+
+    h.retrieve.programDefault("statusschedule.php", { body: zonesSchedule([secondZone()]), kind: "response" });
+
+    await pollsCompleted(h, pollsBegun(h) + 1);
+
+    assert.equal(h.accessory.getServiceById(Service.Valve, ZONE_SUBTYPE), undefined, "the poll removed the vanished zone's valve");
+    assert.equal(h.accessory.getServiceById(Service.Switch, ZONE_SUSPEND_SUBTYPE), undefined, "and its companion switch");
+    assert.equal(signalRegistrations(h), watched - 2, "and each released its watch's registration on the platform signal");
+  });
+
+  for(const { label, sweep } of [ { label: "its option is turned off", sweep: (h: BuildControllerResult): void => {
+
+    h.platform.featureOptions.configuredOptions = [SYNC_NAME_ON];
+  } }, { label: "the account credentials go", sweep: (h: BuildControllerResult): void => {
+
+    h.platform.hasV2Client = false;
+  } } ]) {
+
+    test("a companion switch swept when " + label + " lets go of its watch with the poll that removes it", async (t) => {
+
+      const h = buildController({ hasV2Client: true,
+        program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }), signalAborted: false,
+        userOptions: [ SYNC_NAME_ON, SUSPEND_ZONE_ON ] });
+
+      t.after(() => h.abort());
+
+      await waitFor(() => h.accessory.getServiceById(Service.Switch, ZONE_SUSPEND_SUBTYPE), { description: "the zone suspension switch to appear" });
+      await pollsCompleted(h, pollsBegun(h));
+
+      const watched = signalRegistrations(h);
+
+      sweep(h);
+
+      await pollsCompleted(h, pollsBegun(h) + 1);
+
+      assert.equal(h.accessory.getServiceById(Service.Switch, ZONE_SUSPEND_SUBTYPE), undefined, "the poll swept the companion switch");
+      assert.equal(listenersOn(await valveOf(h)), UNWATCHED_LISTENERS + 1, "while the valve beside it keeps its watch");
+      assert.equal(signalRegistrations(h), watched - 1, "and the switch released its watch's registration on the platform signal");
+    });
+  }
+
+  test("a zone promoted to its own accessory lets go of its controller-side watches as its own accessory's surfaces take theirs", async (t) => {
+
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }), signalAborted: false,
+      userOptions: [ SYNC_NAME_ON, SUSPEND_ZONE_ON ] });
+
+    t.after(() => h.abort());
+
+    await waitFor(() => h.accessory.getServiceById(Service.Switch, ZONE_SUSPEND_SUBTYPE), { description: "the zone suspension switch to appear" });
+    await pollsCompleted(h, pollsBegun(h));
+
+    const watched = signalRegistrations(h);
+
+    h.platform.featureOptions.configuredOptions = [ SYNC_NAME_ON, SUSPEND_ZONE_ON, STANDALONE_ON ];
+
+    await pollsCompleted(h, pollsBegun(h) + 1);
+
+    const host = present(h.zoneAccessories.get(ZONE_RELAY_ID), "the zone's own accessory");
+
+    assert.equal(h.accessory.getServiceById(Service.Valve, ZONE_SUBTYPE), undefined, "the poll removed the controller-side valve");
+    assert.equal(h.accessory.getServiceById(Service.Switch, ZONE_SUSPEND_SUBTYPE), undefined, "and the controller-side switch");
+
+    for(const service of [ host.getServiceById(Service.Valve, ZONE_SUBTYPE), host.getServiceById(Service.Switch, ZONE_SUSPEND_SUBTYPE),
+      host.getService(Service.AccessoryInformation) ]) {
+
+      assert.equal(listenersOn(present(service, "a surface of the zone's own accessory")), UNWATCHED_LISTENERS + 1, "each of the zone's own surfaces carries one watch");
+    }
+
+    assert.equal(signalRegistrations(h), watched + 1, "so the controller side's two registrations went as the zone accessory's three arrived");
+  });
+
+  test("a zone returned to the controller accessory leaves its own accessory's surfaces unwatched as the controller-side ones take theirs", async (t) => {
+
+    // The platform unregisters the zone's own accessory rather than removing its services one by one, and HAP strips nothing off a service on unregistration, so
+    // those services' own listener counts are where a watch left behind would show.
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }), signalAborted: false,
+      userOptions: [ SYNC_NAME_ON, SUSPEND_ZONE_ON, STANDALONE_ON ] });
+
+    t.after(() => h.abort());
+
+    const host = await waitFor(() => h.zoneAccessories.get(ZONE_RELAY_ID), { description: "the zone's own accessory to appear" });
+
+    await pollsCompleted(h, pollsBegun(h));
+
+    const surfaces = [ host.getServiceById(Service.Valve, ZONE_SUBTYPE), host.getServiceById(Service.Switch, ZONE_SUSPEND_SUBTYPE),
+      host.getService(Service.AccessoryInformation) ].map(service => present(service, "a surface of the zone's own accessory"));
+
+    assert.ok(surfaces.every(service => listenersOn(service) === (UNWATCHED_LISTENERS + 1)), "precondition: each of the zone's own surfaces carries one watch");
+
+    const watched = signalRegistrations(h);
+
+    h.platform.featureOptions.configuredOptions = [ SYNC_NAME_ON, SUSPEND_ZONE_ON ];
+
+    await pollsCompleted(h, pollsBegun(h) + 1);
+
+    assert.equal(h.zoneAccessories.has(ZONE_RELAY_ID), false, "the zone's own accessory is gone");
+    assert.ok(surfaces.every(service => listenersOn(service) === UNWATCHED_LISTENERS), "and none of its surfaces keeps a watch");
+    assert.equal(listenersOn(await valveOf(h)), UNWATCHED_LISTENERS + 1, "while the valve the controller accessory hosts again carries one");
+    assert.equal(signalRegistrations(h), watched - 1, "so the zone accessory's three registrations went as the controller side's two arrived");
+  });
+
+  test("a zone's own accessory held while the wire leaves its zone out keeps no watch, so its removal at the grace's end has none to let go", async (t) => {
+
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: zonesSchedule([ zone(WIRE_NAME), secondZone() ]), kind: "response" }),
+      signalAborted: false, userOptions: [ SYNC_NAME_ON, SUSPEND_ZONE_ON, STANDALONE_ON ] });
+
+    t.after(() => h.abort());
+
+    const host = await waitFor(() => h.zoneAccessories.get(ZONE_RELAY_ID), { description: "the zone's own accessory to appear" });
+
+    await pollsCompleted(h, pollsBegun(h));
+
+    const surfaces = [ host.getServiceById(Service.Valve, ZONE_SUBTYPE), host.getServiceById(Service.Switch, ZONE_SUSPEND_SUBTYPE),
+      host.getService(Service.AccessoryInformation) ].map(service => present(service, "a surface of the zone's own accessory"));
+    const watched = signalRegistrations(h);
+
+    h.retrieve.programDefault("statusschedule.php", { body: zonesSchedule([secondZone()]), kind: "response" });
+
+    await pollsCompleted(h, pollsBegun(h) + 1);
+
+    assert.equal(h.zoneAccessories.get(ZONE_RELAY_ID), host, "the zone's own accessory is held, as the platform holds it through its grace");
+    assert.ok(surfaces.every(service => listenersOn(service) === UNWATCHED_LISTENERS), "and none of its surfaces keeps a watch from the first poll that leaves it out");
+    assert.equal(signalRegistrations(h), watched - 3, "so its three registrations went with that poll");
+  });
+
+  test("a zone whose own accessory fails to set up leaves that accessory's surfaces unwatched as the controller-side ones take theirs", async (t) => {
+
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }), signalAborted: false,
+      userOptions: [ SYNC_NAME_ON, SUSPEND_ZONE_ON, STANDALONE_ON ] });
+
+    t.after(() => h.abort());
+
+    const host = await waitFor(() => h.zoneAccessories.get(ZONE_RELAY_ID), { description: "the zone's own accessory to appear" });
+
+    await pollsCompleted(h, pollsBegun(h));
+
+    const surfaces = [ host.getServiceById(Service.Valve, ZONE_SUBTYPE), host.getServiceById(Service.Switch, ZONE_SUSPEND_SUBTYPE),
+      host.getService(Service.AccessoryInformation) ].map(service => present(service, "a surface of the zone's own accessory"));
+    const watched = signalRegistrations(h);
+    const reconcile = h.platform.reconcileZoneAccessories;
+
+    // The platform answers a zone whose setup failed by leaving it out of the hosting map, which keeps its accessory registered and unhosted for the poll.
+    h.platform.reconcileZoneAccessories = (request): Map<number, HydrawiseAccessory> => {
+
+      const hosts = reconcile(request);
+
+      hosts.delete(ZONE_RELAY_ID);
+
+      return hosts;
+    };
+
+    await pollsCompleted(h, pollsBegun(h) + 1);
+
+    assert.ok(surfaces.every(service => listenersOn(service) === UNWATCHED_LISTENERS), "none of the unhosted accessory's surfaces keeps a watch");
+    assert.equal(listenersOn(await valveOf(h)), UNWATCHED_LISTENERS + 1, "while the valve the controller accessory hosts for the poll carries one");
+    assert.equal(signalRegistrations(h), watched - 1, "so the unhosted accessory's three registrations went as the controller side's two arrived");
   });
 });

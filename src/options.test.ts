@@ -76,7 +76,7 @@ describe("hydrawise feature options", () => {
     assert.equal(name.defaultValue, "", "the name option is value-centric and defaults to empty, which the runtime reads as no override");
     assert.equal(suspend.default, false, "the suspend switch defaults to disabled");
     assert.equal(suspendZone.default, false, "the per-zone suspension switches default to disabled");
-    assert.equal(syncName.default, true, "name synchronization defaults to enabled");
+    assert.equal(syncName.default, false, "name synchronization defaults to disabled, so a zone's or a controller's name is the user's and a Home app rename stands");
     assert.equal(logZone.default, true, "zone logging defaults to enabled");
 
     /* The account login is a prose requirement rather than a gate - no mechanism withholds this option from an install without credentials - so the description

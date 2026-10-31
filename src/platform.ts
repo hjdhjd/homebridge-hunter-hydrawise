@@ -733,7 +733,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
      * where HomeKit can carry that, and the controller word otherwise, so the mint never meets HAP's refusal of an empty name and discovery goes on to every later
      * controller. The mint says nothing about a fallback, because the controller's own services decide that warning once it is built. A cached accessory keeps
      * whatever display name it came back with, because discovery leaves a cached name to the poll's rename step, where the naming rule decides: a set Name applies
-     * there, and with none, a synchronization opt-out keeps the user's name.
+     * there, with none synchronization applies the name Hydrawise reports, and with neither the user's name stands.
      *
      * The read presents the serial and nothing else, which is the single-id rule every runtime reader of this option keeps: the option resolves at the controller
      * and the zone alike, so a read carrying a second id would answer with something written for another scope.
@@ -758,10 +758,10 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     return this.configuredDevices[uuid];
   }
 
-  /* The one creation path for every accessory this platform registers: construct it, register it with Homebridge, and track it. Every creation cadence -
-   * discovery-time controller accessories and poll-time standalone zone accessories alike - lands here, so the registration and the tracked array can never
-   * disagree about what exists. The category is optional: a controller accessory takes the PlatformAccessory constructor's own default, while a zone accessory
-   * declares itself a sprinkler so the Home app renders a lone valve correctly.
+  /* The one creation path for every accessory this platform registers: construct it under its display name, register it with Homebridge, and track it. Every
+   * creation cadence - discovery-time controller accessories and poll-time standalone zone accessories alike - lands here, so the registration and the tracked
+   * array can never disagree about what exists. The category is optional: a controller accessory takes the PlatformAccessory constructor's own default, while a
+   * zone accessory declares itself a sprinkler so the Home app renders a lone valve correctly.
    */
   private addAccessory(displayName: string, uuid: string, category?: Categories): HydrawiseAccessory {
 
@@ -806,8 +806,8 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
    * HomeKit identity the user placed in a room.
    *
    * Every arm's cache write is strictly on-change. A demotion unregisters its accessory, which has Homebridge write its cache, while a creation or a context
-   * refresh marks just its accessory for the platform's save window. A poll on which a zone is renamed on the wire marks the same accessory here and again for
-   * the controller's own accessory-name write, and the window carries the marks as one save.
+   * refresh marks just its accessory for the platform's save window. A poll on which a zone is renamed on the wire marks the same accessory here and, where the
+   * plugin owns the zone's name, again for the controller's own accessory-name write, and the window carries the marks as one save.
    *
    * This method never touches a service: what lands on a hosted accessory is the controller's business.
    *

@@ -31,7 +31,7 @@ I've developed a full-featured Homebridge plugin that enables the following feat
   * Suspend watering across your entire controller from a single switch in HomeKit.
   * Display when your irrigation system is off due to a rain sensor preventing watering (the irrigation system will show as *off* in HomeKit).
   * Show, at a glance, all the zones that are queued up to run in the next 60 minutes on your controller (each individual zone will appear active in HomeKit when it's queued to run).
-  * Name your zones and controllers whatever you like, with names synchronized to HomeKit automatically.
+  * Name your zones and controllers whatever you like, in the Home app or in the plugin's settings, and keep them in step with Hydrawise's names when you choose to.
   * Expose any zone as its own standalone HomeKit accessory, assignable to any room in your home.
   * Optional enhanced features when you sign in with your Hydrawise account: accurate rain and suspension state for every zone, a suspend switch for each individual zone, the full zone and controller names your account carries, whether each controller is reachable, and each controller's real model and firmware.
   * A rich webUI for configuration that shows zone and controller schedule status at a glance.

@@ -350,11 +350,12 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
       let accessory = zoneAccessories.get(zone.identity.relayId);
 
       // The display name is sanitized on creation and the UUID derived from the compound identity, exactly as the production reconcile mints them, so a test
-      // measuring name-synchronization writes sees the same starting state the real platform would hand the controller.
+      // measuring name writes sees the same starting state the real platform would hand the controller, whose first binding gives the tile its ConfiguredName.
       if(!accessory) {
 
-        accessory = new api.platformAccessory(sanitizeName(zone.displayName), api.hap.uuid.generate(zoneAccessoryId(request.controller.controller_id,
-          zone.identity.relayId)));
+        const displayName = sanitizeName(zone.displayName);
+
+        accessory = new api.platformAccessory(displayName, api.hap.uuid.generate(zoneAccessoryId(request.controller.controller_id, zone.identity.relayId)));
 
         api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
       }
@@ -455,6 +456,10 @@ export interface BuildControllerResult extends MakeTestPlatformResult {
  * doubles to the production constructor's parameter types; everything the controller then does runs the real production code against the doubles. Returns
  * the constructed controller plus every handle a test asserts on: the accessory (to read services, characteristics and the changes HAP raised on them), the
  * capture buffers, the recording MQTT double, and the retrieve recorder.
+ *
+ * The controller accessory is minted as the platform mints one, under its display name alone, so its information service carries no ConfiguredName until the
+ * controller's setup gives it one at construction, from the name the service carries, and that add is a save of its own ahead of the first poll's. A seeded
+ * accessory keeps whatever ConfiguredName its seed wrote.
  */
 export function buildController(options: BuildControllerOptions = {}): BuildControllerResult {
 

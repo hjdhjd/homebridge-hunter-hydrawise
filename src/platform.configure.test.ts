@@ -86,8 +86,7 @@ describe("HydrawisePlatform configure", () => {
 
   test("registers a fresh accessory under the user's configured name", async (t) => {
 
-    /* Discovery mints the accessory's display name, so it is the only cadence that can establish it - a synchronization opt-out means the runtime never renames
-     * the accessory afterwards, and the configured name would otherwise be unreachable for the life of that accessory.
+    /* Discovery mints the accessory's display name, so a fresh accessory is born under the configured truth rather than renamed to it a poll later.
      *
      * The read presents the serial alone, which is the single-id rule every runtime reader of this option keeps.
      */
@@ -102,6 +101,28 @@ describe("HydrawisePlatform configure", () => {
     await waitUntil(() => registered().length >= 1, { description: "the first accessory registration" });
 
     assert.equal(registered()[0]?.displayName, "Garden Controller", "a fresh accessory carries the name the user configured rather than the wire's");
+  });
+
+  test("a fresh controller accessory's information service carries its name as the ConfiguredName a Home app rename writes once its controller is set up", async (t) => {
+
+    /* HAP gives a new accessory's information service its Name alone, which the Home app cannot write, and the platform mints the accessory under its display
+     * name alone, so the ConfiguredName is the one the controller's setup adds at construction, which discovery runs straight after the mint. Neither a Name nor
+     * synchronization is set here, so no pass writes the controller's names, and the characteristic the row reads can only be the setup's.
+     */
+    const { emit, registered } = buildPlatform();
+
+    t.after(() => emit(SHUTDOWN));
+    await using dispatcher = installMockDispatcher();
+    programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
+    programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
+
+    emit(DID_FINISH_LAUNCHING);
+    await waitUntil(() => registered().length >= 1, { description: "the first accessory registration" });
+
+    const information = present(registered()[0]?.getService(Service.AccessoryInformation), "the fresh accessory's information service");
+
+    assert.equal(information.testCharacteristic(Characteristic.ConfiguredName), true, "the set-up information service carries a ConfiguredName");
+    assert.equal(information.getCharacteristic(Characteristic.ConfiguredName).value, registered()[0]?.displayName, "and it carries the accessory's name");
   });
 
   test("mints a controller whose name HomeKit cannot carry under the controller word, and goes on to configure every controller after it", async (t) => {

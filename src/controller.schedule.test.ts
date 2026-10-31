@@ -295,7 +295,7 @@ describe("HydrawiseController schedule persistence (poll)", () => {
 
     const persisted = scheduleOf(h.accessory);
 
-    assert.equal(h.flushes().length, 1, "the roster seed and the schedule seed share one flush, and the unchanged second poll adds none");
+    assert.equal(h.flushes().length, 2, "beside construction's flush, the roster seed and the schedule seed share one, and the unchanged second poll adds none");
     assert.equal(persisted.zones.length, normalZoneMatrix.length, "the projection carries every reported zone");
     assert.equal(persisted.asOf, normalSchedule().time, "the seeded projection carries the wire's root time");
   });
@@ -307,7 +307,8 @@ describe("HydrawiseController schedule persistence (poll)", () => {
 
     t.after(() => h.abort());
 
-    await waitUntil(() => h.flushes().length >= 1, { description: "the first accessory flush" });
+    // Construction saves the ConfiguredName the controller's setup adds before any poll, so the first poll's save is the second.
+    await waitUntil(() => h.flushes().length >= 2, { description: "the first poll's accessory flush, after construction's" });
 
     // The projection takes no feature parameter and structurally cannot exclude a zone, so this assertion guards a future writer who threads the enabled-zone set into
     // it rather than distinguishing what the code does today.
@@ -328,8 +329,8 @@ describe("HydrawiseController schedule persistence (poll)", () => {
     await h.abort();
 
     // The two wire bodies genuinely differ - the root clock advanced and every countdown fell - yet they describe the same scheduled instants, so the change gate
-    // takes its no-change return and the seed remains the only flush of the run.
-    assert.equal(h.flushes().length, 1, "a poll whose facts did not move costs no cache write, however far the wire's countdowns fell");
+    // takes its no-change return and the seed remains the run's only flush beside construction's.
+    assert.equal(h.flushes().length, 2, "a poll whose facts did not move costs no cache write, however far the wire's countdowns fell");
     assert.equal(scheduleOf(h.accessory).asOf, ROOT_TIME, "asOf holds at the poll that last changed the facts rather than tracking the wire clock");
   });
 
@@ -348,7 +349,7 @@ describe("HydrawiseController schedule persistence (poll)", () => {
 
     const persisted = expectAt(scheduleOf(h.accessory).zones, 0, "zone");
 
-    assert.equal(h.flushes().length, 1, "a running zone whose remaining time fell in lockstep with the clock costs no cache write");
+    assert.equal(h.flushes().length, 2, "beside construction's and the seed's flushes, a running zone whose remaining time fell in lockstep with the clock costs none");
     assert.deepEqual(persisted, { endsAt: ROOT_TIME + 600, relayId: ALPHA_RELAY_ID, state: "running" },
       "the stored fact is the end instant, which held across both polls");
   });
@@ -375,7 +376,7 @@ describe("HydrawiseController schedule persistence (poll)", () => {
     const persisted = scheduleOf(h.accessory);
     const alpha = expectAt(persisted.zones, 0, "zone");
 
-    assert.equal(h.flushes().length, 2, "the seed flushes once and the moved schedule flushes once");
+    assert.equal(h.flushes().length, 3, "construction flushes once, the seed once and the moved schedule once");
     assert.deepEqual(alpha, { durationSeconds: 480, nextRunAt: ROOT_TIME + 68000 - POLL_STEP, relayId: ALPHA_RELAY_ID, state: "scheduled" },
       "the persisted next run adopted the moved instant");
     assert.equal(persisted.asOf, ROOT_TIME + POLL_STEP, "asOf advanced to the root time of the poll that moved the facts");
@@ -399,7 +400,7 @@ describe("HydrawiseController schedule persistence (poll)", () => {
 
     // The two projections carry the same zone count and the same schedule facts at every index but one, so a comparison that stopped at the length - or that
     // compared only the arm's own facts without the relay id - would call these equal and never write the swap.
-    assert.equal(h.flushes().length, 2, "the seed flushes once and the swapped zone flushes once");
+    assert.equal(h.flushes().length, 3, "construction flushes once, the seed once and the swapped zone once");
     assert.deepEqual(scheduleOf(h.accessory).zones.map(zone => zone.relayId), [ ALPHA_RELAY_ID, 700003 ], "the persisted projection adopted the swapped zone");
   });
 

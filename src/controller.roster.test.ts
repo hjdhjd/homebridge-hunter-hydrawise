@@ -88,7 +88,8 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
 
     t.after(() => h.abort());
 
-    await waitUntil(() => h.flushes().length >= 1, { description: "the first accessory flush" });
+    // Construction saves the ConfiguredName the controller's setup adds before any poll, so the first poll's save is the second.
+    await waitUntil(() => h.flushes().length >= 2, { description: "the first poll's accessory flush, after construction's" });
 
     const zones = contextOf(h.accessory).zones;
 
@@ -107,12 +108,13 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
 
     t.after(() => h.abort());
 
-    // Poll 1 seeds the roster from the empty seed and flushes once; every later poll reports the identical set. Bounding on the third call guarantees poll 2 fully
-    // ran its field-wise comparison before we read, so a single flush proves the unchanged poll took the no-change return.
+    // Construction saves the ConfiguredName the controller's setup adds, poll 1 seeds the roster from the empty seed and flushes once, and every later poll reports
+    // the identical set. Bounding on the third call guarantees poll 2 fully ran its field-wise comparison before we read, so no flush past construction's and
+    // poll 1's proves the unchanged poll took the no-change return.
     await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 3, { description: "the third status poll" });
     await h.abort();
 
-    assert.equal(h.flushes().length, 1, "only the first poll flushes; an unchanged poll does not re-flush");
+    assert.equal(h.flushes().length, 2, "only construction and the first poll flush; an unchanged poll does not re-flush");
   });
 
   test("the schedule seed and a zone rename each flush exactly once", async (t) => {
@@ -120,20 +122,22 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
     const alpha = makeZone({ name: "Alpha", relay: 1, relay_id: 700001, run: 480, time: 68000, timestr: "16:00" });
     const beta = makeZone({ name: "Beta", relay: 1, relay_id: 700001, run: 480, time: 68000, timestr: "16:00" });
 
-    // Seed the context with the pre-rename roster so poll 1's roster matches: that poll's one save carries the schedule seed and the valve it attaches, and the
-    // rename is then the run's only other save.
+    // Seed the context with the pre-rename roster so poll 1's roster matches: that poll's one save carries the schedule seed and the valve it attaches, and beside
+    // construction's save of the ConfiguredName the controller's setup adds, the rename is then the run's only other save. Synchronization is on, so the rename
+    // moves the valve's name too, and that write joins the roster's one save.
     const h = buildController({ program: (recorder) => {
 
       recorder.program("statusschedule.php", { body: schedule([alpha]), kind: "response" });
       recorder.programDefault("statusschedule.php", { body: schedule([beta]), kind: "response" });
-    }, seedContext: (seed) => { seed.context = { zones: zoneRoster([alpha]) }; }, signalAborted: false });
+    }, seedContext: (seed) => { seed.context = { zones: zoneRoster([alpha]) }; }, signalAborted: false, userOptions: ["Enable.Device.SyncName"] });
 
     t.after(() => h.abort());
 
     await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 3, { description: "the third status poll" });
     await h.abort();
 
-    assert.equal(h.flushes().length, 2, "the matching first poll saves once for the schedule seed and its valve; the rename then saves exactly once");
+    assert.equal(h.flushes().length, 3,
+      "construction saves once, the matching first poll saves once for the schedule seed and its valve, and the rename then saves exactly once");
     assert.equal(expectAt(contextOf(h.accessory).zones ?? [], 0, "zone").name, "Beta", "the persisted roster adopted the renamed zone");
   });
 
@@ -142,8 +146,8 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
     const first = makeZone({ name: "First", relay: 1, relay_id: 700001, run: 480, time: 68000, timestr: "16:00" });
     const second = makeZone({ name: "Second", relay: 2, relay_id: 700002, run: 480, time: 68000, timestr: "16:00" });
 
-    // Seed the context with both zones so poll 1's roster matches: that poll's one save carries the schedule seed and the valves it attaches, and the second
-    // zone's disappearance is then the run's only other save.
+    // Seed the context with both zones so poll 1's roster matches: that poll's one save carries the schedule seed and the valves it attaches, and beside
+    // construction's save of the ConfiguredName the controller's setup adds, the second zone's disappearance is then the run's only other save.
     const h = buildController({ program: (recorder) => {
 
       recorder.program("statusschedule.php", { body: schedule([ first, second ]), kind: "response" });
@@ -155,7 +159,8 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
     await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 3, { description: "the third status poll" });
     await h.abort();
 
-    assert.equal(h.flushes().length, 2, "the matching first poll saves once for the schedule seed and its valves; the vanished zone then saves exactly once");
+    assert.equal(h.flushes().length, 3,
+      "construction saves once, the matching first poll saves once for the schedule seed and its valves, and the vanished zone then saves exactly once");
     assert.equal(contextOf(h.accessory).zones?.length, 1, "the persisted roster dropped the vanished zone");
   });
 
@@ -193,7 +198,8 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
 
     t.after(() => h.abort());
 
-    await waitUntil(() => h.flushes().length >= 1, { description: "the first accessory flush" });
+    // Construction saves the ConfiguredName the controller's setup adds before any poll, so the first poll's save is the second.
+    await waitUntil(() => h.flushes().length >= 2, { description: "the first poll's accessory flush, after construction's" });
 
     const context = contextOf(h.accessory);
     const referenceController: HydrawiseControllerIdentity = { controllerId: 0, name: "", serialNumber: "" };

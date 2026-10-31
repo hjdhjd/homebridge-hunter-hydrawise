@@ -13,7 +13,7 @@ import type { HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
 import { UNSCHEDULED_SENTINEL, bareSensors, rainSensors, syntheticController } from "./api.fixtures.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
-import { loggedAt, present, triggerSet, waitUntil } from "homebridge-plugin-utils/testing";
+import { loggedAt, present, settle, triggerSet, waitUntil } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
 import { getServiceName } from "homebridge-plugin-utils";
 import { zoneAccessoryId } from "./types.ts";
@@ -26,6 +26,9 @@ const HOSTED_SUBTYPE = "700002";
 
 // The option entry that promotes the first zone. Every scenario that wants a standalone zone names this one, so the grammar lives in one place.
 const STANDALONE_ON = "Enable.Device.Standalone." + STANDALONE_SUBTYPE;
+
+// Synchronization turned on account-wide, which every row about the zone accessory's name following Hydrawise names for itself.
+const SYNC_NAME_ON = "Enable.Device.SyncName";
 
 /* The wire name of the zone under test carries a character HomeKit disallows, so its raw and sanitized forms are observably different values. Every assertion that
  * asserts on a name states that difference as a precondition, which is what stops the assertion from passing vacuously against an implementation that writes the
@@ -236,6 +239,85 @@ describe("HydrawiseController standalone zones", () => {
       "a zone carries no wire serial, so the accessory takes the controller serial compounded with its relay id");
   });
 
+  test("a zone's own accessory the reconcile mints carries its name as the ConfiguredName a Home app rename writes once its first binding sets it up", async (t) => {
+
+    // The platform mints the accessory under its display name alone, as the harness's reconcile does, so the ConfiguredName is the first binding's, and with
+    // neither a Name nor SyncName set no pass after it writes one.
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php",
+      { body: schedule([standaloneZone()]), kind: "response" }), signalAborted: false, userOptions: [STANDALONE_ON] });
+
+    t.after(() => h.abort());
+
+    await pollsCompleted(h, 1);
+    await h.abort();
+
+    const zoneAccessory = present(h.zoneAccessories.get(STANDALONE_RELAY_ID), "the standalone zone's own accessory");
+    const information = present(zoneAccessory.getService(Service.AccessoryInformation), "the zone accessory's information service");
+
+    assert.equal(information.testCharacteristic(Characteristic.ConfiguredName), true, "the minted accessory's information service carries a ConfiguredName");
+    assert.equal(information.getCharacteristic(Characteristic.ConfiguredName).value, WIRE_NAME_SANITIZED, "and it carries the accessory's name");
+    assert.equal(h.flushes().filter(batch => batch.includes(zoneAccessory)).length, 1, "and the binding's one save carries it, with no save of its own");
+  });
+
+  test("a cached zone accessory whose information service carries no ConfiguredName gains one equal to its Name on its first binding", async (t) => {
+
+    // The accessory comes back from a cache that never carried the characteristic, and with neither a Name nor SyncName set the user owns the zone's name, so the
+    // binding's own setup is the only step that can add it.
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php",
+      { body: schedule([standaloneZone(SCHEDULED)]), kind: "response" }), signalAborted: false, userOptions: [STANDALONE_ON] });
+
+    t.after(() => h.abort());
+
+    // Seeding synchronously here lands ahead of the first poll, because the polling loop's first fetch awaits before any projection runs.
+    const { api } = h.platform;
+    const restored = new api.platformAccessory(WIRE_NAME_SANITIZED, api.hap.uuid.generate(zoneAccessoryId(h.controllerConfig.controller_id, STANDALONE_RELAY_ID)));
+
+    restored.addService(new Service.Valve(WIRE_NAME_SANITIZED, STANDALONE_SUBTYPE));
+    restoreCached(api, restored);
+    h.zoneAccessories.set(STANDALONE_RELAY_ID, restored);
+
+    const information = present(restored.getService(Service.AccessoryInformation), "the cached zone accessory's information service");
+
+    assert.equal(information.testCharacteristic(Characteristic.ConfiguredName), false, "the cached information service carries no ConfiguredName");
+
+    await pollsCompleted(h, 1);
+    await h.abort();
+
+    assert.equal(information.testCharacteristic(Characteristic.ConfiguredName), true, "the first binding adds a ConfiguredName");
+    assert.equal(information.getCharacteristic(Characteristic.ConfiguredName).value, information.getCharacteristic(Characteristic.Name).value,
+      "carrying the name the service's Name holds");
+    assert.equal(information.getCharacteristic(Characteristic.ConfiguredName).value, WIRE_NAME_SANITIZED, "which is the accessory's");
+    assert.equal(h.flushes().filter(batch => batch.includes(restored)).length, 1, "and the binding's one save carries it");
+  });
+
+  test("a cached zone accessory whose ConfiguredName a Home app rename set keeps it through its first binding, its Name untouched", async (t) => {
+
+    // The binding's setup adds a ConfiguredName only where the information service carries none, and with neither a Name nor SyncName set the user owns the
+    // zone's name, so the rename the cache restored, apart from the service's Name, is what the first binding leaves standing.
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php",
+      { body: schedule([standaloneZone(SCHEDULED)]), kind: "response" }), signalAborted: false, userOptions: [STANDALONE_ON] });
+
+    t.after(() => h.abort());
+
+    // Seeding synchronously here lands ahead of the first poll, because the polling loop's first fetch awaits before any projection runs.
+    const { api } = h.platform;
+    const restored = new api.platformAccessory(WIRE_NAME_SANITIZED, api.hap.uuid.generate(zoneAccessoryId(h.controllerConfig.controller_id, STANDALONE_RELAY_ID)));
+
+    restored.addService(new Service.Valve(WIRE_NAME_SANITIZED, STANDALONE_SUBTYPE));
+
+    const information = present(restored.getService(Service.AccessoryInformation), "the cached zone accessory's information service");
+
+    information.getCharacteristic(Characteristic.ConfiguredName).updateValue(HOME_APP_NAME);
+    restoreCached(api, restored);
+    h.zoneAccessories.set(STANDALONE_RELAY_ID, restored);
+
+    await pollsCompleted(h, 1);
+    await h.abort();
+
+    assert.equal(information.getCharacteristic(Characteristic.ConfiguredName).value, HOME_APP_NAME, "the first binding keeps the Home app's ConfiguredName");
+    assert.equal(information.getCharacteristic(Characteristic.Name).value, WIRE_NAME_SANITIZED, "and the Name characteristic keeps the name it carried");
+  });
+
   test("synchronizes the zone accessory's own name on a later poll", async (t) => {
 
     assert.notEqual(WIRE_RENAMED_SANITIZED, WIRE_RENAMED, "the renamed fixture must differ from its sanitized form for the assertions below to mean anything");
@@ -244,7 +326,7 @@ describe("HydrawiseController standalone zones", () => {
 
       recorder.program("statusschedule.php", { body: schedule([standaloneZone()]), kind: "response" });
       recorder.programDefault("statusschedule.php", { body: schedule([standaloneZone({ name: WIRE_RENAMED })]), kind: "response" });
-    }, signalAborted: false, userOptions: [STANDALONE_ON] });
+    }, signalAborted: false, userOptions: [ STANDALONE_ON, SYNC_NAME_ON ] });
 
     t.after(() => h.abort());
     await waitUntil(() => h.zoneAccessories.get(STANDALONE_RELAY_ID)?.displayName === WIRE_RENAMED_SANITIZED,
@@ -267,13 +349,14 @@ describe("HydrawiseController standalone zones", () => {
       "the zone accessory is saved once when it is established and once for the rename, across the run");
   });
 
-  test("re-asserts the zone accessory's own name over a Home app rename of its tile, saving the accessory once", async (t) => {
+  test("puts the zone accessory's own name back at once after a Home app rename of its tile, with no save of the accessory", async (t) => {
 
-    /* The host's own rename measured where nothing else can stand in for it. A Home app rename of the tile writes the accessory's information service and leaves
-     * its valve alone, so the next poll's re-assertion of the accessory's name is the only thing that can mark it.
+    /* The host's own name held where nothing else can stand in for it. A Home app rename of the tile writes the accessory's information service and leaves its
+     * valve alone, and the tile's watch puts the name back on the event loop's next turn, before any poll. A rename made in the Home app never reaches
+     * Homebridge's cache on its own, so the restore leaves the cache already right and saves nothing, and the poll after it finds every name in place.
      */
     const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([standaloneZone()]), kind: "response" }),
-      signalAborted: false, userOptions: [STANDALONE_ON] });
+      signalAborted: false, userOptions: [ STANDALONE_ON, SYNC_NAME_ON ] });
 
     t.after(() => h.abort());
 
@@ -283,14 +366,19 @@ describe("HydrawiseController standalone zones", () => {
     const information = present(zoneAccessory.getService(Service.AccessoryInformation), "the zone accessory's information service");
     const valve = present(zoneAccessory.getServiceById(Service.Valve, STANDALONE_SUBTYPE), "the standalone zone's valve");
     const settled = h.flushes().filter(batch => batch.includes(zoneAccessory)).length;
+    const polls = h.retrieve.callsTo("statusschedule.php").length;
 
     await triggerSet(information.getCharacteristic(Characteristic.ConfiguredName), HOME_APP_NAME);
-    await waitUntil(() => getServiceName(information) === WIRE_NAME_SANITIZED, { description: "the zone accessory's own name to be re-asserted" });
+    await settle();
+
+    assert.equal(h.retrieve.callsTo("statusschedule.php").length, polls, "no poll ran across the rename");
+    assert.equal(getServiceName(information), WIRE_NAME_SANITIZED, "the tile takes the zone accessory's own name back at once");
+
     await pollsCompleted(h, h.retrieve.callsTo("statusschedule.php").length);
     await h.abort();
 
     assert.equal(getServiceName(valve), WIRE_NAME_SANITIZED, "the valve kept its name throughout");
-    assert.equal(h.flushes().filter(batch => batch.includes(zoneAccessory)).length, settled + 1, "the re-assertion saves the zone accessory exactly once");
+    assert.equal(h.flushes().filter(batch => batch.includes(zoneAccessory)).length, settled, "neither the restore nor the poll after it saves the zone accessory");
   });
 
   test("leaves the zone accessory's name alone when synchronization is off", async (t) => {
@@ -408,7 +496,7 @@ describe("HydrawiseController standalone zones", () => {
     assert.equal(h.zoneAccessories.size, 0, "no zone accessory exists");
     assert.ok(h.accessory.getServiceById(Service.Valve, STANDALONE_SUBTYPE), "both zones keep their valves on the controller accessory");
     assert.ok(h.accessory.getServiceById(Service.Valve, HOSTED_SUBTYPE), "both zones keep their valves on the controller accessory");
-    assert.equal(h.flushes().length, 1, "only the first poll's roster seed flushes, exactly as it does without this feature");
+    assert.equal(h.flushes().length, 2, "only construction's ConfiguredName add and the first poll's roster seed flush, exactly as they do without this feature");
     assert.equal(h.controllerConfig.serial_number, syntheticController.serial_number, "the scenario ran against the synthetic controller");
   });
 

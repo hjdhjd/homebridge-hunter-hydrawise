@@ -338,7 +338,7 @@ describe("HydrawiseController per-zone suspension switches", () => {
 
       recorder.program("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" });
       recorder.programDefault("statusschedule.php", { body: schedule([alphaZone({ name: "Alpha North" })]), kind: "response" });
-    }, signalAborted: false, userOptions: [SUSPEND_ZONE_ON] });
+    }, signalAborted: false, userOptions: [ "Enable.Device.SyncName", SUSPEND_ZONE_ON ] });
 
     t.after(() => h.abort());
 
@@ -939,7 +939,7 @@ describe("HydrawiseController suspension commands composed into the projection",
 
     /* The pre-first-poll window, where nothing in this run has reached Hydrawise. The controller cannot vouch for the account-wide switch yet, so the write is
      * refused with the communication failure before the handler runs: no command reaches the wire, no stamp is recorded for a later snapshot to be judged
-     * against, and the accessory cache is not written.
+     * against, and the refused write adds no save to the accessory cache.
      */
     const h = buildController({ hasV2Client: true, program: (recorder) => {
 
@@ -951,12 +951,17 @@ describe("HydrawiseController suspension commands composed into the projection",
     const all = await waitFor(() => suspendSwitch(h.accessory, SUSPEND_ALL_SUBTYPE), { description: "the suspend-all switch to appear" });
     const constructed = all.getCharacteristic(Characteristic.On).value;
 
+    // No poll runs to close the save window, so construction's save of the ConfiguredName the controller's setup adds is read out first, which leaves any save
+    // past it to the refused write alone rather than merged into construction's.
+    const constructionSaves = h.flushes().length;
+
     await assert.rejects(() => triggerSet(all.getCharacteristic(Characteristic.On), !constructed), noResponse, "the write is refused with the communication failure");
 
     assert.equal(h.retrieve.callsTo("setzone.php").length, 0, "no command reaches the wire");
     assert.equal(all.getCharacteristic(Characteristic.On).value, constructed, "the switch keeps the state it was constructed with");
     assert.deepEqual(projectionOf(h), [], "nothing is classified, because no poll has reported a zone to classify");
-    assert.equal(h.flushes().length, 0, "and the accessory cache is not written");
+    assert.equal(constructionSaves, 1, "construction saves the accessory once");
+    assert.equal(h.flushes().length, constructionSaves, "and the refused write adds no save beyond construction's");
   });
 
   test("a command's stamp and a snapshot's stamp read one clock, so the guard holds on a virtual timeline too", async (t) => {

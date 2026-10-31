@@ -113,11 +113,11 @@ const accountOptions: HydrawiseFeatureOption[] = [
 const deviceOptions: HydrawiseFeatureOption[] = [
 
   { default: true, description: "Make this device available in HomeKit.", name: "", scopes: [ "controller", "device", "global" ] },
-  { default: false, defaultValue: "", description: "Custom HomeKit name for this zone or controller. When set to a name HomeKit can use, it always applies, and a rename made in the Home app yields to it. Otherwise, the name reported by Hydrawise is used, and where HomeKit cannot use that either, such as a name of only emoji or punctuation, a zone is named by its number, as in Zone 3, and a controller is named Controller.", inputSize: 30, name: "Name", scopes: [ "controller", "device" ] },
+  { default: false, defaultValue: "", description: "Custom HomeKit name for this zone or controller and its parts. It always applies, so a rename in the Home app yields to it wherever HomeKit allows.", inputSize: 30, name: "Name", scopes: [ "controller", "device" ] },
   { default: false, description: "Expose this zone as its own HomeKit accessory, assignable to any room. Toggling this changes the zone's HomeKit identity, so automations, scenes, and room assignments tied to it must be recreated.", name: "Standalone", scopes: [ "controller", "device", "global" ] },
   { default: false, description: "Enable a switch accessory that suspends and resumes every zone on the controller at once.", name: "Suspend.All", scopes: [ "controller", "global" ] },
   { default: false, description: "Enable a switch accessory that suspends and resumes an individual zone. Requires your Hydrawise account login (enhanced features).", name: "Suspend.Zone", scopes: [ "controller", "device", "global" ] },
-  { default: true, description: "Keep zone and controller names in step with the names Hydrawise reports (Hydrawise → HomeKit) when no Name is set. When disabled, the reported name is set once when its HomeKit service is created, and a rename made in the Home app stands. While enabled, the settings page shows each name as HomeKit carries it.", name: "SyncName", scopes: [ "controller", "device", "global" ] }
+  { default: false, description: "Synchronize the Hydrawise name of this zone or controller and its parts with HomeKit. A rename in the Home app yields to it wherever HomeKit allows. A custom Name takes precedence.", name: "SyncName", scopes: [ "controller", "device", "global" ] }
 ];
 
 // Logging options.
