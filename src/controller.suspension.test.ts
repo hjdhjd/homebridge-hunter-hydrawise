@@ -30,6 +30,7 @@ import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
 import type { BuildControllerResult } from "./testing/platform.helpers.ts";
 import { HydrawiseV2Client } from "./v2.ts";
 import { MockAgent } from "undici";
+import type { TestContext } from "node:test";
 import assert from "node:assert/strict";
 
 const CONTROLLER_SERIAL = "SN0A1B2C3D4";
@@ -1008,6 +1009,105 @@ describe("HydrawiseController suspension commands composed into the projection",
     applyFacts(h, { [ALPHA_RELAY_ID]: false }, now());
 
     assert.equal(entryOf(h)?.state, "unscheduled", "and the first real answer from the account reconciles it");
+  });
+});
+
+describe("HydrawiseController account-reported suspensions reaching their end", () => {
+
+  // The end instant each zone's suspension reports, a little ahead of the wire clock the status bodies here start at.
+  const endsAt = schedule([alphaZone()]).time + 100;
+
+  /* A controller whose sentinel-shape zones the account reports suspended until the end instant, with every surface the suspension reaches switched on: the
+   * per-zone and account-wide switches, zone logging, and MQTT. The facts carry the current instant as their fetch time, so they stay current for every poll
+   * that follows.
+   */
+  async function suspendedUntilEnd(t: TestContext): Promise<BuildControllerResult> {
+
+    const h = buildController({ hasV2Client: true, mqtt: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([ alphaZone(), betaZone() ]), kind: "response" }), signalAborted: false,
+      userOptions: [ SUSPEND_ZONE_ON, SUSPEND_ALL_ON, "Enable.Log.Zone" ] });
+
+    t.after(() => h.abort());
+
+    await waitUntil(() => suspendSwitch(h.accessory, BETA_SWITCH_SUBTYPE) !== undefined, { description: "Bravo's suspension switch to appear" });
+
+    const zones = [ ALPHA_RELAY_ID, BETA_RELAY_ID ].map((relayId): [ number, HydrawiseZoneV2Facts ] => [ relayId, makeZoneV2Facts({ suspendedUntil: endsAt }) ]);
+
+    h.controller.applyFacts({ facts: makeV2Facts({ zones }), fetchedAt: now() });
+
+    return h;
+  }
+
+  // Move the wire clock to the end instant while the facts that reported the suspensions stay current, and wait until a whole poll has run at that instant.
+  async function wireReachesEnd(h: BuildControllerResult): Promise<void> {
+
+    h.retrieve.programDefault("statusschedule.php", { body: { ...schedule([ alphaZone(), betaZone() ]), time: endsAt }, kind: "response" });
+
+    await pollsCompleted(h, h.retrieve.callsTo("statusschedule.php").length + 1);
+  }
+
+  // The zone entries of the latest status payload published on the controller topic.
+  function latestPayload(h: BuildControllerResult): { relay: number; state?: string; suspendedUntil?: number }[] {
+
+    return JSON.parse(String(h.mqtt?.publishedTo("controller").at(-1)?.payload ?? "[]")) as { relay: number; state?: string; suspendedUntil?: number }[];
+  }
+
+  test("a suspension the account reports ends on every surface at the first poll whose wire clock reaches its end", async (t) => {
+
+    /* Facts stay current for their whole lifetime, which can outlast the instant they report, so the end is judged against the wire clock rather than left
+     * standing until the next refresh reports the suspension gone. The poll lands exactly on the end instant, the tightest reading of "passed": a suspension
+     * stands only while its end is still ahead of the wire.
+     */
+    const h = await suspendedUntilEnd(t);
+    const all = await waitFor(() => suspendSwitch(h.accessory, SUSPEND_ALL_SUBTYPE), { description: "the suspend-all switch to appear" });
+
+    assert.deepEqual(entryOf(h), { relayId: ALPHA_RELAY_ID, state: "suspended", until: endsAt }, "a suspension ending ahead of the wire clock stands");
+    assert.equal(readsSuspended(h.accessory), true, "and the zone's switch reads it");
+    assert.equal(all.getCharacteristic(Characteristic.On).value, true, "as does the account-wide switch, with every zone suspended");
+    assert.equal(logCount(h.entries, "info", "Suspended until"), 2, "each zone narrates its suspension once");
+
+    await wireReachesEnd(h);
+
+    assert.deepEqual(projectionOf(h), [ { relayId: ALPHA_RELAY_ID, state: "unscheduled" }, { relayId: BETA_RELAY_ID, state: "unscheduled" } ],
+      "the persisted schedule reads each zone unscheduled, carrying no end instant");
+    assert.equal(readsSuspended(h.accessory), false, "the zone's switch turns off");
+    assert.equal(readsSuspended(h.accessory, BETA_SWITCH_SUBTYPE), false, "and its sibling's with it");
+    assert.equal(all.getCharacteristic(Characteristic.On).value, false, "the account-wide switch turns off");
+    assert.equal(logCount(h.entries, "info", "Suspension lifted."), 2, "each zone narrates the end once");
+    assert.deepEqual(latestPayload(h).map(({ relay, state, suspendedUntil }) => ({ relay, state, suspendedUntil })),
+      [ { relay: 1, state: "unscheduled", suspendedUntil: undefined }, { relay: 2, state: "unscheduled", suspendedUntil: undefined } ],
+      "and the MQTT payload carries each zone's new state with no end instant");
+
+    // A further poll at the same instant finds nothing new to say.
+    await pollsCompleted(h, h.retrieve.callsTo("statusschedule.php").length + 1);
+
+    assert.equal(logCount(h.entries, "info", "Suspension lifted."), 2, "the end is narrated once, not on every poll after it");
+  });
+
+  test("a user's own suspend and resume after the end answer as they would on any zone", async (t) => {
+
+    const h = await suspendedUntilEnd(t);
+
+    await wireReachesEnd(h);
+
+    const service = suspendSwitch(h.accessory);
+
+    assert.ok(service, "the zone keeps its switch");
+
+    // A standing command answers ahead of the facts, so the user's own suspend classifies the zone again and narrates it as a new suspension.
+    await triggerSet(service.getCharacteristic(Characteristic.On), true);
+
+    const entry = entryOf(h);
+
+    assert.equal(entry?.state, "suspended", "the user's suspend composes a suspension over the ended one");
+    assert.ok(entry.until > endsAt, "ending at the instant the command asked for, well past the end the account reported");
+    assert.equal(readsSuspended(h.accessory), true, "the zone's switch turns back on");
+    assert.equal(logCount(h.entries, "info", "Suspended until"), 3, "and the new suspension is narrated beside the two the account reported");
+
+    await triggerSet(service.getCharacteristic(Characteristic.On), false);
+
+    assert.equal(entryOf(h)?.state, "unscheduled", "the user's resume returns the zone to what the wire reports");
+    assert.equal(readsSuspended(h.accessory), false, "and the switch follows it off");
   });
 });
 

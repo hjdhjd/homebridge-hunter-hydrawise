@@ -184,8 +184,8 @@ const classifyZone = (entry: HydrawiseZoneScheduleStatus, meta: HydrawiseSchedul
 };
 
 /* Whether one zone's persisted schedule entry is old enough that the display says so - the one staleness rule the zone panel and the controller fold read,
- * so a zone and the controller above it can never disagree about whether the facts behind them are current. Only a running or a scheduled entry can age: each
- * carries an instant a live runtime would have acted on by now, and it ages against the grace above.
+ * so a zone and the controller above it can never disagree about whether the facts behind them are current. Every entry carrying an instant a live runtime
+ * would have acted on by now can age - a run's end, a run's start, and a suspension's end alike - and each ages against the grace above.
  */
 const isStale = (entry: HydrawiseZoneScheduleStatus, nowSeconds: number): boolean => {
 
@@ -201,10 +201,15 @@ const isStale = (entry: HydrawiseZoneScheduleStatus, nowSeconds: number): boolea
       // A scheduled run whose start instant has passed by more than the grace is the same evidence: a live runtime would have reported the zone running.
       return (nowSeconds - entry.nextRunAt) > STALE_GRACE;
 
+    case "suspended":
+
+      // A standing suspension is the state itself, while one whose end instant has passed by more than the grace is evidence that nothing is polling: a live
+      // runtime would have reported the suspension ended.
+      return (nowSeconds - entry.until) > STALE_GRACE;
+
     default:
 
-      // A suspension still standing is the state itself, not evidence that nothing is polling, and rain delay and the unscheduled state carry no instant to age
-      // against, so none of them is ever stale.
+      // Rain delay and the unscheduled state carry no instant to age against, so neither is ever stale.
       return false;
   }
 };

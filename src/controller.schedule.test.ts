@@ -569,22 +569,35 @@ describe("HydrawiseController schedule classification with account facts", () =>
       "the account API resolves the one shape the key-based wire cannot read");
   });
 
-  test("an absent suspension is told apart from an unknown one, and epoch zero is a real instant", () => {
+  test("a zone the facts do not name, a null suspension and a suspension that ended at epoch zero all classify unscheduled", () => {
 
-    /* Each cell a bare truthiness test would collapse into the same falsy case. Undefined means no facts entry reached this zone at all, null means the
-     * entry reached it and reported no suspension, and zero is a real - if implausible - instant that a truthiness test would silently discard.
+    /* A snapshot carrying no entry for the zone is how no suspension reaches it at all, and a null suspension is an entry that reached it and reported none. Zero
+     * is a real instant the wire clock has long passed, so a suspension reported as ending then has lapsed and classifies with them.
      */
-    const cells = [ { expected: "unscheduled", facts: makeZoneV2Facts({ suspendedUntil: undefined }), label: "an undefined suspension" },
-      { expected: "unscheduled", facts: makeZoneV2Facts({ suspendedUntil: null }), label: "a null suspension" },
-      { expected: "suspended", facts: { name: null, sensorStopped: null, suspendedUntil: 0 }, label: "a suspension at epoch zero" } ];
+    const cells = [ { facts: makeV2Facts({ zones: [] }), label: "a zone the facts do not name" },
+      { facts: makeV2Facts({ zones: [[ ALPHA_RELAY_ID, makeZoneV2Facts({ suspendedUntil: null }) ]] }), label: "a null suspension" },
+      { facts: makeV2Facts({ zones: [[ ALPHA_RELAY_ID, { name: null, sensorStopped: null, suspendedUntil: 0 } ]] }), label: "a suspension at epoch zero" } ];
 
-    for(const { expected, facts, label } of cells) {
+    for(const { facts, label } of cells) {
 
-      const projection = scheduleStatus(schedule([sentinelZone()]), HYDRAWISE_ACTIVE_ZONE_INDICATOR,
-        { facts: makeV2Facts({ zones: [[ ALPHA_RELAY_ID, facts ]] }) });
+      const projection = scheduleStatus(schedule([sentinelZone()]), HYDRAWISE_ACTIVE_ZONE_INDICATOR, { facts });
 
-      assert.equal(projection.zones[0]?.state, expected, label + " classifies as " + expected);
+      assert.equal(projection.zones[0]?.state, "unscheduled", label + " classifies as unscheduled");
     }
+  });
+
+  test("a suspension whose instant the WIRE clock has reached is lapsed, and one second short of it still stands", () => {
+
+    // The facts arm compares against the same wire root time the carry does, so its comparison is held on both sides of the instant, as the sticky suspension
+    // suite holds the carry's.
+    const facts = makeV2Facts({ zones: [[ ALPHA_RELAY_ID, makeZoneV2Facts({ suspendedUntil: SUSPENDED_UNTIL }) ]] });
+    const lapsed = scheduleStatus(schedule([sentinelZone()], bareSensors, SUSPENDED_UNTIL), HYDRAWISE_ACTIVE_ZONE_INDICATOR, { facts });
+
+    assert.equal(lapsed.zones[0]?.state, "unscheduled", "an instant the wire clock has reached no longer suspends the zone");
+
+    const standing = scheduleStatus(schedule([sentinelZone()], bareSensors, SUSPENDED_UNTIL - 1), HYDRAWISE_ACTIVE_ZONE_INDICATOR, { facts });
+
+    assert.equal(standing.zones[0]?.state, "suspended", "and one second short of it still does");
   });
 
   test("a live sensor reporting itself quiet RETIRES the group inference that would have called the zone stopped", () => {

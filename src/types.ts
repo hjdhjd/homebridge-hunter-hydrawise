@@ -639,11 +639,11 @@ export function isZoneStoppedBySensor(zone: HydrawiseZoneConfig, status: StatusS
  * the account has agreed to. Every command reaching here is already known to be STANDING - the caller decides that, which is what keeps this module clock-free.
  *
  * The SENTINEL branch then owns the ambiguous shape, the one body the key-based wire cannot read further, where a suspension, a rain stop, and a plain absence
- * of scheduling look identical. A suspension the facts report wins outright, then a suspension carried forward from the prior projection, then a sensor stop -
- * the facts' own live reading where they carry one, the group inference where they do not - and an unscheduled zone is what remains. A positive "the sensors are
- * quiet" answer is deliberately NOT followed by the group inference: the account API has looked at the sensor itself, which is better evidence than reading the
- * shape of a group. Suspension outranks the sensor claim because it is the longer-lived, user-created fact; the sensor's claim returns on its own the moment the
- * suspension clears.
+ * of scheduling look identical. A suspension the facts report wins first and one carried forward from the prior projection next, each only while its end
+ * instant is still ahead of the wire clock, then a sensor stop - the facts' own live reading where they carry one, the group inference where they do not - and
+ * an unscheduled zone is what remains. A positive "the sensors are quiet" answer is deliberately NOT followed by the group inference: the account API has looked
+ * at the sensor itself, which is better evidence than reading the shape of a group. Suspension outranks the sensor claim because it is the longer-lived,
+ * user-created fact; the sensor's claim returns on its own the moment the suspension clears.
  *
  * A standing RESUME travels the other direction and acts as SUPPRESSION rather than as a claim of its own: it silences both suspension arms inside that branch
  * and lets the zone fall through to the sensor test, because resuming a zone does not call off a rain delay. On any other shape a resume is naturally silent,
@@ -685,9 +685,12 @@ export function zoneScheduleStatus(zone: HydrawiseZoneConfig, status: StatusSche
     // A standing resume silences the two suspension arms below. Reaching here at all means the command was not a suspend, so this is true exactly when one stands.
     const resumed = commanded === null;
 
-    // Both absences are excluded explicitly: an undefined means no facts entry reached this zone at all, and a null means the entry reached it and reported no
-    // suspension. Only a real instant claims the arm, so a zone suspended until epoch zero still classifies as suspended.
-    if(!resumed && (suspendedUntil !== undefined) && (suspendedUntil !== null)) {
+    /* Both absences are excluded explicitly: an undefined means no facts entry reached this zone at all, and a null means the entry reached it and reported no
+     * suspension. A reported instant claims the arm only while it is still ahead of the wire clock, the same comparison the carry below makes: facts stay current
+     * for their whole lifetime, which can outlast the instant they report, so a suspension ends on the first poll that reaches its end rather than standing until
+     * the next refresh says so.
+     */
+    if(!resumed && (suspendedUntil !== undefined) && (suspendedUntil !== null) && (suspendedUntil > status.time)) {
 
       return { relayId: zone.relay_id, state: "suspended", until: suspendedUntil };
     }

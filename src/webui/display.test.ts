@@ -267,8 +267,24 @@ describe("hydrawise webUI suspension and availability display", () => {
     assert.deepEqual(rendering.rows, [ [ "Status", ZONE_STATE_LABELS.suspended ], [ "Until", dateOf(FAR_FUTURE) ] ],
       "a suspended zone shows its state and when it ends");
 
-    // No staleness verdict, mirroring the rain-delay arm: a suspension still standing is the state itself, not evidence that nothing is polling.
+    // A suspension still standing is the state itself, not evidence that nothing is polling, so it reads as current.
     assert.equal(rendering.stale, false, "a standing suspension is never reported as stale facts");
+  });
+
+  test("a suspended zone reads stale only once its end instant passes the grace", () => {
+
+    // A live runtime ends a suspension on the first poll past its end, so one still standing well after it is the same evidence a long-passed run is.
+    assert.equal(deriveZoneDisplay(suspendedEntry(1, NOW - STALE_GRACE), meta(), NOW).stale, false, "an end instant exactly at the grace is not yet stale");
+    assert.equal(deriveZoneDisplay(suspendedEntry(1, (NOW - STALE_GRACE) - 1), meta(), NOW).stale, true, "an end instant one second past the grace is stale");
+  });
+
+  test("a controller reads stale once any suspended zone's end instant passes the grace", () => {
+
+    // The fold holds suspended zones alone, one still standing beside one whose end moves across the grace, so the verdict can come from no other arm.
+    assert.equal(deriveControllerDisplay(projection([ suspendedEntry(1, NOW - STALE_GRACE), suspendedEntry(2, FAR_FUTURE) ]), {}, NOW).stale, false,
+      "an end instant exactly at the grace is not yet stale");
+    assert.equal(deriveControllerDisplay(projection([ suspendedEntry(1, (NOW - STALE_GRACE) - 1), suspendedEntry(2, FAR_FUTURE) ]), {}, NOW).stale, true,
+      "one zone's end instant one second past the grace makes the controller stale");
   });
 
   test("the formatter's third tier renders an instant beyond a week as a locale date", () => {
