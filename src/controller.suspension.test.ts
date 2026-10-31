@@ -562,6 +562,10 @@ describe("HydrawiseController per-zone suspension command guard", () => {
 
     const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
 
+    // The command's stamp and every snapshot stamp below read the host clock, so the clock is frozen before the command and the tie below lands in the command's
+    // own second however long the test takes to reach it.
+    t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+
     await triggerSet(service.getCharacteristic(Characteristic.On), true);
 
     /* A fetch already in flight when the user tapped knows nothing about their command. Letting it answer would flip the switch straight back under their finger,
@@ -744,6 +748,10 @@ describe("HydrawiseController suspension commands composed into the projection",
 
     const publishesBefore = h.mqtt?.published.length ?? 0;
 
+    // The command stamps its instant from the host clock and the assertion below recomputes it, so the clock is frozen first and the stamp and its recomputation
+    // always land in the same second.
+    t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+
     await triggerSet(service.getCharacteristic(Characteristic.On), true);
 
     const entry = entryOf(h);
@@ -907,6 +915,10 @@ describe("HydrawiseController suspension commands composed into the projection",
 
     const flushesBefore = h.flushes().length;
     const publishesBefore = h.mqtt?.published.length ?? 0;
+
+    // Each command below stamps its instant from the host clock, so the clock is frozen first: the second then asks for exactly the instant the first did, which
+    // is what makes it a no-op rather than a later suspension.
+    t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
 
     await triggerSet(service.getCharacteristic(Characteristic.On), true);
 
