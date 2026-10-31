@@ -121,7 +121,7 @@ const getCatalog = () => {
 /* The interpreter every configuration read in this file goes through. It is declared already holding the degraded-mode interpreter, so the binding is never
  * undefined in any window and no consumer needs a guard; the wiring below swaps in the catalog-backed interpreter the moment the catalog is in hand.
  */
-let hydrawiseConfig = makeLegacyHydrawiseConfig();
+let hydrawiseConfig = makeLegacyHydrawiseConfig({ FeatureOptions });
 
 /* The page's naming rule, built once over HBPU's naming functions: every controller and zone name this page shows goes through it, so the page names each as the
  * runtime's composers name it in HomeKit. It needs no catalog, so it is whole from the first render.
@@ -1527,9 +1527,9 @@ const wiringController = new AbortController();
  * and only the save after it is skipped.
  *
  * When the envelope fails, the interpreter settles at whatever the wiring reached. A catalog fetch that never succeeded leaves the degraded-mode interpreter in
- * place, which reads and writes the legacy properties, so the page still loads and first run still works; a migration that stumbled after the catalog arrived
- * keeps the catalog-backed interpreter, because one failed attempt is no reason to degrade every read for the session. The migration itself simply waits for a
- * session whose fetches succeed.
+ * place, which reads through the engine over the account declaration and writes the key to its legacy property, so the page still loads and first run still
+ * works; a migration that stumbled after the catalog arrived keeps the catalog-backed interpreter, because one failed attempt is no reason to degrade every read
+ * for the session. The migration itself simply waits for a session whose fetches succeed.
  */
 const wireHydrawiseConfig = async () => {
 

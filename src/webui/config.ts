@@ -4,7 +4,7 @@
  */
 import type { FeatureCategoryEntry, FeatureOptionEntry, FeatureOptions, displayedName, sanitizeName } from "homebridge-plugin-utils";
 import type { HYDRAWISE_CONTROLLER_FALLBACK_NAME, HYDRAWISE_ZONE_FALLBACK_NAME, controllerDisplayName, zoneDisplayName } from "../types.ts";
-import type { HydrawiseControllerOption, HydrawiseGlobalFlagOption, HydrawiseGlobalValueOption } from "../options.ts";
+import type { HydrawiseControllerOption, HydrawiseFeatureOption, HydrawiseGlobalFlagOption, HydrawiseGlobalValueOption } from "../options.ts";
 
 /* The single home for our plugin-config shape. Every function here is a pure interpreter of the primary platform-config entry the webUI framework injects into
  * our hooks - no I/O, no global reach, and no value imports, so the whole module is testable against the real feature-option engine by handing that engine in.
@@ -25,9 +25,9 @@ import type { HydrawiseControllerOption, HydrawiseGlobalFlagOption, HydrawiseGlo
 export const API_KEY_LENGTH = 19;
 
 /* Every consolidated setting, as the legacy configuration property that carries it paired with the feature option that supersedes it. This pairing is this
- * module's policy knowledge and the one address book both factories below read, so the migration's writes, the interpreters' reads, and the degraded-mode scan
- * can never disagree about where a setting lives. The plugin's runtime names the same option keys in TypeScript, and each name here is tied to the runtime's
- * option unions at compile time through the satisfies clause as well as by the config suite's round trip through a real platform.
+ * module's policy knowledge and the one address book the factories below read, so the migration's writes, the interpreters' reads, and the degraded-mode
+ * declaration can never disagree about where a setting lives. The plugin's runtime names the same option keys in TypeScript, and each name here is tied to the
+ * runtime's option unions at compile time through the satisfies clause as well as by the config suite's round trip through a real platform.
  */
 const CONSOLIDATED_SETTINGS = {
 
@@ -47,12 +47,37 @@ const CREDENTIAL_SETTINGS = {
   username: "Account.Username"
 } satisfies Record<string, HydrawiseGlobalValueOption>;
 
-// The canonical entry prefix the feature-option engine composes for an enabled value option, lowercased because entry matching is case-insensitive. The
-// degraded-mode reader scans every option against this one composition, so each read agrees on the entry form by construction rather than by hand-typed strings.
-const enabledPrefix = (option: string): string => "enable." + option.toLowerCase() + "=";
+/* The account settings as the catalog declares them, which the degraded-mode readers resolve through while no catalog has been served: each a global value
+ * option with an empty registered default and no inline choices. Which entry addresses one of these options turns on its kind and its choices, each stated here
+ * as the catalog states it, and no option here extends another's name, so the readers answer as the catalog-backed ones do over the served catalog. The empty
+ * default is required, not incidental: it is what makes each a value option to the engine, and without it the degraded readers' answers diverge from the
+ * catalog-backed ones. Each option's name comes from the address books above, under the Account category they share, and the config suite's parity row holds the
+ * two to one answer. Since the declaration is read and never rendered, each description is its option's own name.
+ */
+const ACCOUNT_CATALOG: HydrawiseConfigCatalog = {
+
+  categories: [{ description: "Account feature options.", name: "Account" }],
+  options: {
+
+    Account: [ CONSOLIDATED_SETTINGS.apiKey, CREDENTIAL_SETTINGS.password, CREDENTIAL_SETTINGS.username ].map((option): HydrawiseFeatureOption => ({ default: false,
+      defaultValue: "", description: option, name: option.slice(option.indexOf(".") + 1), scopes: ["global"] }))
+  }
+};
 
 // The two action prefixes the entry grammar admits, lowercased for the same case-insensitive matching every other scan here uses.
 const ACTION_PREFIXES = [ "disable.", "enable." ];
+
+/* Whether an entry addresses an option in either action form, with or without a value, matched case-insensitively against the option's name without its value
+ * delimiter, so an entry carrying no value at all is matched beside the ones that do. A write composed by hand drops every entry this names for an option it
+ * writes. The match is broader than the engine's own: an entry whose option name merely starts with this one matches too, which drops nothing a real
+ * configuration carries, because no option in the catalog extends another's name.
+ */
+const addressesOption = (entry: string, option: string): boolean => {
+
+  const lower = entry.toLowerCase();
+
+  return ACTION_PREFIXES.some((action) => lower.startsWith(action + option.toLowerCase()));
+};
 
 /* Feature options this plugin has RETIRED, paired with the name that supersedes each. A configured entry addressing a retired name is rewritten to its
  * replacement once, losslessly, so a user who configured the retired name keeps the behavior they chose without touching their configuration.
@@ -111,7 +136,10 @@ export interface HydrawiseConfigPatch {
 /**
  * The commit-shaped patch the degraded-mode interpreter produces for a first-run write. The API key writes the legacy property rather than an option entry, which
  * is the deliberate difference from the catalog-backed interpreter's write shape; the account credentials have no legacy property, so they are carried on the
- * options array by the catalog-backed interpreter and this one alike, and this patch carries one only when a credential pair was written.
+ * options array by the catalog-backed interpreter and this one alike.
+ *
+ * This patch carries the options array when a credential pair was written or an `Account.ApiKey` entry was dropped, and only then. The key's entries are dropped
+ * because neither the next healthy load nor the runtime may prefer a stale entry over the new key, and each lets any such entry outrank the property.
  */
 export interface HydrawiseLegacyConfigPatch {
 
@@ -143,7 +171,7 @@ export interface HydrawiseConfigInterpreter {
 }
 
 /**
- * The degraded-mode interpreter, answering the same questions with no catalog and no engine. Its migration is always `null`, so a session whose fetches are failing
+ * The degraded-mode interpreter, answering the same questions with no served catalog. Its migration is always `null`, so a session whose fetches are failing
  * still loads and still completes first run.
  */
 export interface HydrawiseLegacyConfigInterpreter {
@@ -185,11 +213,20 @@ export interface HydrawiseConfigDependencies {
   readonly catalog: HydrawiseConfigCatalog;
 }
 
+/**
+ * What the degraded-mode interpreter is built over: the feature-option engine class alone, which the page holds whether or not a catalog is ever served. Its type
+ * is declared at module scope for the reason the interface above states.
+ */
+export interface HydrawiseLegacyConfigDependencies {
+
+  readonly FeatureOptions: typeof FeatureOptions;
+}
+
 /* The configured entries: the config's options array, less every entry that is not a string. This module-scope filter is every reader's and writer's single read
- * of the list - the catalog-backed engine and its retired-name rewrite, and the degraded-mode scans and first-run write alike. The entry grammar is text and every
- * reader reads each entry as text, so a hand-edited entry of any other kind is dropped here, once, as it is read, rather than handed on to throw inside the engine
- * or carried out of a degraded write through a patch that declares its entries as text. An options key that is absent, or that holds anything but an array,
- * reads as no entries at all.
+ * of the list - the catalog-backed engine, which the degraded-mode readers resolve through too, its retired-name rewrite, and the degraded-mode first-run write
+ * alike. The entry grammar is text and every reader reads each entry as text, so a hand-edited entry of any other kind is dropped here, once, as it is read,
+ * rather than handed on to throw inside the engine or carried out of a degraded write through a patch that declares its entries as text. An options key that is
+ * absent, or that holds anything but an array, reads as no entries at all.
  */
 const optionsOf = (config?: HydrawiseConfig): string[] => {
 
@@ -513,71 +550,50 @@ export const makeHydrawiseConfig = ({ FeatureOptions, catalog }: HydrawiseConfig
 };
 
 /**
- * Build the degraded-mode interpreter, which is what the webUI falls back to when the option catalog cannot be fetched. It answers the same questions without an
- * engine, so the settings page still loads and first-run still works in a session whose local requests are failing.
+ * Build the degraded-mode interpreter, which is what the webUI falls back to when the option catalog cannot be fetched. It answers the same questions without a
+ * served catalog, so the settings page still loads and first-run still works in a session whose local requests are failing. Its readers are the catalog-backed
+ * interpreter's own, built over the account settings' declaration above with the engine class injected as it is there, so the key and the login read by the
+ * plugin's own rules whichever interpreter the page holds.
  *
- * Its write shapes are chosen per setting, by where the setting can actually live. The API key writes the legacy property: composing an option entry by hand with
+ * Its write shapes are chosen per setting, by where the setting can actually live. The API key writes the legacy property and clears any option entry addressing
+ * it, so the property is the key's one home: composing an option entry by hand with
  * no catalog to validate it against is how a webUI corrupts a config, writing the property instead is always safe, and the next healthy session migrates it
  * forward on its own. The account credentials have no legacy property at all, so that safety valve does not exist for them - a property write would land somewhere
- * nothing ever reads - and they compose the canonical option entry directly. That is a narrow, well-understood exception: the entry form is one line of grammar
- * shared with the reader below, and the password and username options are known to be value-centric without consulting any catalog.
+ * nothing ever reads - and they compose the canonical option entry directly. That is a narrow, well-understood exception: the entry form is the one the engine
+ * composes for a value option, and the password and username options are value options in the declaration the readers resolve through.
+ *
+ * @param injected.FeatureOptions - The feature-option engine class.
  *
  * @returns The degraded-mode interpreter.
  */
-export const makeLegacyHydrawiseConfig = (): HydrawiseLegacyConfigInterpreter => {
+export const makeLegacyHydrawiseConfig = ({ FeatureOptions }: HydrawiseLegacyConfigDependencies): HydrawiseLegacyConfigInterpreter => {
 
-  /* Read one option's value out of the configured entries, through the module-scope filter that is every reader's and writer's single read of the list. This is
-   * the engine-free half of the same grammar the catalog-backed reader resolves through, and the original entry is sliced rather than its lowercased copy, so a
-   * value keeps the casing the user typed. Only the enabled-with-value form is scanned for, which is honest for every entry a migration or a first-run write could
-   * have produced, since the engine composes only that form for a value option.
-   */
-  const scanOption = (config: HydrawiseConfig | undefined, option: string): string => {
-
-    const prefix = enabledPrefix(option);
-
-    for(const entry of optionsOf(config)) {
-
-      if(entry.toLowerCase().startsWith(prefix)) {
-
-        return entry.slice(prefix.length);
-      }
-    }
-
-    return "";
-  };
+  // The catalog-backed readers over the account settings' declaration, so the degraded and the catalog-backed interpreter read the key and the login by one rule.
+  const reader = makeHydrawiseConfig({ FeatureOptions, catalog: ACCOUNT_CATALOG });
 
   return {
 
-    /* The effective API key, read without an engine. The legacy property answers first, and when it is gone - which is exactly what a completed migration
-     * leaves behind - the configured entries are scanned for the canonical entry, through the module-scope filter that is every reader's and writer's single
-     * read of the list. Without that scan a degraded session would read a fully migrated install as having no key at all and send the user back through
-     * first-run.
+    /* The effective API key, by the catalog-backed reader's rule: a configured `Account.ApiKey` entry rules in every one of its states, its empty ones included,
+     * and only when no entry exists does the legacy property answer. That is the precedence a healthy session and the runtime apply, so a degraded session reads
+     * the key the plugin would run on, and a fully migrated install, whose key lives in its entry alone, is never sent back through first run.
      *
      * @param config - The platform configuration entry.
      *
      * @returns The effective key, or an empty string when there is none.
      */
-    apiKey: (config?: HydrawiseConfig): string => {
-
-      if(typeof config?.apiKey === "string") {
-
-        return config.apiKey;
-      }
-
-      return scanOption(config, CONSOLIDATED_SETTINGS.apiKey);
-    },
+    apiKey: (config?: HydrawiseConfig): string => reader.apiKey(config),
 
     // Never migrate without a catalog. A migration decides what to write by consulting the catalog's registered defaults and the entries already configured,
     // and neither question can be answered here.
     migrate: (): null => null,
 
-    /* The effective account password, scanned from the options array. There is no property arm to try first, because this setting has no property home.
+    /* The effective account password, by the catalog-backed reader's rule. There is no property arm to try first, because this setting has no property home.
      *
      * @param config - The platform configuration entry.
      *
      * @returns The configured password, or an empty string when there is none.
      */
-    password: (config?: HydrawiseConfig): string => scanOption(config, CREDENTIAL_SETTINGS.password),
+    password: (config?: HydrawiseConfig): string => reader.password(config),
 
     /* The effective account username, on the terms the password reader above states.
      *
@@ -585,14 +601,21 @@ export const makeLegacyHydrawiseConfig = (): HydrawiseLegacyConfigInterpreter =>
      *
      * @returns The configured username, or an empty string when there is none.
      */
-    username: (config?: HydrawiseConfig): string => scanOption(config, CREDENTIAL_SETTINGS.username),
+    username: (config?: HydrawiseConfig): string => reader.username(config),
 
     /* The first-run write in degraded mode: the legacy property for the key, and canonical option entries for the credentials, per the split this interpreter's
      * own documentation states. The credentials are written only as a pair and only when both carry something, exactly as the catalog-backed writer does.
      *
-     * Any entry already addressing either credential option is dropped before the new one is appended, in the disabled form as well as the enabled one, so a
-     * second pass replaces rather than accumulates - the same thing the engine's own set does, done by hand because there is no engine here. The entries it keeps
-     * are read through the module-scope filter, so a hand-edited entry that is not text is left out of the list it writes.
+     * Every entry already addressing the API key is dropped, and so is every entry addressing a credential option the write replaces, each in either action form
+     * and with or without a value, so a second pass replaces rather than accumulates - the same thing the engine's own set does, done by hand because no served
+     * catalog is in hand to set it through. The entries it keeps are read through the module-scope filter, so a hand-edited entry that is not text is left out of
+     * the list it writes.
+     *
+     * The key's entries go because the property this write sets must be the key's one home: neither the next healthy load nor the runtime may prefer a stale entry
+     * over the new key. Each lets an entry outrank the property, so a stale entry left standing would win over the key this write just validated, and the healthy
+     * load's migration, finding the option already configured, would delete the new property without composing it and send the user back through first run. The
+     * patch therefore carries the options array when a credential pair was written or a key entry was dropped, and is the property write alone otherwise, which
+     * leaves a list it has no reason to touch exactly as it stood.
      *
      * @param config          - The platform configuration entry.
      * @param values          - The validated values to write.
@@ -604,17 +627,18 @@ export const makeLegacyHydrawiseConfig = (): HydrawiseLegacyConfigInterpreter =>
      */
     withFirstRun: (config: HydrawiseConfig | undefined, { apiKey, password, username }: HydrawiseFirstRunValues): HydrawiseLegacyConfigPatch => {
 
-      if(!password?.length || !username?.length) {
+      const entries = optionsOf(config);
+      const written: [ string, string ][] = (password?.length && username?.length) ?
+        [ [ CREDENTIAL_SETTINGS.password, password ], [ CREDENTIAL_SETTINGS.username, username ] ] : [];
+
+      if(!written.length && !entries.some((entry) => addressesOption(entry, CONSOLIDATED_SETTINGS.apiKey))) {
 
         return { apiKey };
       }
 
-      const written: [ string, string ][] = [ [ CREDENTIAL_SETTINGS.password, password ], [ CREDENTIAL_SETTINGS.username, username ] ];
-
-      // Both action forms are superseded, and each is matched without its value delimiter, so an entry that addresses the option while carrying no value at all is
-      // dropped alongside the ones that do.
-      const superseded = written.flatMap(([option]) => [ "disable." + option.toLowerCase(), "enable." + option.toLowerCase() ]);
-      const options = optionsOf(config).filter((entry) => !superseded.some((prefix) => entry.toLowerCase().startsWith(prefix)));
+      // The key's entries are superseded on every write that reaches here, and the credentials' whenever a pair is written.
+      const superseded = [ CONSOLIDATED_SETTINGS.apiKey, ...written.map(([option]) => option) ];
+      const options = entries.filter((entry) => !superseded.some((option) => addressesOption(entry, option)));
 
       for(const [ option, value ] of written) {
 

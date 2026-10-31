@@ -40,6 +40,7 @@ const config = makeHydrawiseConfig({ FeatureOptions, catalog: { categories: feat
 const _injectedShapeExercises = (): void => {
 
   type _InjectedEngineIsTheClass = Assert<Equal<Parameters<typeof makeHydrawiseConfig>[0]["FeatureOptions"], typeof FeatureOptions>>;
+  type _InjectedLegacyEngineIsTheClass = Assert<Equal<Parameters<typeof makeLegacyHydrawiseConfig>[0]["FeatureOptions"], typeof FeatureOptions>>;
   type _InjectedDisplayedNameIsTheFunction = Assert<Equal<Parameters<typeof makeHydrawiseNames>[0]["displayedName"], typeof displayedName>>;
   type _InjectedSanitizeNameIsTheFunction = Assert<Equal<Parameters<typeof makeHydrawiseNames>[0]["sanitizeName"], typeof sanitizeName>>;
 };
@@ -332,15 +333,15 @@ describe("hydrawise webUI config interpreters", () => {
 
   test("the degraded-mode interpreter reads what the real interpreter writes", () => {
 
-    const legacy = makeLegacyHydrawiseConfig();
+    const legacy = makeLegacyHydrawiseConfig({ FeatureOptions });
 
     assert.equal(legacy.apiKey({ apiKey: LEGACY_KEY }), LEGACY_KEY, "the legacy property answers directly");
     assert.equal(legacy.migrate({ apiKey: LEGACY_KEY }), null, "degraded mode never migrates blind");
     assert.deepEqual(legacy.withFirstRun({}, { apiKey: OPTION_KEY }), { apiKey: OPTION_KEY }, "the degraded key write is the legacy-shaped one");
     assert.equal(legacy.apiKey({}), "", "a config carrying neither reads as no key");
 
-    /* The scan is cross-checked end to end against what the real interpreter actually produces, never against a hand-typed entry, so a drifted prefix fails
-     * here rather than silently sending a migrated install back through first run.
+    /* The degraded read is cross-checked end to end against what the real interpreter actually produces, never against a hand-typed entry, so a drifted
+     * declaration fails here rather than silently sending a migrated install back through first run.
      */
     const written = { ...{}, ...config.withFirstRun({}, { apiKey: OPTION_KEY }) };
 
@@ -353,9 +354,44 @@ describe("hydrawise webUI config interpreters", () => {
     assert.equal(legacy.apiKey({ ...source, ...patch }), LEGACY_KEY, "a migrated config is readable in a later degraded session");
   });
 
+  test("a degraded first run leaves the key it writes as the only key the configuration keeps", () => {
+
+    const legacy = makeLegacyHydrawiseConfig({ FeatureOptions });
+
+    /* Each start holds an entry addressing the key that is not the key first run validates: one enabled with a value, one disabled, and one enabled with none.
+     * The catalog-backed reader and the runtime let any such entry outrank the property the degraded write sets, and the next healthy load's migration, finding
+     * the option configured, would delete the property without composing it. So the write drops the entry, and every read along that path - the degraded one and
+     * the catalog-backed one, before and after the migration the healthy load commits on its own - answers the new key. Each patch is merged as the session's
+     * commit merges it.
+     */
+    for(const stale of [ "Enable.Account.ApiKey=SHORT", "Disable.Account.ApiKey", "Enable.Account.ApiKey" ]) {
+
+      const start = { options: [ stale, "Disable.Device.ABC123" ] };
+      const written = { ...start, ...legacy.withFirstRun(start, { apiKey: OPTION_KEY }) };
+
+      assert.equal(legacy.apiKey(written), OPTION_KEY, "the degraded read answers the new key over " + stale);
+      assert.equal(config.apiKey(written), OPTION_KEY, "the catalog-backed read answers the new key over " + stale);
+
+      const patch = config.migrate(written);
+
+      assert.ok(patch, "the next healthy load migrates the property over " + stale);
+      assert.deepEqual(entriesFor(patch.options, "Account.ApiKey"), ["Enable.Account.ApiKey=" + OPTION_KEY], "the migration composes the new key's entry over " + stale);
+
+      const migrated = { ...written, ...patch };
+
+      assert.equal(config.apiKey(migrated), OPTION_KEY, "the catalog-backed read after the migration answers the new key over " + stale);
+      assert.equal(legacy.apiKey(migrated), OPTION_KEY, "the degraded read after the migration answers the new key over " + stale);
+      assert.ok(migrated.options.includes("Disable.Device.ABC123"), "an unrelated entry survives the whole sequence over " + stale);
+    }
+
+    // A list holding no key entry has nothing for the write to change, so the patch stays the property write alone.
+    assert.deepEqual(legacy.withFirstRun({ options: ["Disable.Device.ABC123"] }, { apiKey: OPTION_KEY }), { apiKey: OPTION_KEY },
+      "a list with no key entry is left exactly as it stood");
+  });
+
   test("the degraded interpreter writes the account credentials as option entries, not as properties", () => {
 
-    const legacy = makeLegacyHydrawiseConfig();
+    const legacy = makeLegacyHydrawiseConfig({ FeatureOptions });
     const patch = legacy.withFirstRun({ options: ["Disable.Device.ABC123"] }, { apiKey: OPTION_KEY, password: ACCOUNT_PASSWORD, username: ACCOUNT_USERNAME });
 
     /* The key writes a property because a property is always safe to write blind. The credentials cannot: there is no property home for them, so a property write
@@ -369,7 +405,7 @@ describe("hydrawise webUI config interpreters", () => {
 
   test("the degraded credential write replaces rather than accumulates", () => {
 
-    const legacy = makeLegacyHydrawiseConfig();
+    const legacy = makeLegacyHydrawiseConfig({ FeatureOptions });
     const first = legacy.withFirstRun({}, { apiKey: OPTION_KEY, password: "first-password", username: "first-user" });
     const second = legacy.withFirstRun({ options: first.options }, { apiKey: OPTION_KEY, password: ACCOUNT_PASSWORD, username: ACCOUNT_USERNAME });
 
@@ -381,7 +417,7 @@ describe("hydrawise webUI config interpreters", () => {
 
   test("the degraded credential write supersedes an explicitly disabled entry too", () => {
 
-    const legacy = makeLegacyHydrawiseConfig();
+    const legacy = makeLegacyHydrawiseConfig({ FeatureOptions });
     const patch = legacy.withFirstRun({ options: [ "Disable.Account.Username", "Enable.Account.Password" ] },
       { apiKey: OPTION_KEY, password: ACCOUNT_PASSWORD, username: ACCOUNT_USERNAME });
 
@@ -393,7 +429,7 @@ describe("hydrawise webUI config interpreters", () => {
 
   test("the degraded credential write drops a non-string entry from the options it writes", () => {
 
-    const legacy = makeLegacyHydrawiseConfig();
+    const legacy = makeLegacyHydrawiseConfig({ FeatureOptions });
 
     // The write reads the options list through the module's one filter, so a hand-edited entry that is not text is left out of the list it writes rather than
     // passed on through a patch that declares its entries as text.
@@ -405,7 +441,7 @@ describe("hydrawise webUI config interpreters", () => {
 
   test("the two interpreters read each other's credential writes", () => {
 
-    const legacy = makeLegacyHydrawiseConfig();
+    const legacy = makeLegacyHydrawiseConfig({ FeatureOptions });
     const values = { apiKey: OPTION_KEY, password: ACCOUNT_PASSWORD, username: ACCOUNT_USERNAME };
 
     /* Both directions matter, because a session can degrade or recover between one open and the next. What is on disk has to be ONE shape either way: a degraded
@@ -424,11 +460,45 @@ describe("hydrawise webUI config interpreters", () => {
 
   test("the degraded credential readers answer nothing set when no entry carries the credential", () => {
 
-    const legacy = makeLegacyHydrawiseConfig();
+    const legacy = makeLegacyHydrawiseConfig({ FeatureOptions });
 
     assert.equal(legacy.username({ options: [ "Enable.Account.Password=" + ACCOUNT_PASSWORD, "Disable.Device.ABC123" ] }), "",
-      "a scan that reaches the end of the array without the username reads as nothing set");
+      "an array that carries no username entry reads as nothing set");
     assert.equal(legacy.password({}), "", "and a configuration carrying no options array reads the same way");
+  });
+
+  test("the degraded readers answer the key and the account login exactly as the catalog-backed readers do", () => {
+
+    const legacy = makeLegacyHydrawiseConfig({ FeatureOptions });
+
+    /* The forms an entry can take on one option, alone and with a disable before and after an enabled value, since the engine lets the first entry addressing an
+     * option decide. Each answer is held to the catalog-backed reader's over the same configuration rather than to a hand-typed expectation, so a degraded rule that
+     * is not the engine's own fails here on whichever form it reads differently.
+     */
+    const forms = (option: string, value: string): string[][] => [ [], ["Enable." + option + "=" + value], ["Disable." + option], ["Enable." + option],
+      ["enable." + option.toLowerCase() + "=lower"], ["Disable." + option + "=x"], ["Enable." + option + " = spaced"], ["Enable." + option + "=  padded  "],
+      ["Enable." + option + ".dotted"], ["Enable." + option + ".SN1=scoped"], ["Disable." + option + ".SN1"], ["Enable." + option + "X=prefix"],
+      ["Enable." + option + "="], [ "Disable." + option, "Enable." + option + "=" + value ], [ "Enable." + option + "=" + value, "Disable." + option ] ];
+
+    // The key is read across every state of the legacy property too, since the property is its fallback and which of them answers is what the rule decides.
+    for(const apiKey of [ undefined, "", "SHORT", LEGACY_KEY ]) {
+
+      for(const options of forms("Account.ApiKey", OPTION_KEY)) {
+
+        const source = (apiKey === undefined) ? { options } : { apiKey, options };
+
+        assert.equal(legacy.apiKey(source), config.apiKey(source), "the degraded key reads as the catalog-backed key over " + JSON.stringify(source));
+      }
+    }
+
+    for(const [ reader, option, value ] of [ [ "password", "Account.Password", ACCOUNT_PASSWORD ], [ "username", "Account.Username", ACCOUNT_USERNAME ] ] as const) {
+
+      for(const options of forms(option, value)) {
+
+        assert.equal(legacy[reader]({ options }), config[reader]({ options }),
+          "the degraded " + reader + " reads as the catalog-backed one over " + JSON.stringify(options));
+      }
+    }
   });
 
   test("the platform resolves the credentials a first-run write composed", (t) => {
