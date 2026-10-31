@@ -3,7 +3,7 @@
  * tsconfig.build.json: The TypeScript project `tsc` uses to emit the published `dist/` output. Narrowed to `src` and excludes the colocated test, fixtures, and helpers
  * files, so none of them are compiled into the package; type-checking those still happens through tsconfig.json (`npm run typecheck`). An exclude only filters the
  * include roots - a file an emitted module imports is compiled regardless - so anything under an excluded path that production genuinely consumes still ships, which
- * is what keeps these entries safe against the layout growing. The IDE-and-lint project declaration lives in tsconfig.json (broad include + `noEmit`).
+ * is what keeps these entries safe against the layout growing. tsconfig.json is the IDE-and-lint project, with `noEmit`.
  */
 {
   "compilerOptions": {

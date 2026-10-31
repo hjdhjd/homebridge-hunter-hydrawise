@@ -4,10 +4,10 @@
  */
 "use strict";
 
-import { API_KEY_LENGTH, makeHydrawiseConfig, makeHydrawiseNames, makeLegacyHydrawiseConfig } from "./hydrawise-config.mjs";
+import { API_KEY_LENGTH, makeHydrawiseConfig, makeHydrawiseNames, makeLegacyHydrawiseConfig } from "./lib/webui/config.js";
 import { FeatureOptions, buildCatalogIndex, enumerateConfiguredEntries, expandOption } from "homebridge-plugin-utils/featureOptions.js";
 import { ZONE_STATE_LABELS, cachedCharacteristic, cachedControllerHardware, deriveControllerDisplay, deriveControllerStrip, deriveZoneDisplay, deriveZoneStrip,
-  formatRunTime, zoneScheduleState } from "./hydrawise-display.mjs";
+  formatRunTime, zoneScheduleState } from "./lib/webui/display.js";
 import { createActionGuard, withDeadline } from "homebridge-plugin-utils/webUi-liveness.mjs";
 import { displayedName, sanitizeName } from "homebridge-plugin-utils/homekit-name.js";
 import { PluginConfigSession } from "homebridge-plugin-utils/pluginConfigSession.mjs";

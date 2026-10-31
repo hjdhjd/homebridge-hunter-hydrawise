@@ -1,28 +1,33 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * hydrawise-config.mjs: Pure interpreters over the injected Hydrawise platform configuration.
+ * webui/config.ts: Pure interpreters over the injected Hydrawise platform configuration.
  */
-"use strict";
+import type { FeatureCategoryEntry, FeatureOptionEntry, FeatureOptions, displayedName, sanitizeName } from "homebridge-plugin-utils";
+import type { HYDRAWISE_CONTROLLER_FALLBACK_NAME, HYDRAWISE_ZONE_FALLBACK_NAME, controllerDisplayName, zoneDisplayName } from "../types.ts";
+import type { HydrawiseControllerOption, HydrawiseGlobalFlagOption, HydrawiseGlobalValueOption } from "../options.ts";
 
 /* The single home for our plugin-config shape. Every function here is a pure interpreter of the primary platform-config entry the webUI framework injects into
- * our hooks - no I/O, no global reach, and no imports, so the whole module is testable against the real feature-option engine by handing that engine in.
+ * our hooks - no I/O, no global reach, and no value imports, so the whole module is testable against the real feature-option engine by handing that engine in.
  * The framework owns reading and writing the persisted config through its session; this module owns the Hydrawise-specific knowledge of where a setting lives.
  *
  * Two settings substrates meet here. A feature option is where a setting lives, and a handful of configuration properties are a second home the plugin honors
  * so that a configuration nobody has opened the webUI on keeps working. Reconciling the two is this module's whole job: the interpreters read them in
  * precedence order, and the migration moves a property's value into its option and marks the property for deletion.
  *
- * The page's naming rule sits beside them on the same terms, pure and import-free with HBPU's naming functions handed in, so the suites hold it to the runtime's
- * own composers under Node.
+ * The page's naming rule sits beside them on the same terms, pure and importing no values with HBPU's naming functions handed in, so the suites hold it to the
+ * runtime's own composers under Node.
  */
 
-// The number of characters in a Hydrawise API key, which is always nineteen. This is the VALIDATION fact the first-run screen gates on and stamps onto its
-// input. The catalog's matching inputSize is a render-width hint that happens to share the number; neither is derived from the other.
+/**
+ * The number of characters in a Hydrawise API key, which is always nineteen. This is the VALIDATION fact the first-run screen gates on and stamps onto its
+ * input. The catalog's matching inputSize is a render-width hint that happens to share the number; neither is derived from the other.
+ */
 export const API_KEY_LENGTH = 19;
 
 /* Every consolidated setting, as the legacy configuration property that carries it paired with the feature option that supersedes it. This pairing is this
  * module's policy knowledge and the one address book both factories below read, so the migration's writes, the interpreters' reads, and the degraded-mode scan
- * can never disagree about where a setting lives. The plugin's runtime names the same option keys independently in TypeScript; the two meet at the wire.
+ * can never disagree about where a setting lives. The plugin's runtime names the same option keys in TypeScript, and each name here is tied to the runtime's
+ * option unions at compile time through the satisfies clause as well as by the config suite's round trip through a real platform.
  */
 const CONSOLIDATED_SETTINGS = {
 
@@ -30,7 +35,7 @@ const CONSOLIDATED_SETTINGS = {
   debug: "Log.Debug",
   mqttTopic: "Mqtt.Topic",
   mqttUrl: "Mqtt.Url"
-};
+} satisfies Record<string, HydrawiseGlobalFlagOption | HydrawiseGlobalValueOption>;
 
 /* The account login the optional enhanced features authenticate with, as the feature options that carry it. These are kept apart from the table above because
  * they answer a different question: that table pairs a setting with the legacy configuration property it supersedes, and these have no property to supersede.
@@ -40,11 +45,11 @@ const CREDENTIAL_SETTINGS = {
 
   password: "Account.Password",
   username: "Account.Username"
-};
+} satisfies Record<string, HydrawiseGlobalValueOption>;
 
-// The canonical entry prefix the feature-option engine composes for an enabled value option, lowercased because entry matching is case-insensitive. Both the
-// degraded-mode reader and its write compose against this, so the two agree on the entry form by construction rather than by two hand-typed strings matching.
-const enabledPrefix = (option) => "enable." + option.toLowerCase() + "=";
+// The canonical entry prefix the feature-option engine composes for an enabled value option, lowercased because entry matching is case-insensitive. The
+// degraded-mode reader scans every option against this one composition, so each read agrees on the entry form by construction rather than by hand-typed strings.
+const enabledPrefix = (option: string): string => "enable." + option.toLowerCase() + "=";
 
 // The two action prefixes the entry grammar admits, lowercased for the same case-insensitive matching every other scan here uses.
 const ACTION_PREFIXES = [ "disable.", "enable." ];
@@ -56,14 +61,143 @@ const ACTION_PREFIXES = [ "disable.", "enable." ];
  * everything else. It stays here after the transition because a configuration that has never been opened in the webUI can still be carrying the retired name years
  * later, and an entry that has already been rewritten costs nothing to re-examine.
  */
-const RETIRED_OPTION_RENAMES = new Map([[ "device.suspend", "Device.Suspend.All" ]]);
+const RETIRED_OPTION_RENAMES = new Map<string, HydrawiseControllerOption>([[ "device.suspend", "Device.Suspend.All" ]]);
 
 // The words a controller and a zone are named by where HomeKit can carry nothing of any name they could take: this module's own copies of the runtime's, since
-// it imports nothing, held to them by the config suite's parity row.
-const CONTROLLER_FALLBACK_NAME = "Controller";
-const ZONE_FALLBACK_NAME = "Zone";
+// it imports no values, tied to them at compile time by their types as well as by the config suite's parity row.
+const CONTROLLER_FALLBACK_NAME: typeof HYDRAWISE_CONTROLLER_FALLBACK_NAME = "Controller";
+const ZONE_FALLBACK_NAME: typeof HYDRAWISE_ZONE_FALLBACK_NAME = "Zone";
 
-/* Build the page's naming rule over HBPU's naming functions, injected as the engine is below so this module stays import-free. It mirrors the runtime's composers,
+/**
+ * The primary platform-configuration entry, as it actually arrives from the Homebridge UI. Every consolidated setting is declared as an unknown-valued optional
+ * property because that is the honest shape of an object read back from a user's `config.json`: a setting may be absent, may carry a hand-edited value of any
+ * type, and may have been staged to `undefined` by this module's own patch. Interpreting exactly that is what the module is for. The entry carries other keys
+ * besides, the platform's own name among them, so the index signature admits any property as the unknown value it is, which is what lets the migration read a
+ * setting by the property name its address book pairs it with.
+ */
+export interface HydrawiseConfig {
+
+  readonly [property: string]: unknown;
+  readonly apiKey?: unknown;
+  readonly debug?: unknown;
+  readonly mqttTopic?: unknown;
+  readonly mqttUrl?: unknown;
+  readonly options?: unknown;
+}
+
+/**
+ * The option catalog the plugin's UI server publishes, as the interpreter consumes it.
+ */
+export interface HydrawiseConfigCatalog {
+
+  readonly categories: FeatureCategoryEntry[];
+  readonly options: Record<string, FeatureOptionEntry[]>;
+}
+
+/**
+ * The commit-shaped patch the interpreter produces. A consumed legacy property is carried here as a PRESENT key whose value is `undefined`, never as an omitted
+ * key: the session's shallow-merge commit treats those two shapes oppositely, deleting the first and leaving the second untouched, and the type system cannot
+ * state that difference. Assertions about this patch must therefore read own-property presence rather than compare against `undefined`.
+ */
+export interface HydrawiseConfigPatch {
+
+  apiKey?: undefined;
+  debug?: undefined;
+  mqttTopic?: undefined;
+  mqttUrl?: undefined;
+  options?: string[];
+}
+
+/**
+ * The commit-shaped patch the degraded-mode interpreter produces for a first-run write. The API key writes the legacy property rather than an option entry, which
+ * is the deliberate difference from the catalog-backed interpreter's write shape; the account credentials have no legacy property, so they are carried on the
+ * options array by the catalog-backed interpreter and this one alike, and this patch carries one only when a credential pair was written.
+ */
+export interface HydrawiseLegacyConfigPatch {
+
+  apiKey: string;
+  options?: string[];
+}
+
+/**
+ * The values a first-run write commits. The API key is always present, because first run exists to collect it; the account credentials are optional and are only
+ * ever written as a pair, since neither half authenticates on its own.
+ */
+export interface HydrawiseFirstRunValues {
+
+  readonly apiKey: string;
+  readonly password?: string;
+  readonly username?: string;
+}
+
+/**
+ * The interpreter over a fetched catalog: the effective settings, the legacy-settings migration, and the single first-run write.
+ */
+export interface HydrawiseConfigInterpreter {
+
+  apiKey(config?: HydrawiseConfig): string;
+  migrate(config?: HydrawiseConfig): HydrawiseConfigPatch | null;
+  password(config?: HydrawiseConfig): string;
+  username(config?: HydrawiseConfig): string;
+  withFirstRun(config: HydrawiseConfig | undefined, values: HydrawiseFirstRunValues): HydrawiseConfigPatch;
+}
+
+/**
+ * The degraded-mode interpreter, answering the same questions with no catalog and no engine. Its migration is always `null`, so a session whose fetches are failing
+ * still loads and still completes first run.
+ */
+export interface HydrawiseLegacyConfigInterpreter {
+
+  apiKey(config?: HydrawiseConfig): string;
+  migrate(config?: HydrawiseConfig): null;
+  password(config?: HydrawiseConfig): string;
+  username(config?: HydrawiseConfig): string;
+  withFirstRun(config: HydrawiseConfig | undefined, values: HydrawiseFirstRunValues): HydrawiseLegacyConfigPatch;
+}
+
+/**
+ * The page's naming rule, mirroring the runtime's controller and zone composers in `src/types.ts` and taking each composer's own arguments: each answers the
+ * name the page shows, sanitized as HomeKit carries it.
+ */
+export interface HydrawiseNames {
+
+  controllerName(names: Parameters<typeof controllerDisplayName>[0]): string;
+  zoneName(names: Parameters<typeof zoneDisplayName>[0]): string;
+}
+
+/**
+ * What the naming rule is built over: HBPU's naming functions. Their types are declared here at module scope, where `typeof displayedName` names the imported
+ * function, rather than in the factory's parameter, where the same words would name the parameter itself.
+ */
+export interface HydrawiseNamesDependencies {
+
+  readonly displayedName: typeof displayedName;
+  readonly sanitizeName: typeof sanitizeName;
+}
+
+/**
+ * What the interpreter is built over: the feature-option engine class and the served catalog. The engine's type is declared here at module scope, where `typeof
+ * FeatureOptions` names the imported class, rather than in the factory's parameter, where the same words would name the parameter itself.
+ */
+export interface HydrawiseConfigDependencies {
+
+  readonly FeatureOptions: typeof FeatureOptions;
+  readonly catalog: HydrawiseConfigCatalog;
+}
+
+/* The configured entries: the config's options array, less every entry that is not a string. This module-scope filter is every reader's and writer's single read
+ * of the list - the catalog-backed engine and its retired-name rewrite, and the degraded-mode scans and first-run write alike. The entry grammar is text and every
+ * reader reads each entry as text, so a hand-edited entry of any other kind is dropped here, once, as it is read, rather than handed on to throw inside the engine
+ * or carried out of a degraded write through a patch that declares its entries as text. An options key that is absent, or that holds anything but an array,
+ * reads as no entries at all.
+ */
+const optionsOf = (config?: HydrawiseConfig): string[] => {
+
+  return Array.isArray(config?.options) ? config.options.filter((entry: unknown): entry is string => typeof entry === "string") : [];
+};
+
+/**
+ * Build the page's naming rule over HBPU's naming functions, injected as the engine is below so this module imports no values. It mirrors the runtime's composers,
  * controllerDisplayName and zoneDisplayName in src/types.ts, and the config suite's parity row holds the two to one answer: the user's Name where HomeKit can carry
  * it, the reported name where HomeKit can carry that, and the kind's word otherwise, a zone's followed by its relay number. The name chosen is shown sanitized, as
  * the runtime applies it to HomeKit, so the page names each controller and zone as HomeKit carries it.
@@ -75,20 +209,29 @@ const ZONE_FALLBACK_NAME = "Zone";
  *
  * @returns The page's names: controllerName and zoneName, each taking the runtime composer's arguments and answering the name the page shows.
  */
-export const makeHydrawiseNames = ({ displayedName, sanitizeName }) => {
+export const makeHydrawiseNames = ({ displayedName, sanitizeName }: HydrawiseNamesDependencies): HydrawiseNames => {
 
   // The name a Name HomeKit cannot carry yields to: the reported name where HomeKit can carry something of it, and the kind's word otherwise.
-  const fallbackOf = (reported, word) => (sanitizeName(reported).length ? reported : word);
+  const fallbackOf = (reported: string, word: string): string => (sanitizeName(reported).length ? reported : word);
 
   return {
 
-    controllerName: ({ override, reported }) => displayedName({ fallback: fallbackOf(reported, CONTROLLER_FALLBACK_NAME), override }),
-    zoneName: ({ override, relay, reported }) => displayedName({ fallback: fallbackOf(reported, ZONE_FALLBACK_NAME + " " + relay.toString()), override })
+    controllerName: ({ override, reported }: Parameters<typeof controllerDisplayName>[0]): string => {
+
+      return displayedName({ fallback: fallbackOf(reported, CONTROLLER_FALLBACK_NAME), override });
+    },
+
+    zoneName: ({ override, relay, reported }: Parameters<typeof zoneDisplayName>[0]): string => {
+
+      return displayedName({ fallback: fallbackOf(reported, ZONE_FALLBACK_NAME + " " + relay.toString()), override });
+    }
   };
 };
 
-/* Build the interpreter over an injected feature-option engine class and the option catalog the plugin's own UI server publishes. Injecting both is what keeps
- * this module import-free and testable under node against the real engine and the real catalog, rather than against a stand-in that could drift from either.
+/**
+ * Build the interpreter over an injected feature-option engine class and the option catalog the plugin's own UI server publishes. Injecting both is what keeps
+ * this module free of value imports and testable under node against the real engine and the real catalog, rather than against a stand-in that could drift from
+ * either.
  *
  * @param injected.FeatureOptions - The feature-option engine class.
  * @param injected.catalog        - The served catalog, carrying its categories and its options record.
@@ -96,23 +239,23 @@ export const makeHydrawiseNames = ({ displayedName, sanitizeName }) => {
  * @returns The interpreter: readers for the effective API key, account password, and account username, the legacy-settings migration, and the first-run
  *          write that commits all of them at once.
  */
-export const makeHydrawiseConfig = ({ FeatureOptions, catalog }) => {
+export const makeHydrawiseConfig = ({ FeatureOptions, catalog }: HydrawiseConfigDependencies): HydrawiseConfigInterpreter => {
 
-  // A feature-option engine over the served catalog and the config's own entries. The array is handed in directly rather than copied: the engine's set-option
-  // path is a pure transform that composes a fresh array and reassigns its own field, so the array it was given is never written to.
-  const engineFor = (config) => new FeatureOptions(catalog.categories, catalog.options, Array.isArray(config?.options) ? config.options : []);
+  // A feature-option engine over the served catalog and the config's text entries, which the filter above hands it as an array of its own, so nothing the engine
+  // does can reach the configuration's own array.
+  const engineFor = (config?: HydrawiseConfig): FeatureOptions => new FeatureOptions(catalog.categories, catalog.options, optionsOf(config));
 
   /* Every option key the SERVED catalog currently declares, lowercased. The composition is the feature-option engine's own rule - a category name joined to an
-   * option name by a dot, with a nameless option addressing its category alone - stated here rather than imported because this module is deliberately
-   * import-free and receives the catalog as data.
+   * option name by a dot, with a nameless option addressing its category alone - stated here rather than imported because this module deliberately imports no
+   * values and receives the catalog as data.
    *
    * This set is what makes the rename below catalog-anchored instead of hand-rolled string surgery.
    */
-  const currentOptionKeys = () => {
+  const currentOptionKeys = (): Set<string> => {
 
-    const keys = new Set();
+    const keys = new Set<string>();
 
-    for(const [ category, entries ] of Object.entries(catalog?.options ?? {})) {
+    for(const [ category, entries ] of Object.entries(catalog.options)) {
 
       for(const entry of entries) {
 
@@ -135,24 +278,19 @@ export const makeHydrawiseConfig = ({ FeatureOptions, catalog }) => {
    * the user typed. Running twice is a no-op by construction rather than by a guard - the first pass leaves entries addressing a current key, which the first
    * rule passes straight through.
    */
-  const renameRetiredOptions = (options) => {
+  const renameRetiredOptions = (options: readonly string[]): string[] | null => {
 
     const current = currentOptionKeys();
-    let rewritten = false;
 
-    const migrated = options.map((entry) => {
-
-      if(typeof entry !== "string") {
-
-        return entry;
-      }
+    // One entry's rewrite, or undefined for an entry that is left exactly as the user wrote it.
+    const renameEntry = (entry: string): string | undefined => {
 
       const lower = entry.toLowerCase();
       const action = ACTION_PREFIXES.find((prefix) => lower.startsWith(prefix));
 
       if(!action) {
 
-        return entry;
+        return undefined;
       }
 
       // The addressed key is the tail up to any value payload, since a value never participates in naming the option.
@@ -173,23 +311,34 @@ export const makeHydrawiseConfig = ({ FeatureOptions, catalog }) => {
        */
       if(current.has(lowerKey)) {
 
-        return entry;
+        return undefined;
       }
 
       const globalRename = RETIRED_OPTION_RENAMES.get(lowerKey);
       const scopedRename = ((head.length > 0) && !current.has(head)) ? RETIRED_OPTION_RENAMES.get(head) : undefined;
 
-      // Anything else addressing a current option at a scope, or addressing nothing this plugin knows, is left exactly as the user wrote it.
-      if((globalRename === undefined) && (scopedRename === undefined)) {
+      // A global rewrite carries the replacement alone; a scoped one carries the identifier the entry named, sliced from the original so its casing survives.
+      const replacement = globalRename ?? ((scopedRename === undefined) ? undefined : scopedRename + key.slice(lastDot));
 
-        return entry;
+      // Anything else addressing a current option at a scope, or addressing nothing this plugin knows, is left exactly as the user wrote it.
+      if(replacement === undefined) {
+
+        return undefined;
       }
 
-      rewritten = true;
+      return entry.slice(0, action.length) + replacement + payload;
+    };
 
-      // A global rewrite carries the replacement alone; a scoped one carries the identifier the entry named, sliced from the original so its casing survives.
-      return entry.slice(0, action.length) + (globalRename ?? (scopedRename + key.slice(lastDot))) + payload;
-    });
+    const migrated: string[] = [];
+    let rewritten = false;
+
+    for(const entry of options) {
+
+      const renamed = renameEntry(entry);
+
+      rewritten ||= (renamed !== undefined);
+      migrated.push(renamed ?? entry);
+    }
 
     return rewritten ? migrated : null;
   };
@@ -204,7 +353,7 @@ export const makeHydrawiseConfig = ({ FeatureOptions, catalog }) => {
      *
      * @returns The effective key, or an empty string when there is none.
      */
-    apiKey: (config) => {
+    apiKey: (config?: HydrawiseConfig): string => {
 
       const engine = engineFor(config);
       const option = CONSOLIDATED_SETTINGS.apiKey;
@@ -245,7 +394,7 @@ export const makeHydrawiseConfig = ({ FeatureOptions, catalog }) => {
      *
      * @returns The patch to commit, or null when there is nothing to do.
      */
-    migrate: (config) => {
+    migrate: (config?: HydrawiseConfig): HydrawiseConfigPatch | null => {
 
       if(!config || ((config.options !== undefined) && !Array.isArray(config.options))) {
 
@@ -256,7 +405,7 @@ export const makeHydrawiseConfig = ({ FeatureOptions, catalog }) => {
        * migration answers null the moment a configuration carries no legacy properties, which is true of nearly every installation that has already been through
        * it once - gating the rename behind that scan would leave exactly those configurations carrying the retired name forever.
        */
-      const renamed = renameRetiredOptions(Array.isArray(config.options) ? config.options : []);
+      const renamed = renameRetiredOptions(optionsOf(config));
       const carried = Object.entries(CONSOLIDATED_SETTINGS).filter(([property]) => config[property] !== undefined);
 
       if(!carried.length) {
@@ -267,15 +416,13 @@ export const makeHydrawiseConfig = ({ FeatureOptions, catalog }) => {
       // The engine reads the RENAMED array, so a pass carrying both a legacy property and a retired option name composes one array holding both migrations rather
       // than two writers each producing a whole array and the last one winning.
       const engine = engineFor(renamed ? { ...config, options: renamed } : config);
-      const patch = {};
+      const patch: HydrawiseConfigPatch = Object.fromEntries(carried.map(([property]): [ string, undefined ] => [ property, undefined ]));
       let composed = false;
 
       for(const [ property, option ] of carried) {
 
         const value = config[property];
         const catalogDefault = engine.valueDefault(option);
-
-        patch[property] = undefined;
 
         // An option the catalog gives no registered default is a flag, and a flag's whole payload is the entry's existence.
         if(catalogDefault === undefined) {
@@ -320,7 +467,7 @@ export const makeHydrawiseConfig = ({ FeatureOptions, catalog }) => {
      *
      * @returns The configured password, or an empty string when there is none.
      */
-    password: (config) => engineFor(config).value(CREDENTIAL_SETTINGS.password) ?? "",
+    password: (config?: HydrawiseConfig): string => engineFor(config).value(CREDENTIAL_SETTINGS.password) ?? "",
 
     /* The effective account username, on exactly the terms the password reader above states.
      *
@@ -328,7 +475,7 @@ export const makeHydrawiseConfig = ({ FeatureOptions, catalog }) => {
      *
      * @returns The configured username, or an empty string when there is none.
      */
-    username: (config) => engineFor(config).value(CREDENTIAL_SETTINGS.username) ?? "",
+    username: (config?: HydrawiseConfig): string => engineFor(config).value(CREDENTIAL_SETTINGS.username) ?? "",
 
     /* The first-run write: compose every value first run collected as its feature option, replacing any entry already addressing it. The legacy API-key property
      * goes into the patch as an explicitly undefined key, so a configuration that carried one is left with exactly one home for the key once the patch is written.
@@ -348,7 +495,7 @@ export const makeHydrawiseConfig = ({ FeatureOptions, catalog }) => {
      *
      * @returns The patch to commit.
      */
-    withFirstRun: (config, { apiKey, password, username }) => {
+    withFirstRun: (config: HydrawiseConfig | undefined, { apiKey, password, username }: HydrawiseFirstRunValues): HydrawiseConfigPatch => {
 
       const engine = engineFor(config);
 
@@ -365,7 +512,8 @@ export const makeHydrawiseConfig = ({ FeatureOptions, catalog }) => {
   };
 };
 
-/* Build the degraded-mode interpreter, which is what the webUI falls back to when the option catalog cannot be fetched. It answers the same questions without an
+/**
+ * Build the degraded-mode interpreter, which is what the webUI falls back to when the option catalog cannot be fetched. It answers the same questions without an
  * engine, so the settings page still loads and first-run still works in a session whose local requests are failing.
  *
  * Its write shapes are chosen per setting, by where the setting can actually live. The API key writes the legacy property: composing an option entry by hand with
@@ -376,21 +524,20 @@ export const makeHydrawiseConfig = ({ FeatureOptions, catalog }) => {
  *
  * @returns The degraded-mode interpreter.
  */
-export const makeLegacyHydrawiseConfig = () => {
+export const makeLegacyHydrawiseConfig = (): HydrawiseLegacyConfigInterpreter => {
 
-  // The entry prefix for each option this interpreter reads or writes without an engine. The engine composes only the enabled-with-value form for a value option,
-  // so scanning for it is honest for every entry a migration or a first-run write could have produced.
-  const apiKeyPrefix = enabledPrefix(CONSOLIDATED_SETTINGS.apiKey);
-
-  // Read one option's value straight out of the raw options array. This is the engine-free half of the same grammar the catalog-backed reader resolves through, and
-  // the original entry is sliced rather than its lowercased copy, so a value keeps the casing the user typed.
-  const scanOption = (config, option) => {
+  /* Read one option's value out of the configured entries, through the module-scope filter that is every reader's and writer's single read of the list. This is
+   * the engine-free half of the same grammar the catalog-backed reader resolves through, and the original entry is sliced rather than its lowercased copy, so a
+   * value keeps the casing the user typed. Only the enabled-with-value form is scanned for, which is honest for every entry a migration or a first-run write could
+   * have produced, since the engine composes only that form for a value option.
+   */
+  const scanOption = (config: HydrawiseConfig | undefined, option: string): string => {
 
     const prefix = enabledPrefix(option);
 
-    for(const entry of Array.isArray(config?.options) ? config.options : []) {
+    for(const entry of optionsOf(config)) {
 
-      if((typeof entry === "string") && entry.toLowerCase().startsWith(prefix)) {
+      if(entry.toLowerCase().startsWith(prefix)) {
 
         return entry.slice(prefix.length);
       }
@@ -402,34 +549,27 @@ export const makeLegacyHydrawiseConfig = () => {
   return {
 
     /* The effective API key, read without an engine. The legacy property answers first, and when it is gone - which is exactly what a completed migration
-     * leaves behind - the raw options array is scanned for the canonical entry. Without that scan a degraded session would read a fully migrated install as
-     * having no key at all and send the user back through first-run.
+     * leaves behind - the configured entries are scanned for the canonical entry, through the module-scope filter that is every reader's and writer's single
+     * read of the list. Without that scan a degraded session would read a fully migrated install as having no key at all and send the user back through
+     * first-run.
      *
      * @param config - The platform configuration entry.
      *
      * @returns The effective key, or an empty string when there is none.
      */
-    apiKey: (config) => {
+    apiKey: (config?: HydrawiseConfig): string => {
 
       if(typeof config?.apiKey === "string") {
 
         return config.apiKey;
       }
 
-      for(const entry of Array.isArray(config?.options) ? config.options : []) {
-
-        if((typeof entry === "string") && entry.toLowerCase().startsWith(apiKeyPrefix)) {
-
-          return entry.slice(apiKeyPrefix.length);
-        }
-      }
-
-      return "";
+      return scanOption(config, CONSOLIDATED_SETTINGS.apiKey);
     },
 
     // Never migrate without a catalog. A migration decides what to write by consulting the catalog's registered defaults and the entries already configured,
     // and neither question can be answered here.
-    migrate: () => null,
+    migrate: (): null => null,
 
     /* The effective account password, scanned from the options array. There is no property arm to try first, because this setting has no property home.
      *
@@ -437,7 +577,7 @@ export const makeLegacyHydrawiseConfig = () => {
      *
      * @returns The configured password, or an empty string when there is none.
      */
-    password: (config) => scanOption(config, CREDENTIAL_SETTINGS.password),
+    password: (config?: HydrawiseConfig): string => scanOption(config, CREDENTIAL_SETTINGS.password),
 
     /* The effective account username, on the terms the password reader above states.
      *
@@ -445,13 +585,14 @@ export const makeLegacyHydrawiseConfig = () => {
      *
      * @returns The configured username, or an empty string when there is none.
      */
-    username: (config) => scanOption(config, CREDENTIAL_SETTINGS.username),
+    username: (config?: HydrawiseConfig): string => scanOption(config, CREDENTIAL_SETTINGS.username),
 
     /* The first-run write in degraded mode: the legacy property for the key, and canonical option entries for the credentials, per the split this interpreter's
      * own documentation states. The credentials are written only as a pair and only when both carry something, exactly as the catalog-backed writer does.
      *
      * Any entry already addressing either credential option is dropped before the new one is appended, in the disabled form as well as the enabled one, so a
-     * second pass replaces rather than accumulates - the same thing the engine's own set does, done by hand because there is no engine here.
+     * second pass replaces rather than accumulates - the same thing the engine's own set does, done by hand because there is no engine here. The entries it keeps
+     * are read through the module-scope filter, so a hand-edited entry that is not text is left out of the list it writes.
      *
      * @param config          - The platform configuration entry.
      * @param values          - The validated values to write.
@@ -461,20 +602,19 @@ export const makeLegacyHydrawiseConfig = () => {
      *
      * @returns The patch to commit.
      */
-    withFirstRun: (config, { apiKey, password, username }) => {
+    withFirstRun: (config: HydrawiseConfig | undefined, { apiKey, password, username }: HydrawiseFirstRunValues): HydrawiseLegacyConfigPatch => {
 
       if(!password?.length || !username?.length) {
 
         return { apiKey };
       }
 
-      const written = [ [ CREDENTIAL_SETTINGS.password, password ], [ CREDENTIAL_SETTINGS.username, username ] ];
+      const written: [ string, string ][] = [ [ CREDENTIAL_SETTINGS.password, password ], [ CREDENTIAL_SETTINGS.username, username ] ];
 
       // Both action forms are superseded, and each is matched without its value delimiter, so an entry that addresses the option while carrying no value at all is
       // dropped alongside the ones that do.
       const superseded = written.flatMap(([option]) => [ "disable." + option.toLowerCase(), "enable." + option.toLowerCase() ]);
-      const options = (Array.isArray(config?.options) ? config.options : [])
-        .filter((entry) => (typeof entry !== "string") || !superseded.some((prefix) => entry.toLowerCase().startsWith(prefix)));
+      const options = optionsOf(config).filter((entry) => !superseded.some((prefix) => entry.toLowerCase().startsWith(prefix)));
 
       for(const [ option, value ] of written) {
 

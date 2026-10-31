@@ -1,6 +1,6 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * webui-display.test.ts: The webUI's pure schedule-display derivations, exercised against the very module ui.mjs renders from. Covers the zone classification
+ * webui/display.test.ts: The webUI's pure schedule-display derivations, exercised against the very module ui.mjs renders from. Covers the zone classification
  * and the imminent-run window it splits on, the zone and controller row folds with their staleness verdicts and the status precedence, the formatters, and the
  * device panel's stat strips with the cached-hardware gate that decides whether the hardware cells appear.
  *
@@ -8,10 +8,10 @@
  * means the same thing at any hour, and every expected string a formatter produces is computed through the identical Intl call the formatter itself makes, so a
  * host whose locale or timezone differs moves both sides together rather than reddening a correct implementation.
  */
-import type { HydrawiseCachedAccessory, HydrawiseScheduleMeta, HydrawiseScheduleProjection, HydrawiseZoneScheduleEntry }
-  from "../homebridge-ui/public/hydrawise-display.mjs";
+import type { HydrawiseCachedAccessory, HydrawiseScheduleMeta } from "./display.ts";
+import type { HydrawiseScheduleStatus, HydrawiseZoneScheduleStatus } from "../types.ts";
 import { STALE_GRACE, ZONE_STATE_LABELS, cachedControllerHardware, deriveControllerDisplay, deriveControllerStrip, deriveZoneDisplay, deriveZoneStrip, formatMinutes,
-  formatRunTime, zoneScheduleState } from "../homebridge-ui/public/hydrawise-display.mjs";
+  formatRunTime, zoneScheduleState } from "./display.ts";
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 
@@ -36,23 +36,23 @@ function meta(activeWindowSeconds: number = WINDOW): HydrawiseScheduleMeta {
   return { activeWindowSeconds, asOf: NOW };
 }
 
-function runningEntry(relayId: number, endsAt: number): HydrawiseZoneScheduleEntry {
+function runningEntry(relayId: number, endsAt: number): HydrawiseZoneScheduleStatus {
 
   return { endsAt, relayId, state: "running" };
 }
 
-function scheduledEntry(relayId: number, nextRunAt: number, durationSeconds = 480): HydrawiseZoneScheduleEntry {
+function scheduledEntry(relayId: number, nextRunAt: number, durationSeconds = 480): HydrawiseZoneScheduleStatus {
 
   return { durationSeconds, nextRunAt, relayId, state: "scheduled" };
 }
 
-function projection(zones: HydrawiseZoneScheduleEntry[], activeWindowSeconds: number = WINDOW): HydrawiseScheduleProjection {
+function projection(zones: HydrawiseZoneScheduleStatus[], activeWindowSeconds: number = WINDOW): HydrawiseScheduleStatus {
 
   return { activeWindowSeconds, asOf: NOW, zones };
 }
 
 // The status word a projection folds to, returned apart from the detail rows rather than as one of them.
-function statusOf(zones: HydrawiseZoneScheduleEntry[]): string | undefined {
+function statusOf(zones: HydrawiseZoneScheduleStatus[]): string | undefined {
 
   return deriveControllerDisplay(projection(zones), {}, NOW).status ?? undefined;
 }
@@ -159,8 +159,8 @@ describe("hydrawise webUI schedule display derivations", () => {
     const running = runningEntry(1, NOW + 600);
     const soon = scheduledEntry(2, NOW + WINDOW);
     const later = scheduledEntry(3, NOW + WINDOW + 1);
-    const stopped: HydrawiseZoneScheduleEntry = { relayId: 4, state: "sensor-stopped" };
-    const idle: HydrawiseZoneScheduleEntry = { relayId: 5, state: "unscheduled" };
+    const stopped: HydrawiseZoneScheduleStatus = { relayId: 4, state: "sensor-stopped" };
+    const idle: HydrawiseZoneScheduleStatus = { relayId: 5, state: "unscheduled" };
 
     assert.equal(statusOf([ running, soon, later, stopped, idle ]), "Watering", "water actually flowing outranks every other state");
     assert.equal(statusOf([ soon, later, stopped, idle ]), ZONE_STATE_LABELS["starting-soon"], "an imminent run outranks a later one");
@@ -240,7 +240,7 @@ describe("hydrawise webUI suspension and availability display", () => {
   // Well beyond a week from the anchor, which is what a real suspension instant looks like and what the formatter's date tier serves.
   const FAR_FUTURE = NOW + (400 * 24 * 3600);
 
-  function suspendedEntry(relayId: number, until: number): HydrawiseZoneScheduleEntry {
+  function suspendedEntry(relayId: number, until: number): HydrawiseZoneScheduleStatus {
 
     return { relayId, state: "suspended", until };
   }
@@ -261,7 +261,7 @@ describe("hydrawise webUI suspension and availability display", () => {
 
     const rendering = deriveZoneDisplay(suspendedEntry(1, FAR_FUTURE), meta(), NOW);
 
-    /* The status word is read from the shared vocabulary rather than compared against a literal, so a change to the wording moves this pin with it rather than
+    /* The status word is read from the shared vocabulary rather than compared against a literal, so a change to the wording moves this assertion with it rather than
      * reddening it - which is the whole reason the vocabulary is shared in the first place.
      */
     assert.deepEqual(rendering.rows, [ [ "Status", ZONE_STATE_LABELS.suspended ], [ "Until", dateOf(FAR_FUTURE) ] ],
@@ -301,7 +301,7 @@ describe("hydrawise webUI suspension and availability display", () => {
     /* Reachability reframes everything under it: a schedule read off a controller that is not answering describes what WOULD happen, so saying so first is more
      * honest than leading with a plan nothing is currently carrying out.
      */
-    const offline: HydrawiseScheduleProjection = { activeWindowSeconds: WINDOW, asOf: NOW, online: false,
+    const offline: HydrawiseScheduleStatus = { activeWindowSeconds: WINDOW, asOf: NOW, online: false,
       zones: [ runningEntry(1, SAME_DAY), scheduledEntry(2, NEXT_DAY) ] };
 
     assert.equal(deriveControllerDisplay(offline, {}, NOW).status, "Offline", "an unreachable controller says so first");
@@ -310,7 +310,7 @@ describe("hydrawise webUI suspension and availability display", () => {
   test("a reachable controller, and one whose availability is unknown, both fold exactly as they always have", () => {
 
     // The parity half: the availability arm must not disturb the fold for an install that reports itself reachable or one that carries no availability at all.
-    const reachable: HydrawiseScheduleProjection = { activeWindowSeconds: WINDOW, asOf: NOW, online: true, zones: [runningEntry(1, SAME_DAY)] };
+    const reachable: HydrawiseScheduleStatus = { activeWindowSeconds: WINDOW, asOf: NOW, online: true, zones: [runningEntry(1, SAME_DAY)] };
 
     assert.equal(deriveControllerDisplay(reachable, {}, NOW).status, "Watering", "a reachable controller folds on its zones alone");
     assert.equal(statusOf([runningEntry(1, SAME_DAY)]), "Watering", "and so does one that carries no availability at all");

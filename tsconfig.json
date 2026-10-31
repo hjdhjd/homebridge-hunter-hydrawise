@@ -1,8 +1,9 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * tsconfig.json: Project declaration discovered by IDEs and typescript-eslint's project service, and the type-check pass (`npm run typecheck`). The broad include type-
- * checks the web UI sources, the root config files, and the full colocated test suite. `noEmit` keeps `tsc -p tsconfig.json` from producing build output - emitting the
- * published `dist/` is exclusively tsconfig.build.json's job, which narrows to `src` and excludes the test/fixtures/helpers files so they never reach the package.
+ * tsconfig.json: The project IDEs and typescript-eslint's project service discover, and the pass `npm run typecheck` runs. It type-checks everything under src, the
+ * test and helper files tsconfig.build.json leaves out of the published output included, while `noEmit` keeps `tsc -p tsconfig.json` from producing build output -
+ * emitting the published `dist/` is tsconfig.build.json's job. The web UI's JavaScript and eslint.config.mjs are not inputs here: typescript-eslint lints them through
+ * the default project that eslint.config.mjs's allowDefaultProject list names.
  */
 {
   "compilerOptions": {
@@ -12,5 +13,5 @@
 
   "exclude": [ "dist", "node_modules" ],
   "extends": "./node_modules/homebridge-plugin-utils/build/tsconfig.plugin.json",
-  "include": [ "eslint.config.mjs", "homebridge-ui", "src" ]
+  "include": [ "src" ]
 }

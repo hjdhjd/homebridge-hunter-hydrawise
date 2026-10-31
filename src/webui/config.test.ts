@@ -1,7 +1,7 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * config.test.ts: The webUI's pure platform-configuration interpreters, exercised against the REAL feature-option engine and the REAL option catalog
- * so the pins bind to the same grammar the plugin's runtime resolves against. Covers the effective-key precedence, every arm of the legacy-settings migration -
+ * webui/config.test.ts: The webUI's pure platform-configuration interpreters, exercised against the REAL feature-option engine and the REAL option catalog
+ * so the assertions bind to the same grammar the plugin's runtime resolves against. Covers the effective-key precedence, every arm of the legacy-settings migration -
  * what migrates, what deletes without migrating, and what declines entirely - the first-run write, the degraded-mode interpreter, a round trip proving a
  * migrated configuration runs the platform on the same effective values the legacy one did, and the page's naming rule held to the runtime's composers.
  *
@@ -9,18 +9,19 @@
  * omitting the key. An equality read cannot tell those apart, and the session's shallow-merge commit treats them oppositely, so presence is asserted with
  * Object.hasOwn and absence with its negation - never with a comparison against undefined.
  */
-import { API_KEY_LENGTH, makeHydrawiseConfig, makeHydrawiseNames, makeLegacyHydrawiseConfig } from "../homebridge-ui/public/hydrawise-config.mjs";
+import { API_KEY_LENGTH, makeHydrawiseConfig, makeHydrawiseNames, makeLegacyHydrawiseConfig } from "./config.ts";
+import type { Assert, Equal } from "homebridge-plugin-utils/testing";
 import { FeatureOptions, displayedName, sanitizeName } from "homebridge-plugin-utils";
-import { controllerDisplayName, zoneDisplayName } from "./types.ts";
+import { controllerDisplayName, zoneDisplayName } from "../types.ts";
 import { describe, test } from "node:test";
-import { featureOptionCategories, featureOptions } from "./options.ts";
+import { featureOptionCategories, featureOptions } from "../options.ts";
 import assert from "node:assert/strict";
-import { buildPlatform } from "./testing/platform.helpers.ts";
+import { buildPlatform } from "../testing/platform.helpers.ts";
 
-// APIEvent.SHUTDOWN's string value, fired to tear down a platform the round-trip pin builds.
+// APIEvent.SHUTDOWN's string value, fired to tear down a platform the round-trip test builds.
 const SHUTDOWN = "shutdown";
 
-// The two API keys the precedence pins tell apart: one carried by a legacy property, one carried by a configured option.
+// The two API keys the precedence assertions tell apart: one carried by a legacy property, one carried by a configured option.
 const LEGACY_KEY = "AAAA-BBBB-CCCC-DDD";
 const OPTION_KEY = "EEEE-FFFF-GGGG-HHH";
 
@@ -31,6 +32,17 @@ const ACCOUNT_PASSWORD = "correct horse battery";
 
 // The interpreter under test, built the way the webUI builds it: the real engine class and the real served catalog.
 const config = makeHydrawiseConfig({ FeatureOptions, catalog: { categories: featureOptionCategories, options: featureOptions } });
+
+/* Compile-time shape exercise for the factories' injected values. It never runs - the function is never called, and its leading underscore marks it, with its
+ * bindings, as a compile-time exercise the typecheck reads - so it adds nothing to the runtime totals. Each injected value's type is the imported HBPU value's
+ * exactly, so a declaration that lets one collapse to any, which every runtime row in this suite would still pass against, fails `npm run typecheck` here instead.
+ */
+const _injectedShapeExercises = (): void => {
+
+  type _InjectedEngineIsTheClass = Assert<Equal<Parameters<typeof makeHydrawiseConfig>[0]["FeatureOptions"], typeof FeatureOptions>>;
+  type _InjectedDisplayedNameIsTheFunction = Assert<Equal<Parameters<typeof makeHydrawiseNames>[0]["displayedName"], typeof displayedName>>;
+  type _InjectedSanitizeNameIsTheFunction = Assert<Equal<Parameters<typeof makeHydrawiseNames>[0]["sanitizeName"], typeof sanitizeName>>;
+};
 
 // The entries in an options array that address a given option, case-insensitively, in either the enabled or the disabled form.
 function entriesFor(options: string[] | undefined, option: string): string[] {
@@ -64,7 +76,7 @@ describe("hydrawise webUI config interpreters", () => {
 
       assert.ok(patch, "a config carrying " + property + " should produce a patch");
       assert.deepEqual(entriesFor(patch.options, option), ["Enable." + option + "=" + value], option + " should compose one entry carrying the exact value");
-      assert.ok(Object.hasOwn(patch, property), property + " should ride the patch as a present key so the commit deletes it");
+      assert.ok(Object.hasOwn(patch, property), property + " should be staged as a present key so the commit deletes it");
       assert.equal(patch[property as keyof typeof patch], undefined, property + " should be carried as undefined");
     }
   });
@@ -89,7 +101,7 @@ describe("hydrawise webUI config interpreters", () => {
     const patch = config.migrate({ mqttUrl: "mqtt://127.0.0.2:1883", options: ["Enable.Mqtt.Url=mqtt://127.0.0.1:1883"] });
 
     assert.ok(patch, "the legacy property should still be deleted");
-    assert.ok(Object.hasOwn(patch, "mqttUrl"), "the superseded property rides the patch for deletion");
+    assert.ok(Object.hasOwn(patch, "mqttUrl"), "the superseded property is staged for deletion");
     assert.ok(!Object.hasOwn(patch, "options"), "an existing entry is the user's own choice, so nothing is composed over it");
   });
 
@@ -98,7 +110,7 @@ describe("hydrawise webUI config interpreters", () => {
     const patch = config.migrate({ mqttUrl: "mqtt://127.0.0.1:1883", options: ["Disable.Mqtt.Url"] });
 
     assert.ok(patch, "the legacy property should still be deleted");
-    assert.ok(Object.hasOwn(patch, "mqttUrl"), "the property rides the patch for deletion");
+    assert.ok(Object.hasOwn(patch, "mqttUrl"), "the property is staged for deletion");
     assert.ok(!Object.hasOwn(patch, "options"), "a disable is a configured entry, so the legacy value does not overwrite it");
   });
 
@@ -107,7 +119,7 @@ describe("hydrawise webUI config interpreters", () => {
     const patch = config.migrate({ mqttTopic: "hydrawise" });
 
     assert.ok(patch, "the property should still be deleted");
-    assert.ok(Object.hasOwn(patch, "mqttTopic"), "the property rides the patch for deletion");
+    assert.ok(Object.hasOwn(patch, "mqttTopic"), "the property is staged for deletion");
     assert.ok(!Object.hasOwn(patch, "options"), "a value that only restates the catalog default manufactures no configuration");
   });
 
@@ -120,7 +132,7 @@ describe("hydrawise webUI config interpreters", () => {
 
     for(const property of [ "apiKey", "mqttTopic", "mqttUrl" ]) {
 
-      assert.ok(Object.hasOwn(patch, property), property + " should ride the patch for deletion");
+      assert.ok(Object.hasOwn(patch, property), property + " should be staged for deletion");
     }
 
     assert.deepEqual(entriesFor(patch.options, "Account.ApiKey"), ["Enable.Account.ApiKey=" + LEGACY_KEY], "the key should compose one entry");
@@ -156,9 +168,9 @@ describe("hydrawise webUI config interpreters", () => {
      * a writer that split them across separate engines and merged the results would keep only the last snapshot and silently drop the rest - which is exactly
      * what this assertion catches.
      */
-    assert.deepEqual(entriesFor(patch.options, "Account.ApiKey"), ["Enable.Account.ApiKey=" + OPTION_KEY], "the key rides the patch");
-    assert.deepEqual(entriesFor(patch.options, "Account.Username"), ["Enable.Account.Username=" + ACCOUNT_USERNAME], "the username rides the same patch");
-    assert.deepEqual(entriesFor(patch.options, "Account.Password"), ["Enable.Account.Password=" + ACCOUNT_PASSWORD], "the password rides the same patch");
+    assert.deepEqual(entriesFor(patch.options, "Account.ApiKey"), ["Enable.Account.ApiKey=" + OPTION_KEY], "the key is carried by the patch");
+    assert.deepEqual(entriesFor(patch.options, "Account.Username"), ["Enable.Account.Username=" + ACCOUNT_USERNAME], "the username is carried by the same patch");
+    assert.deepEqual(entriesFor(patch.options, "Account.Password"), ["Enable.Account.Password=" + ACCOUNT_PASSWORD], "the password is carried by the same patch");
     assert.ok(patch.options?.includes("Disable.Device.ABC123"), "unrelated entries survive the write");
   });
 
@@ -185,11 +197,8 @@ describe("hydrawise webUI config interpreters", () => {
 
     /* There is deliberately no legacy-property arm to test here, unlike the API key. These settings have never had a config.json property, so a raw property
      * carrying one is not an older configuration to honor - it is a hand edit addressing nothing, and it reads as nothing set.
-     *
-     * The hand edit reaches the reader through a cast because the config type declares no such properties, and declaring them would describe a home these
-     * settings do not have. The cast is the honest model of where the shape comes from: a user's own config.json, which answers to no static type.
      */
-    const handEdited = { password: "raw-password", username: "raw-username" } as unknown as Parameters<typeof config.username>[0];
+    const handEdited = { password: "raw-password", username: "raw-username" };
 
     assert.equal(config.username(handEdited), "", "a raw property is not a home these settings have");
     assert.equal(config.password(handEdited), "", "and the same for the password");
@@ -220,7 +229,7 @@ describe("hydrawise webUI config interpreters", () => {
 
     assert.ok(patch, "a config carrying debug should produce a patch");
     assert.deepEqual(entriesFor(patch.options, "Log.Debug"), ["Enable.Log.Debug"], "a flag composes the valueless enable form, carrying no value");
-    assert.ok(Object.hasOwn(patch, "debug"), "the legacy property rides the patch for deletion");
+    assert.ok(Object.hasOwn(patch, "debug"), "the legacy property is staged for deletion");
   });
 
   test("a legacy debug flag set off deletes without composing", () => {
@@ -228,7 +237,7 @@ describe("hydrawise webUI config interpreters", () => {
     const patch = config.migrate({ debug: false });
 
     assert.ok(patch, "the property should still be deleted");
-    assert.ok(Object.hasOwn(patch, "debug"), "the property rides the patch for deletion");
+    assert.ok(Object.hasOwn(patch, "debug"), "the property is staged for deletion");
     assert.ok(!Object.hasOwn(patch, "options"), "off is what the catalog already declares, so no entry is manufactured for it");
   });
 
@@ -237,7 +246,7 @@ describe("hydrawise webUI config interpreters", () => {
     const patch = config.migrate({ debug: "yes" });
 
     assert.ok(patch, "a hand-edited non-boolean still produces a deletion patch");
-    assert.ok(Object.hasOwn(patch, "debug"), "the property rides the patch for deletion");
+    assert.ok(Object.hasOwn(patch, "debug"), "the property is staged for deletion");
     assert.ok(!Object.hasOwn(patch, "options"), "a value we decline to interpret composes nothing");
   });
 
@@ -246,7 +255,7 @@ describe("hydrawise webUI config interpreters", () => {
     const patch = config.migrate({ debug: true, options: ["Disable.Log.Debug"] });
 
     assert.ok(patch, "the legacy property should still be deleted");
-    assert.ok(Object.hasOwn(patch, "debug"), "the property rides the patch for deletion");
+    assert.ok(Object.hasOwn(patch, "debug"), "the property is staged for deletion");
     assert.ok(!Object.hasOwn(patch, "options"), "a disable is a configured entry, so the legacy flag does not overwrite it");
   });
 
@@ -255,7 +264,7 @@ describe("hydrawise webUI config interpreters", () => {
     const patch = config.migrate({ debug: true, options: [ "Enable.Log.Debug", "Disable.Device.ABC123" ] });
 
     assert.ok(patch, "the legacy property should still be deleted");
-    assert.ok(Object.hasOwn(patch, "debug"), "the property rides the patch for deletion");
+    assert.ok(Object.hasOwn(patch, "debug"), "the property is staged for deletion");
     assert.ok(!Object.hasOwn(patch, "options"), "an existing entry already says what the property says, so nothing is composed over it");
   });
 
@@ -271,7 +280,7 @@ describe("hydrawise webUI config interpreters", () => {
 
     for(const property of [ "apiKey", "debug", "mqttTopic", "mqttUrl" ]) {
 
-      assert.ok(Object.hasOwn(patch, property), property + " should ride the patch for deletion");
+      assert.ok(Object.hasOwn(patch, property), property + " should be staged for deletion");
     }
 
     // Apply the patch the way the webUI stages it, then build a real platform on each configuration and compare what each resolves.
@@ -313,7 +322,7 @@ describe("hydrawise webUI config interpreters", () => {
 
     assert.ok(patch, "a genuinely defined sibling still migrates");
     assert.ok(!Object.hasOwn(patch, "apiKey"), "the already-staged key is not re-included, which would be churn");
-    assert.ok(Object.hasOwn(patch, "mqttTopic"), "the defined sibling still rides the patch for deletion");
+    assert.ok(Object.hasOwn(patch, "mqttTopic"), "the defined sibling is still staged for deletion");
   });
 
   test("an options substrate that is not an array declines rather than guessing", () => {
@@ -382,6 +391,18 @@ describe("hydrawise webUI config interpreters", () => {
     assert.deepEqual(entriesFor(patch.options, "Account.Password"), ["Enable.Account.Password=" + ACCOUNT_PASSWORD], "the valueless entry is replaced too");
   });
 
+  test("the degraded credential write drops a non-string entry from the options it writes", () => {
+
+    const legacy = makeLegacyHydrawiseConfig();
+
+    // The write reads the options list through the module's one filter, so a hand-edited entry that is not text is left out of the list it writes rather than
+    // passed on through a patch that declares its entries as text.
+    const patch = legacy.withFirstRun({ options: [ 42, "Disable.Device.ABC123" ] }, { apiKey: OPTION_KEY, password: ACCOUNT_PASSWORD, username: ACCOUNT_USERNAME });
+
+    assert.deepEqual(patch.options, [ "Disable.Device.ABC123", "Enable.Account.Password=" + ACCOUNT_PASSWORD, "Enable.Account.Username=" + ACCOUNT_USERNAME ],
+      "the non-string entry is dropped and every text entry is kept beside the credentials");
+  });
+
   test("the two interpreters read each other's credential writes", () => {
 
     const legacy = makeLegacyHydrawiseConfig();
@@ -399,6 +420,15 @@ describe("hydrawise webUI config interpreters", () => {
 
     assert.equal(legacy.username(healthyWrite), ACCOUNT_USERNAME, "a healthy write is readable by the degraded interpreter");
     assert.equal(legacy.password(healthyWrite), ACCOUNT_PASSWORD, "and the password with it");
+  });
+
+  test("the degraded credential readers answer nothing set when no entry carries the credential", () => {
+
+    const legacy = makeLegacyHydrawiseConfig();
+
+    assert.equal(legacy.username({ options: [ "Enable.Account.Password=" + ACCOUNT_PASSWORD, "Disable.Device.ABC123" ] }), "",
+      "a scan that reaches the end of the array without the username reads as nothing set");
+    assert.equal(legacy.password({}), "", "and a configuration carrying no options array reads the same way");
   });
 
   test("the platform resolves the credentials a first-run write composed", (t) => {
@@ -466,7 +496,7 @@ describe("hydrawise webUI retired-option rename migration", () => {
 
   test("the rename runs on a configuration that carries no legacy properties at all", () => {
 
-    /* The gating pin, and the one that decides whether this migration reaches anybody. The property scan answers null the moment a configuration carries no legacy
+    /* The gating assertion, and the one that decides whether this migration reaches anybody. The property scan answers null the moment a configuration carries no legacy
      * properties, which is true of nearly every install that has already been migrated once - so a rename gated behind it would never run for them.
      */
     assert.deepEqual(migratedOptions({ options: [ "Enable.Device.Suspend." + SERIAL, "Enable.Log.Zone" ] }),
@@ -489,12 +519,10 @@ describe("hydrawise webUI retired-option rename migration", () => {
 
   test("a legacy property and a retired option name both migrate in ONE pass", () => {
 
-    /* The same-pass pin. Both migrations compose one options array, so neither write can clobber the other - which is exactly what two independent writers each
+    /* The same-pass assertion. Both migrations compose one options array, so neither write can clobber the other - which is exactly what two independent writers each
      * answering a whole array would do under the session's shallow merge.
      */
-    // The cast is the same honest model used for the hand-edited value above: migrate() comes from an untyped module, so the shape asserted here is where it
-    // comes from, not something the module itself declares.
-    const patch = config.migrate({ apiKey: LEGACY_KEY, options: ["Enable.Device.Suspend." + SERIAL] }) as { apiKey?: string; options?: string[] } | null;
+    const patch = config.migrate({ apiKey: LEGACY_KEY, options: ["Enable.Device.Suspend." + SERIAL] });
 
     assert.ok(patch, "the migration should stage a patch");
     assert.ok(Object.hasOwn(patch, "apiKey"), "the legacy key is staged for deletion");
@@ -502,9 +530,37 @@ describe("hydrawise webUI retired-option rename migration", () => {
     assert.deepEqual(entriesFor(patch.options, "Device.Suspend.All"), ["Enable.Device.Suspend.All." + SERIAL], "and the retired name was renamed in the same array");
   });
 
+  test("a pass whose legacy properties all decline still stages the rename", () => {
+
+    const patch = config.migrate({ mqttTopic: "", options: ["Enable.Device.Suspend." + SERIAL] });
+
+    assert.ok(patch, "the migration should stage a patch");
+    assert.ok(Object.hasOwn(patch, "mqttTopic"), "the declined property is still staged for deletion");
+    assert.deepEqual(patch.options, ["Enable.Device.Suspend.All." + SERIAL], "and the rename alone supplies the staged array");
+  });
+
+  test("an entry carrying no action prefix passes through the rename exactly as written", () => {
+
+    // An entry the grammar cannot read as an action addresses no option at all, so the rename leaves it standing beside the retired entry it rewrites.
+    assert.deepEqual(migratedOptions({ options: [ "Device.Suspend", "Enable.Device.Suspend" ] }), [ "Device.Suspend", "Enable.Device.Suspend.All" ],
+      "the entry with no action prefix is kept and only the retired entry is renamed");
+  });
+
+  test("a non-string entry in a hand-edited options array is dropped as it is read", () => {
+
+    /* What the boundary filter answers. The entry grammar is text, so an entry of any other kind is dropped before the engine reads the array: the effective key
+     * resolves rather than the engine throwing on the stray entry, and a migration that rewrites a retired name stages the text entries alone.
+     */
+    const handEdited = { options: [ 42, "Enable.Account.ApiKey=" + OPTION_KEY, "Enable.Device.Suspend." + SERIAL ] };
+
+    assert.equal(config.apiKey(handEdited), OPTION_KEY, "the key resolves from the text entries");
+    assert.deepEqual(config.migrate(handEdited), { options: [ "Enable.Account.ApiKey=" + OPTION_KEY, "Enable.Device.Suspend.All." + SERIAL ] },
+      "the staged array carries the text entries alone, the retired one renamed");
+  });
+
   test("the module's catalog anchoring agrees with the engine's own composition for every served option", () => {
 
-    /* The matching-parity pin. The module composes its current-key set from the served catalog by hand, because it is import-free and can consume no engine
+    /* The matching-parity assertion. The module composes its current-key set from the served catalog by hand, because it imports no values and can consume no engine
      * export; this asserts that the hand composition agrees with the engine's own expandOption for every option the catalog declares, which is the drift this
      * rule would otherwise be exposed to. An entry addressing a current key must always pass through, and passing through is observable as "nothing staged".
      */
@@ -528,10 +584,11 @@ describe("hydrawise webUI names", () => {
 
   test("the page names every controller and zone as the runtime's composers name it in HomeKit", () => {
 
-    /* The parity row. The page's naming module is import-free and carries its own copies of the kind's words, so this holds its answer to the runtime's composers,
-     * sanitized as every HomeKit write sanitizes them, over every source a name can come from. The table carries a Name that sanitizing rewrites, so a page that
-     * showed a name unsanitized fails it, reported names HomeKit can carry nothing of, so a page that named them by another word or dropped a zone's number fails
-     * it, reported names that are the kind's word, which read as themselves, and more than one relay, so a zone's number cannot come from anywhere but its own.
+    /* The parity row. The page's naming module imports no values and carries its own copies of the kind's words, tied to the runtime's at compile time as well,
+     * so this holds its answer to the runtime's composers, sanitized as every HomeKit write sanitizes them, over every source a name can come from. The table
+     * carries a Name that sanitizing rewrites, so a page that showed a name unsanitized fails it, reported names HomeKit can carry nothing of, so a page that
+     * named them by another word or dropped a zone's number fails it, reported names that are the kind's word, which read as themselves, and more than one relay,
+     * so a zone's number cannot come from anywhere but its own.
      */
     const overrides = [ undefined, null, "   ", "\u{1F331}\u{1F331}", "Front/Back Lawn", "\u{1F331} Front Lawn", "Garden Controller" ];
 
