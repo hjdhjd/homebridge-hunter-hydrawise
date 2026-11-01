@@ -1,21 +1,23 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
  * controller.hardware.test.ts: The controller's projection of optional hardware facts onto HomeKit's AccessoryInformation service. The design under test is
- * cache-resident: the characteristics are the only store these facts have, so every assertion here is a claim about what a characteristic READS after a construction or
- * an enrichment, never about a parallel copy.
+ * cache-resident: the model's characteristic is the only store it has, and the firmware version has one more, the controller accessory's context, so the
+ * assertions here are claims about what a characteristic READS after a construction or an enrichment, and about the version that context carries.
  *
  * That makes the pre-seeded value the whole method. HAP round-trips characteristic values through Homebridge's accessory cache, so a warm restart begins with real
  * values already in place - a test models this by writing those values over the defaults HAP constructs each characteristic with. A test that started from an
  * untouched accessory could not tell "preserved the cached value" from "wrote nothing anywhere", which is exactly the distinction this design turns on. Homebridge
- * stamps its own firmware placeholder on every restore before the plugin sees the accessory, so the model carries over a restart and the firmware does not.
+ * stamps its own firmware placeholder on every restore before the plugin sees the accessory, and the platform writes the context's version back over it as it
+ * restores the accessory. This harness restores through a stand-in for the platform that writes nothing, so the placeholder stands on every restored accessory
+ * here, and the credentialed restart rows assert that the controller leaves it standing; the platform's restore is asserted in its own hardware suite.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { Characteristic, Service, buildController, makeV2Facts, restoreCached } from "./testing/platform.helpers.ts";
+import { Characteristic, Service, buildController, makeV2Facts, restoreCached, seedEstablished } from "./testing/platform.helpers.ts";
 import type { CharacteristicValue, Characteristic as HapCharacteristic, PlatformAccessory, WithUUID } from "homebridge";
 import { HAP_DEFAULT_MODEL, HOMEBRIDGE_UNKNOWN_FIRMWARE, HYDRAWISE_API_JITTER, HYDRAWISE_REVERT_DELAY, HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
-import type { HydrawiseControllerHardware, StatusScheduleResponse } from "./types.ts";
+import type { HydrawiseAccessoryContext, HydrawiseControllerHardware, StatusScheduleResponse } from "./types.ts";
 import { TestClock, advanceThroughSchedule, hapStatus, logCount, present, triggerGet, triggerSet, waitUntil } from "homebridge-plugin-utils/testing";
 import { controllerIdentity, suspendZoneSubtype, zoneAccessoryId } from "./types.ts";
 import { describe, test } from "node:test";
@@ -50,6 +52,12 @@ function informationValue(accessory: PlatformAccessory, characteristic: WithUUID
 
   return present(accessory.getService(Service.AccessoryInformation), "the information service HAP builds every accessory with").getCharacteristic(characteristic)
     .value;
+}
+
+// The firmware version an accessory's context carries, which is the store that version has across a restart.
+function firmwareOf(accessory: PlatformAccessory): string | undefined {
+
+  return (accessory.context as HydrawiseAccessoryContext).firmware;
 }
 
 // The instant a facts snapshot is stamped with. Tests that care only about adoption stamp it now, which is comfortably inside the freshness window every consumer
@@ -97,6 +105,24 @@ describe("HydrawiseController hardware display without credentials", () => {
     assert.equal(informationValue(accessory, Characteristic.Model), PLACEHOLDER_MODEL, "the model returns to the product-line placeholder");
     assert.equal(informationValue(accessory, Characteristic.FirmwareRevision), HOMEBRIDGE_UNKNOWN_FIRMWARE, "the firmware reads Homebridge's restore placeholder");
   });
+
+  test("removing the credentials clears a persisted firmware version, and a context carrying none saves nothing for it", () => {
+
+    /* A version nothing will ever refresh again is a stale fact, so it leaves the context on the same terms the characteristics return to their placeholders, and
+     * the clear is saved. Each accessory is seeded with what earlier polls established, so construction has nothing else to save and each count is the
+     * firmware's own: an install that never had credentials pays no cache write for a clear it does not need.
+     */
+    const cleared = buildController({ seedContext: (seed) => {
+
+      seed.context = { firmware: CACHED.firmware };
+      seedEstablished({ accessory: seed, zones: [] });
+    } });
+    const untouched = buildController({ seedContext: (seed) => { seedEstablished({ accessory: seed, zones: [] }); } });
+
+    assert.equal(firmwareOf(cleared.accessory), undefined, "the persisted version is cleared");
+    assert.equal(cleared.flushes().length, 1, "and the clear is saved");
+    assert.equal(untouched.flushes().length, 0, "a context carrying no version saves nothing");
+  });
 });
 
 describe("HydrawiseController hardware display with credentials", () => {
@@ -104,14 +130,26 @@ describe("HydrawiseController hardware display with credentials", () => {
   test("a warm restart leaves cached real values untouched", () => {
 
     /* The refresh that will confirm these values is already on its way, so the synchronous path writes neither: blanking a correct display for the length of a
-     * network round trip would be a visible regression for a user who has done nothing but restart Homebridge. Homebridge stamps its firmware placeholder on every
-     * restore before the plugin sees the accessory, so a warm restart shows that placeholder until the first refresh lands, and only the model carries over.
+     * network round trip would be a visible regression for a user who has done nothing but restart Homebridge. This harness restores without the platform's
+     * firmware write, so the firmware here is Homebridge's placeholder, and what the row asserts is that the controller leaves it exactly as the restore did.
      */
     const { accessory } = buildController({ hasV2Client: true, seedContext: seedCached });
 
     assert.equal(informationValue(accessory, Characteristic.Model), CACHED.model, "the cached model survives the restart");
     assert.equal(informationValue(accessory, Characteristic.FirmwareRevision), HOMEBRIDGE_UNKNOWN_FIRMWARE,
-      "the firmware reads Homebridge's restore placeholder until the first refresh lands");
+      "the firmware is left as the restore handed it over, here Homebridge's placeholder");
+  });
+
+  test("a warm restart carries the persisted firmware version through construction, and a malformed one degrades to absent", () => {
+
+    /* Construction wipes the context and reseeds what the controller owns, the firmware version among it. The context is that version's only store across a
+     * restart, so a version the wipe dropped would be missing from the next cache save, and a restart before the first refresh would show the placeholder.
+     */
+    const carried = buildController({ hasV2Client: true, seedContext: (seed) => { seed.context = { firmware: CACHED.firmware }; } });
+    const malformed = buildController({ hasV2Client: true, seedContext: (seed) => { seed.context = { firmware: 4.7 }; } });
+
+    assert.equal(firmwareOf(carried.accessory), CACHED.firmware, "the persisted version survives the wipe");
+    assert.equal(firmwareOf(malformed.accessory), undefined, "a malformed version is treated as absent rather than carried");
   });
 
   test("a brand-new accessory is stamped with the placeholder rather than showing HAP's default", () => {
@@ -244,6 +282,21 @@ describe("HydrawiseController facts adoption", () => {
     assert.equal(h.flushes().length - settled, 1, "a genuine hardware change is worth exactly one write");
   });
 
+  test("adopting hardware carries the firmware version into the context, and a changed version rewrites it", () => {
+
+    // The version goes into the context through the same change-gated mark that saves the characteristics, so the version a restart restores is the one this
+    // controller last adopted.
+    const h = buildController({ hasV2Client: true });
+
+    h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: now() });
+
+    assert.equal(firmwareOf(h.accessory), FETCHED.firmware, "the adopted version is carried in the context");
+
+    h.controller.applyFacts({ facts: makeV2Facts({ hardware: { firmware: "4.99", model: FETCHED.model } }), fetchedAt: now() + 1 });
+
+    assert.equal(firmwareOf(h.accessory), "4.99", "and an upgraded version replaces it");
+  });
+
   test("a tick carrying no hardware leaves the values a prior tick established", () => {
 
     // A controller whose hardware block comes back incomplete composes no hardware at all, and that absence must not blank a correct display.
@@ -259,8 +312,9 @@ describe("HydrawiseController facts adoption", () => {
   test("adopted values survive into the next session untouched", () => {
 
     /* The end of the cache-resident story: what adoption wrote is what a restart reads back, and the credentialed synchronous path leaves it exactly as it found it.
-     * The firmware is the exception Homebridge makes, stamping its placeholder on every restore before the plugin sees the accessory, so the next session shows
-     * that placeholder until its first refresh lands.
+     * The firmware's characteristic is the exception Homebridge makes, stamping its placeholder on every restore before the plugin sees the accessory. The
+     * platform writes the context's version back over it, and this harness restores without that write, so the next session here shows the placeholder, which
+     * the controller leaves alone until its first refresh lands.
      */
     const first = buildController({ hasV2Client: true });
 
@@ -276,7 +330,7 @@ describe("HydrawiseController facts adoption", () => {
 
     assert.equal(informationValue(second.accessory, Characteristic.Model), FETCHED.model, "the next session reads back the adopted model");
     assert.equal(informationValue(second.accessory, Characteristic.FirmwareRevision), HOMEBRIDGE_UNKNOWN_FIRMWARE,
-      "and the firmware reads Homebridge's restore placeholder until the first refresh lands");
+      "and the controller leaves the firmware the restore handed it, here Homebridge's placeholder");
   });
 
   test("each controller's facts land on its own accessory", () => {
@@ -323,6 +377,9 @@ describe("HydrawiseController standalone zone hardware", () => {
     assert.equal(informationValue(zoneAccessory, Characteristic.Model), PLACEHOLDER_MODEL, "the zone accessory shows no controller model either");
     assert.equal(informationValue(zoneAccessory, Characteristic.SerialNumber), CONTROLLER_SERIAL + "-" + STANDALONE_SUBTYPE,
       "the zone accessory keeps its own synthesized serial");
+
+    // The zone's information setup takes the placeholder arm, and the controller's own context keeps the version a refresh adopted all the same.
+    assert.equal(firmwareOf(h.accessory), FETCHED.firmware, "binding the zone leaves the controller's persisted version in place");
   });
 
   test("a zone accessory restored carrying a stale firmware value is reset, not preserved", async (t) => {

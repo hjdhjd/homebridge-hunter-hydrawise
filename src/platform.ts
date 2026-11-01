@@ -15,7 +15,7 @@ import { HYDRAWISE_API_BASE_URL, HYDRAWISE_API_BUDGET_CALLS, HYDRAWISE_API_BUDGE
   HYDRAWISE_V2_MUTATION_BUDGET_CALLS, HYDRAWISE_V2_MUTATION_BUDGET_WINDOW, HYDRAWISE_V2_REFRESH_INTERVAL, HYDRAWISE_ZONE_ACCESSORY_CATEGORY,
   HYDRAWISE_ZONE_ACCESSORY_GRACE_POLLS, PLATFORM_NAME, PLUGIN_NAME } from "./settings.ts";
 import type { HydrawiseGlobalFlagOption, HydrawiseGlobalValueOption, HydrawiseOptions } from "./options.ts";
-import { controllerDisplayName, controllerIdentity, isControllerIdentity, isZoneAccessoryContext, sameControllerIdentity, sameZoneIdentity,
+import { controllerDisplayName, controllerIdentity, isControllerIdentity, isFirmwareVersion, isZoneAccessoryContext, sameControllerIdentity, sameZoneIdentity,
   zoneAccessoryId } from "./types.ts";
 import { featureOptionCategories, featureOptions } from "./options.ts";
 import { request, setGlobalDispatcher } from "undici";
@@ -288,8 +288,9 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   }
 
   /* This gets called when homebridge restores cached accessories at startup. Every restored accessory is tracked for discovery to claim, a controller accessory's
-   * serial is recorded for the availability statement below, and the accessory's primary characteristics refuse at once: nothing in this run has reached Hydrawise
-   * yet, so the values the cache restored are ones the plugin cannot vouch for. Everything else waits for Hydrawise API enumeration.
+   * serial is recorded for the availability statement below, its persisted firmware version is put back on display, and the accessory's primary characteristics
+   * refuse at once: nothing in this run has reached Hydrawise yet, so the values the cache restored are ones the plugin cannot vouch for. Everything else waits for
+   * Hydrawise API enumeration.
    */
   public configureAccessory(accessory: HydrawiseAccessory): void {
 
@@ -302,7 +303,30 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       this.restoredSerials.add(context.controller.serialNumber);
     }
 
+    this.restoreFirmware(accessory);
     this.bindPrimary(accessory);
+  }
+
+  /* Write the firmware version a controller accessory's context carries in place of the placeholder Homebridge stamps on its FirmwareRevision. Homebridge writes "0"
+   * there on every restored accessory and then calls configureAccessory, naming that call as the plugin's chance to override it, so the characteristic cannot
+   * carry the version across a restart and the context does. The write belongs here because this is the window Homebridge provides: it runs before any controller
+   * exists and before the accessory joins the bridge, so HomeKit never sees the placeholder on an accessory whose version is known.
+   *
+   * It writes only while the account credentials are configured, because only then is the persisted version one a refresh is on its way to confirm. Without them
+   * the version is a stale fact nothing will ever update, the placeholder stands, and the controller clears the context's copy when it configures the accessory.
+   * A missing or malformed version writes nothing, and a zone accessory never reaches the write, because the context predicate classifies a context carrying a
+   * version as a controller's.
+   */
+  private restoreFirmware(accessory: HydrawiseAccessory): void {
+
+    const firmware = accessory.context.firmware;
+
+    if(!this.hasV2Client || !isFirmwareVersion(firmware)) {
+
+      return;
+    }
+
+    accessory.getService(this.hap.Service.AccessoryInformation)?.updateCharacteristic(this.hap.Characteristic.FirmwareRevision, firmware);
   }
 
   /** The Not Responding rule for one cached accessory, as its restore-time handlers read it: the accessory refuses while the controller that owns it cannot vouch

@@ -182,8 +182,9 @@ export const HYDRAWISE_SUSPEND_DURATION = 31556926;
  *
  * It is a real write rather than an omitted one on purpose. Homebridge stamps it on every accessory it restores, while a fresh accessory carries HAP's own default
  * version instead, so the write is what gives an unenriched controller one spelling of an unknown version whichever way its accessory arrived. On a restored
- * accessory the write matches what Homebridge already stamped, so HAP sends HomeKit no event for it, and the unenriched display is exactly what it has always
- * been.
+ * accessory the write matches what Homebridge already stamped, because the platform writes a persisted version over that stamp only on a controller accessory
+ * while the account credentials are configured, which is never where this write runs. HAP therefore sends HomeKit no event for it, and an unenriched display
+ * reads Homebridge's own marker.
  */
 export const HOMEBRIDGE_UNKNOWN_FIRMWARE = "0";
 

@@ -6,9 +6,9 @@ import type { API, CharacteristicValue, HAP, Service } from "homebridge";
 import { HAP_DEFAULT_MODEL, HAP_DURATION_CEILING, HOMEBRIDGE_UNKNOWN_FIRMWARE, HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER,
   HYDRAWISE_API_NEXTPOLL_MAX, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_POLL_LOSS_THRESHOLD, HYDRAWISE_REVERT_DELAY,
   HYDRAWISE_SUSPEND_DURATION, HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
-import { HYDRAWISE_UNSCHEDULED_SENTINEL, HydrawiseReservedNames, controllerDisplayName, controllerIdentity, isControllerIdentity, isScheduleStatus,
-  isSuspendZoneSubtype, isZoneIdentity, isZoneStoppedBySensor, sameControllerIdentity, sameScheduleStatus, sameZoneIdentity, scheduleStatus, suspendZoneSubtype,
-  zoneDisplayName, zoneIdentity, zoneScheduleStatus } from "./types.ts";
+import { HYDRAWISE_UNSCHEDULED_SENTINEL, HydrawiseReservedNames, controllerDisplayName, controllerIdentity, isControllerIdentity, isFirmwareVersion,
+  isScheduleStatus, isSuspendZoneSubtype, isZoneIdentity, isZoneStoppedBySensor, sameControllerIdentity, sameScheduleStatus, sameZoneIdentity, scheduleStatus,
+  suspendZoneSubtype, zoneDisplayName, zoneIdentity, zoneScheduleStatus } from "./types.ts";
 import type { HomebridgePluginLogging, MqttAvailabilityPayload, Nullable, RepeatDemotedLog } from "homebridge-plugin-utils";
 import type { HydrawiseAccessory, HydrawiseComposedName, HydrawiseControllerAccessory, HydrawiseControllerConfig, HydrawiseControllerHardware,
   HydrawiseControllerIdentity, HydrawiseControllerV2Facts, HydrawiseScheduleStatus, HydrawiseZoneConfig, HydrawiseZoneIdentity, HydrawiseZoneScheduleStatus,
@@ -362,10 +362,11 @@ export class HydrawiseController {
   // Configure an irrigation system accessory for HomeKit.
   private configureDevice(roster: HydrawiseControllerIdentity[]): void {
 
-    // Capture the prior persisted identity, zone roster, and schedule projection before we wipe the context. We restore all three below so a restart does not blank
-    // the zone list or the schedule panel during the window between this configure pass and the first completed poll, when the runtime has not yet rebuilt either
-    // from a fresh status body.
+    // Capture the prior persisted identity, zone roster, schedule projection, and firmware version before we wipe the context. We restore each of them below so a
+    // restart does not blank the zone list or the schedule panel during the window between this configure pass and the first completed poll, when the runtime has
+    // not yet rebuilt either from a fresh status body, and so the firmware version outlives the wipe.
     const priorController = this.accessory.context.controller;
+    const priorFirmware = this.accessory.context.firmware;
     const priorSchedule = this.accessory.context.schedule;
     const priorZones = this.accessory.context.zones;
 
@@ -389,6 +390,15 @@ export class HydrawiseController {
     if(isScheduleStatus(priorSchedule)) {
 
       this.accessory.context.schedule = priorSchedule;
+    }
+
+    /* Restore the firmware version on the same terms: a well-formed prior value carries over, and a malformed one degrades to absent. The context is the firmware's
+     * only store across a restart, so a value dropped here would be missing from the next cache save, and a restart before the first refresh relearned it would show
+     * Homebridge's placeholder. Without credentials the information setup below clears it, since nothing will ever refresh it.
+     */
+    if(isFirmwareVersion(priorFirmware)) {
+
+      this.accessory.context.firmware = priorFirmware;
     }
 
     // Configure ourselves.
@@ -459,17 +469,21 @@ export class HydrawiseController {
    * a write whose value matches what the characteristic holds, so a compare here would only duplicate HAP's own work and add a second place for the two answers
    * to disagree.
    *
-   * Called WITHOUT hardware on the controller's OWN accessory while the account credentials are configured, it leaves BOTH alone. Those characteristics are the
-   * store: HAP restored the model a previous session wrote, while Homebridge stamped its firmware placeholder on the restore, so a warm restart shows "0" for the
-   * firmware until the first refresh lands. The fetch that will refresh them is already on its way, so writing a placeholder over the model would blank a
-   * correct display for the length of a network round trip. The single exception is an accessory that has never been stamped at all, which still carries HAP's
-   * own default model - there is nothing to preserve there, and leaving it would show the user a library-internal string, so the placeholder is written.
+   * Called WITHOUT hardware on the controller's OWN accessory while the account credentials are configured, it leaves BOTH alone. They hold what a previous
+   * session adopted: HAP restored the model a previous session wrote, and before this controller existed the platform wrote the firmware version the
+   * accessory's context carries in place of Homebridge's restore placeholder, so a warm restart shows the model and the firmware from the start. An accessory
+   * whose context carries no version shows that placeholder until the first refresh lands. The fetch that will refresh them is already on its way, so writing a
+   * placeholder over them would blank a correct display for the length of a network round trip. The single exception is an accessory that has never been
+   * stamped at all, which still carries HAP's own default model - there is nothing to preserve there, and leaving it would show the user a library-internal
+   * string, so the placeholder is written.
    *
    * Called WITHOUT hardware and with no credentials configured, both write unconditionally: the product-line placeholder, and the firmware returned to the
    * unknown-firmware marker Homebridge itself stamps on a restored accessory. The model's reset is what makes removing the credentials a clean revert - the
    * characteristic outlives the credentials that populated it, so an omitted write would strand a real model on display permanently, with nothing left in the
-   * plugin that could refresh or correct it. Homebridge stamps the firmware marker on every restore itself, so the firmware write changes only a fresh accessory,
-   * which HAP constructs with a default version of its own.
+   * plugin that could refresh or correct it. Homebridge stamps the firmware marker on every restore itself, and the platform writes a persisted version over it
+   * only while credentials are configured, so the firmware write changes only a fresh accessory, which HAP constructs with a default version of its own. The
+   * version the controller's own context carries is cleared on the same terms, since nothing will ever refresh it, and the clear marks the accessory for the save
+   * window only when there is a version to clear.
    */
   private configureInfo({ accessory, hardware, serialNumber }: { accessory: HydrawiseAccessory; hardware?: HydrawiseControllerHardware; serialNumber: string } =
     { accessory: this.accessory, serialNumber: this.controller.serial_number }): void {
@@ -516,6 +530,13 @@ export class HydrawiseController {
 
     informationService?.updateCharacteristic(this.hap.Characteristic.Model, "Hydrawise");
     informationService?.updateCharacteristic(this.hap.Characteristic.FirmwareRevision, HOMEBRIDGE_UNKNOWN_FIRMWARE);
+
+    // The clear reads the controller's own accessory alone. A standalone zone accessory takes this arm on a credentialed install too, where the version its
+    // controller's context carries is one a refresh keeps current.
+    if((accessory === this.accessory) && (this.accessory.context.firmware !== undefined)) {
+
+      this.platform.persistence.persist(this.accessory, { firmware: undefined });
+    }
   }
 
   /* Adopt the facts the account-credentialed API reported for this controller: display them, project them, and make whatever moved durable.
@@ -524,10 +545,10 @@ export class HydrawiseController {
    * the snapshot this controller was holding on entry; a comparison written against the field after the store would read the new value on both sides and could
    * never report a change. The first arrival counts as a change whenever it carries hardware, since that arrival is the one that has to reach the disk.
    *
-   * The characteristics are the store the hardware facts have, and no parallel copy is kept. HAP round-trips them through Homebridge's on-disk accessory cache,
-   * so writing them here and marking the accessory for the save window is the whole of the persistence, with one exception Homebridge itself makes: it stamps
-   * its firmware placeholder on every restore before the plugin sees the accessory, so a warm restart shows "0" for the firmware until the first refresh lands,
-   * while the model carries over.
+   * The model's characteristic is the only store it has. HAP round-trips it through Homebridge's on-disk accessory cache, so writing it here and marking the
+   * accessory for the save window is the whole of its persistence. The firmware has a second home in the accessory's context, because Homebridge stamps its
+   * firmware placeholder over the characteristic on every restore before the plugin sees the accessory. The mark below carries the version into the context, and
+   * the platform writes it back over the placeholder at restore, so a credentialed warm restart shows the firmware this method last adopted.
    *
    * The mark is CHANGE-GATED, and on a recurring cadence that gate is the point: a tick that moved nothing would otherwise write the accessory cache to disk
    * every quarter hour for no reason at all. It is made only when the hardware genuinely differs from what this controller already held, and a projection the
@@ -548,7 +569,7 @@ export class HydrawiseController {
 
       if(!this.sameHardware(prior?.hardware ?? null, facts.hardware)) {
 
-        this.platform.persistence.persist(this.accessory);
+        this.platform.persistence.persist(this.accessory, { firmware: facts.hardware.firmware });
       }
     }
 

@@ -284,9 +284,10 @@ export const HYDRAWISE_V2_CONTROLLER_FIRMWARE = "controller";
 
 /* The hardware facts of a single irrigation controller: the model name and the firmware version, as HomeKit's AccessoryInformation service shows them.
  *
- * This shape is IN MEMORY only, and deliberately so. It is composed from one wire answer, carried as far as the characteristic writes, and then dropped - HAP
- * already retains characteristic values across restarts through Homebridge's accessory cache, so persisting these fields anywhere else would be a second store of
- * the same displayed state, and two stores of one fact eventually disagree. The characteristics ARE the store.
+ * This shape is IN MEMORY only, and deliberately so. It is composed from one wire answer, carried as far as the characteristic writes, and then dropped. HAP
+ * retains characteristic values across restarts through Homebridge's accessory cache, so the model's characteristic is its only store, and a second copy would
+ * be two stores of one fact that eventually disagree. The firmware is the one exception: Homebridge overwrites its characteristic with a placeholder on every
+ * restore, so the controller accessory's context carries the version as well, as the context's own comment below explains.
  *
  * Both fields are required strings, which is the whole point of the compose helper below returning null on a partial answer: a half-populated shape would put a
  * real model beside an empty firmware and leave HomeKit showing a fact this plugin never learned.
@@ -317,6 +318,13 @@ export function controllerHardware(hardware: HydrawiseV2HardwareBlock | undefine
   }
 
   return { firmware, model };
+}
+
+// Validate a firmware version read back from a controller accessory's context: a non-empty string, which is the only value the facts adoption ever writes there,
+// since the compose helper above refuses an empty one. A malformed value counts as absent, so a corrupt cache entry is never displayed.
+export function isFirmwareVersion(value: unknown): value is string {
+
+  return (typeof value === "string") && (value.length > 0);
 }
 
 /* What the account-credentialed API knows about a single zone that the key-based API cannot express: the zone's full name, whether a rain-class sensor is stopping
@@ -882,18 +890,23 @@ export function sameScheduleStatus(a: ComparedScheduleFields, b: ComparedSchedul
 /* The typed HomeKit accessory context this plugin persists on every accessory it owns. Homebridge round-trips this object verbatim through its on-disk cache, so it
  * holds only plain, JSON-serializable data the webUI can read back with zero cloud calls.
  *
- * The context carries two distinct persisted kinds side by side, each with its own types, its own guards, and its own flush discipline. Stable identity - the
+ * The context carries distinct persisted kinds side by side, each with its own types, its own guards, and its own flush discipline. Stable identity - the
  * self-identity, the denormalized account roster, the zone roster, and the zone-accessory pair - answers who a thing is, and its types never carry volatile fields.
  * The schedule projection answers what a controller's zones are doing; it is volatile by subject but change-shaped by construction, storing absolute instants that
  * hold still between polls, so it is written on the same compare-then-write terms identity is. Both are read straight off the accessory cache, which is what keeps
  * the webUI's listing and its schedule display free of any cloud call.
  *
+ * The firmware version is the one hardware fact the context carries, written when the account reports hardware that differs from what the controller held. The
+ * model needs no copy here, because HAP round-trips its characteristic through the same cache and it survives a restart there. The firmware's characteristic does
+ * not: Homebridge overwrites it with a placeholder on every restore, before the plugin is handed the accessory, so the context is what carries the version across
+ * a restart, and the platform writes it back over that placeholder as the accessory is restored while the account credentials are configured.
+ *
  * The accessory KINDS are mutually exclusive, and the arms below state that in the types rather than leaving it to convention. A controller accessory carries
  * its own identity (the self-identity the webUI's zone lookup keys on), the denormalized account roster (every account controller, enabled or not, so any one
- * accessory knows all its siblings), its own zone roster, and its schedule projection; it never carries the zone-accessory pair. A standalone zone accessory carries
- * exactly that pair - the owning controller's identity and the zone's own - and never any controller-accessory field. Each arm types the other kind's fields as
- * `never`, so an object carrying both shapes at once inhabits neither. That split is what the webUI's controller match rests on: it finds a controller by reading
- * `controller`, so a zone accessory carrying that field would shadow the real controller accessory and blank the zone listing.
+ * accessory knows all its siblings), its own zone roster, its schedule projection, and its firmware version; it never carries the zone-accessory pair. A
+ * standalone zone accessory carries exactly that pair - the owning controller's identity and the zone's own - and never any controller-accessory field. Each arm
+ * types the other kind's fields as `never`, so an object carrying both shapes at once inhabits neither. That split is what the webUI's controller match rests on:
+ * it finds a controller by reading `controller`, so a zone accessory carrying that field would shadow the real controller accessory and blank the zone listing.
  *
  * The arms are deliberately asymmetric in what they require. Every controller-arm field is optional, so a freshly constructed `{}` and a cache entry carrying only
  * some of the fields both inhabit that arm, and an ambiguous or empty context classifies as controller-side - the self-healing direction, and the same answer the
@@ -908,6 +921,7 @@ export interface HydrawiseControllerAccessoryContext {
 
   controller?: HydrawiseControllerIdentity;
   controllers?: HydrawiseControllerIdentity[];
+  firmware?: string;
   ownerController?: never;
   schedule?: HydrawiseScheduleStatus;
   zone?: never;
@@ -920,6 +934,7 @@ export interface HydrawiseZoneAccessoryContext {
 
   controller?: never;
   controllers?: never;
+  firmware?: never;
   ownerController: HydrawiseControllerIdentity;
   schedule?: never;
   zone: HydrawiseZoneIdentity;
@@ -943,7 +958,7 @@ export type HydrawiseAccessoryContext = Readonly<HydrawiseControllerAccessoryCon
 export function isZoneAccessoryContext(context: HydrawiseAccessoryContext): context is Readonly<HydrawiseZoneAccessoryContext> {
 
   return isControllerIdentity(context.ownerController) && isZoneIdentity(context.zone) && (context.controller === undefined) &&
-    (context.controllers === undefined) && (context.schedule === undefined) && (context.zones === undefined);
+    (context.controllers === undefined) && (context.firmware === undefined) && (context.schedule === undefined) && (context.zones === undefined);
 }
 
 // A Hydrawise accessory of either kind: a Homebridge PlatformAccessory whose context is our typed union. This is the alias for every surface that genuinely sees

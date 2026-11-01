@@ -5,7 +5,8 @@
  *
  * Two things are being told apart throughout. The GATE decides whether a client exists at all, and it answers to the configured credentials; the DISTRIBUTION
  * decides which controller receives which facts, and it answers to the correlation id that v1 and the account API agree about. A test that conflated them could pass
- * with the wrong controller enriched.
+ * with the wrong controller enriched. The firmware restore rows cover what the platform writes as Homebridge restores an accessory: the version a controller
+ * accessory's context carries, written back over Homebridge's placeholder while the credentials are configured.
  *
  * What these tests deliberately do NOT wait on is the loop's quarter-hour sleep. The real platform runs on the system clock and takes no other, so the second tick
  * is driven through the production refresh method directly, and the sleep between ticks is covered by the constants receipt in the settings suite rather than by a
@@ -14,17 +15,17 @@
 // The Hydrawise API wire shapes use snake_case keys such as controller_id, so camelcase is disabled here to let the controller fixture mirror the wire verbatim.
 /* eslint-disable camelcase */
 import { Characteristic, Service, buildPlatform, installMockDispatcher, installV2Client, makeTestV2Client, makeV2Facts, programJsonReply, refreshV2FactsOnce,
-  v2BudgetOf, waitFor } from "./testing/platform.helpers.ts";
+  seedAccessory, v2BudgetOf, waitFor } from "./testing/platform.helpers.ts";
 import { HOMEBRIDGE_UNKNOWN_FIRMWARE, HYDRAWISE_V2_BUDGET_CALLS } from "./settings.ts";
 import type { Characteristic as HapCharacteristic, PlatformAccessory, WithUUID } from "homebridge";
 import type { HydrawiseAccessoryContext, HydrawiseControllerHardware } from "./types.ts";
+import { controllerIdentity, zoneAccessoryId } from "./types.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeCustomerDetails, normalSchedule } from "./api.helpers.ts";
 import { logCount, loggedAt, waitUntil } from "homebridge-plugin-utils/testing";
 import type { TestLogEntry } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
 import { syntheticController } from "./api.fixtures.ts";
-import { zoneAccessoryId } from "./types.ts";
 
 const DID_FINISH_LAUNCHING = "didFinishLaunching";
 const SHUTDOWN = "shutdown";
@@ -160,8 +161,7 @@ describe("HydrawisePlatform hardware distribution", () => {
     assert.equal(informationValue(first, Characteristic.FirmwareRevision), FIRST_HARDWARE.firmware, "the first controller shows its own firmware");
     assert.equal(informationValue(second, Characteristic.FirmwareRevision), SECOND_HARDWARE.firmware, "the second controller shows its own firmware");
 
-    // The durable half of the same claim: the characteristics ARE the store, so the tick that landed the hardware saved each accessory with its own values and
-    // the next restart reads the model straight back.
+    // The durable half of the same claim: the tick that landed the hardware saved each accessory with its own values, which is what the next restart reads back.
     const saves = updated().slice(savesBefore);
 
     assert.ok(saves.some(batch => batch.includes(first)), "the tick's save carries the first controller's accessory");
@@ -346,6 +346,70 @@ describe("HydrawisePlatform hardware distribution", () => {
     // Silence is part of the contract, not incidental: a user who configured nothing but an API key should see no trace of a capability they never turned on.
     assert.ok(!loggedAnywhere(entries, "Enhanced features"), "no enhanced-features line appears at all");
     assert.ok(!loggedAnywhere(entries, "enhanced features refresh"), "and no refresh loop reports itself");
+  });
+});
+
+describe("HydrawisePlatform firmware restore", () => {
+
+  // The synthetic controller's persisted identity, as a previous session wrote it into its accessory's context and into a zone accessory's owner stamp.
+  const OWNER = controllerIdentity(syntheticController);
+
+  // Restore a controller accessory whose context carries the firmware value given, under a UUID derived from the id given, so a row can restore several of them
+  // side by side.
+  function restoreController(platform: Parameters<typeof seedAccessory>[0], id: number, firmware: unknown): PlatformAccessory {
+
+    return seedAccessory(platform, "Controller " + id.toString(), platform.hap.uuid.generate(id.toString()), (seed) => {
+
+      seed.context = { controller: OWNER, firmware };
+    });
+  }
+
+  test("a credentialed restore shows a controller accessory's persisted firmware at once, and a zone accessory keeps Homebridge's placeholder", (t) => {
+
+    const { emit, platform } = buildPlatform({ options: CREDENTIAL_OPTIONS });
+
+    t.after(() => emit(SHUTDOWN));
+
+    /* Each accessory is read straight after its restore, before discovery or any refresh has run, because that is the window the restore exists for. Homebridge
+     * stamps its placeholder before it hands an accessory over, so a version on display here can only have come from the context.
+     */
+    const controller = restoreController(platform, syntheticController.controller_id, FIRST_HARDWARE.firmware);
+    const zone = seedAccessory(platform, "Front Lawn", platform.hap.uuid.generate(zoneAccessoryId(syntheticController.controller_id, STANDALONE_RELAY_ID)),
+      (seed) => {
+
+        seed.context = { ownerController: OWNER, zone: { name: "Front Lawn", relay: 1, relayId: STANDALONE_RELAY_ID } };
+      });
+
+    assert.equal(informationValue(controller, Characteristic.FirmwareRevision), FIRST_HARDWARE.firmware,
+      "the controller accessory shows the version its context carries");
+    assert.equal(informationValue(zone, Characteristic.FirmwareRevision), HOMEBRIDGE_UNKNOWN_FIRMWARE, "and the zone accessory keeps Homebridge's placeholder");
+  });
+
+  test("a missing or malformed version keeps Homebridge's placeholder, and so does any version without credentials", (t) => {
+
+    const credentialed = buildPlatform({ options: CREDENTIAL_OPTIONS });
+    const keyOnly = buildPlatform();
+
+    t.after(() => {
+
+      credentialed.emit(SHUTDOWN);
+      keyOnly.emit(SHUTDOWN);
+    });
+
+    const malformed: [string, unknown][] = [ [ "an absent version", undefined ], [ "an empty version", "" ], [ "a numeric version", 4.76 ],
+      [ "a version in an array", [FIRST_HARDWARE.firmware] ], [ "a version in an object", { version: FIRST_HARDWARE.firmware } ] ];
+
+    for(const [ index, [ description, firmware ] ] of malformed.entries()) {
+
+      const restored = restoreController(credentialed.platform, syntheticController.controller_id + index + 1, firmware);
+
+      assert.equal(informationValue(restored, Characteristic.FirmwareRevision), HOMEBRIDGE_UNKNOWN_FIRMWARE, description + " writes nothing");
+    }
+
+    // Without credentials the version is a stale fact nothing will refresh, so even a well-formed one stays off the display.
+    const stale = restoreController(keyOnly.platform, syntheticController.controller_id, FIRST_HARDWARE.firmware);
+
+    assert.equal(informationValue(stale, Characteristic.FirmwareRevision), HOMEBRIDGE_UNKNOWN_FIRMWARE, "an install with an API key alone keeps the placeholder");
   });
 });
 

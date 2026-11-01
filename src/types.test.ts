@@ -1,13 +1,15 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * types.test.ts: The reserved-name constants, the controller and zone name composers, and the fixture-versus-interface conformance check. The interfaces are
- * compile-time contracts; this file asserts the reserved-name constant and its subtype compose/recognize pair, each source a composer answers from, and verifies
- * the synthetic fixtures carry the required wire fields with wire-accurate types.
+ * types.test.ts: The reserved-name constants, the controller and zone name composers, the accessory-context classification, and the fixture-versus-interface
+ * conformance check. The interfaces are compile-time contracts; this file asserts the reserved-name constant and its subtype compose/recognize pair, each source a
+ * composer answers from, the context predicate's reading of cache JSON no static type governs, and verifies the synthetic fixtures carry the required wire fields
+ * with wire-accurate types.
  */
-import { HYDRAWISE_CONTROLLER_FALLBACK_NAME, HYDRAWISE_ZONE_FALLBACK_NAME, HydrawiseReservedNames, controllerDisplayName, isSuspendZoneSubtype,
-  suspendZoneSubtype, zoneDisplayName } from "./types.ts";
+import { HYDRAWISE_CONTROLLER_FALLBACK_NAME, HYDRAWISE_ZONE_FALLBACK_NAME, HydrawiseReservedNames, controllerDisplayName, controllerIdentity, isSuspendZoneSubtype,
+  isZoneAccessoryContext, suspendZoneSubtype, zoneDisplayName } from "./types.ts";
 import { UNSCHEDULED_SENTINEL, normalZoneMatrix, sentinelZoneMatrix, syntheticController, syntheticCustomerDetails } from "./api.fixtures.ts";
 import { describe, test } from "node:test";
+import type { HydrawiseAccessoryContext } from "./types.ts";
 import assert from "node:assert/strict";
 import { expectAt } from "homebridge-plugin-utils/testing";
 
@@ -82,6 +84,22 @@ describe("hydrawise name composers", () => {
 
     assert.deepEqual(controllerDisplayName({ reported: "Controller" }), { name: "Controller", source: "reported" }, "a controller Hydrawise names Controller");
     assert.deepEqual(zoneDisplayName({ relay: 3, reported: "Zone 3" }), { name: "Zone 3", source: "reported" }, "a zone Hydrawise names Zone 3 at relay 3");
+  });
+});
+
+describe("hydrawise accessory contexts", () => {
+
+  test("a zone pair carrying a firmware version is not a zone accessory context", () => {
+
+    const ownerController = controllerIdentity(syntheticController);
+    const zone = { name: "Front Lawn", relay: 1, relayId: 700001 };
+
+    // The ambiguous shape inhabits neither arm of the context union, so it reaches the predicate through a cast, the way cache JSON Homebridge round-trips from
+    // disk reaches it with no static type at all.
+    const ambiguous = { firmware: "4.76", ownerController, zone } as unknown as HydrawiseAccessoryContext;
+
+    assert.ok(isZoneAccessoryContext({ ownerController, zone }), "the zone pair alone is a zone accessory context");
+    assert.ok(!isZoneAccessoryContext(ambiguous), "a firmware version on a zone accessory makes it classify as not-a-zone, the self-healing direction");
   });
 });
 
