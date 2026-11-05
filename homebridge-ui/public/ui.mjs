@@ -907,25 +907,20 @@ const renderDeviceDetails = ({ device, panel }) => {
   if(isController(device)) {
 
     /* A controller renders inside one bordered box as an identity-and-state strip across the top, then whatever detail the schedule has to add. The framework's
-     * own status-grid modifier already expresses exactly that - it wraps the cells and sizes each to its own content - so the layout is composed from the shared
-     * classes rather than from new local CSS, and a full-width break element separates the strip from the schedule detail below it. Which cells the strip carries,
-     * and in what order, is the display module's derivation; this renderer only turns each row into its element.
+     * status-grid modifier is a column grid whose track count the grid states for itself through the `--fo-status-tracks` variable, exactly as HBPU's own status
+     * panel does, so the layout is composed from the shared classes rather than from new local CSS. The strip states one track per cell, which lays the whole strip
+     * on the first line and starts the detail on the line beneath, flowing along the same tracks; a grid that states no count falls to the modifier's single track
+     * and stacks every cell in one column. Which cells the strip carries, and in what order, is the display module's derivation; this renderer only turns each row
+     * into its element.
      */
     const controllerDisplay = deriveControllerDisplay(device.schedule, device.zoneNames, nowSeconds);
+    const strip = deriveControllerStrip({ hardware: device.hardware, serialNumber: device.serialNumber, status: controllerDisplay.status,
+      zoneCount: device.zoneCount });
 
     grid.classList.add("fo-status-grid");
+    grid.style.setProperty("--fo-status-tracks", strip.length.toString());
 
-    grid.append(...deriveControllerStrip({ hardware: device.hardware, serialNumber: device.serialNumber, status: controllerDisplay.status,
-      zoneCount: device.zoneCount }).map((row) => buildStatRow(row.label, row.value, row.monospace ? "stat-value font-monospace" : "stat-value")));
-
-    // The break closes the strip so the detail below starts its own line, even when the strip has room left over.
-    if(controllerDisplay.detail.length) {
-
-      const rowBreak = document.createElement("div");
-
-      rowBreak.className = "fo-row-break";
-      grid.append(rowBreak);
-    }
+    grid.append(...strip.map((row) => buildStatRow(row.label, row.value, row.monospace ? "stat-value font-monospace" : "stat-value")));
 
     derived = { rows: controllerDisplay.detail, stale: controllerDisplay.stale };
   } else {
