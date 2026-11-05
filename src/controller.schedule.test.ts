@@ -8,14 +8,14 @@
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { HYDRAWISE_RAIN_SENSOR_TYPE, HYDRAWISE_UNSCHEDULED_SENTINEL, isScheduleStatus, isZoneAccessoryContext, isZoneScheduleStatus, sameScheduleStatus,
-  scheduleStatus, zoneIdentity } from "./types.ts";
+import { HYDRAWISE_RAIN_SENSOR_TYPE, HYDRAWISE_UNSCHEDULED_SENTINEL, controllerV2Facts, isScheduleStatus, isZoneAccessoryContext, isZoneScheduleStatus,
+  sameScheduleStatus, scheduleStatus, zoneIdentity } from "./types.ts";
 import type { HydrawiseAccessoryContext, HydrawiseScheduleStatus, HydrawiseZoneConfig, HydrawiseZoneIdentity, HydrawiseZoneScheduleState,
   StatusScheduleResponse } from "./types.ts";
 import { bareSensors, normalZoneMatrix, rainSensors, sentinelZoneMatrix, syntheticController } from "./api.fixtures.ts";
 import { buildController, buildPlatform, makeV2Facts, makeZoneV2Facts, pollsCompleted, seedEstablished } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
-import { expectAt, waitUntil } from "homebridge-plugin-utils/testing";
+import { expectAt, logCount, waitUntil } from "homebridge-plugin-utils/testing";
 import { fastPolling, makeStatusSchedule, makeZone, normalSchedule, rainStopped } from "./api.helpers.ts";
 import { HYDRAWISE_ACTIVE_ZONE_INDICATOR } from "./settings.ts";
 import assert from "node:assert/strict";
@@ -622,6 +622,76 @@ describe("HydrawiseController schedule classification with account facts", () =>
       { facts: makeV2Facts({ zones: sentinelZoneMatrix.map(zone => [ zone.relay_id, makeZoneV2Facts({ sensorStopped: null }) ]) }) });
 
     assert.ok(unknown.zones.every(zone => zone.state === "sensor-stopped"), "a sensor answer this plugin cannot read degrades to exactly today's behavior");
+  });
+
+  test("a zone an error's path names is omitted from the facts, so a suspended zone stays suspended through its carry", async (t) => {
+
+    const h = buildController({ hasV2Client: true, program: (recorder) => recorder.programDefault("statusschedule.php",
+      { body: schedule([sentinelZone()]), kind: "response" }), signalAborted: false });
+
+    t.after(() => h.abort());
+
+    await waitUntil(() => contextOf(h.accessory).schedule !== undefined, { description: "the first poll to persist its projection" });
+
+    h.controller.applyFacts({ facts: makeV2Facts({ zones: [[ ALPHA_RELAY_ID, makeZoneV2Facts({ suspendedUntil: SUSPENDED_UNTIL }) ]] }),
+      fetchedAt: Math.floor(Date.now() / 1000) });
+
+    assert.deepEqual(scheduleOf(h.accessory).zones, [{ relayId: ALPHA_RELAY_ID, state: "suspended", until: SUSPENDED_UNTIL }], "the zone starts out suspended");
+
+    // The server nulled the zone's suspension for the error, which reads the same as a real "no suspension". The list's own indexes name the entry, a null entry ahead
+    // of it counted, as the wire's path counts it.
+    const facts = controllerV2Facts({ zones: [ null, { id: ALPHA_RELAY_ID, status: { suspendedUntil: null } },
+      { id: BETA_RELAY_ID, status: { suspendedUntil: null } } ] }, [[ "zones", 1, "status", "suspendedUntil" ]]);
+
+    assert.deepEqual([...facts.zones.keys()], [BETA_RELAY_ID], "the zone the error names is omitted, and the zone beside it stands");
+
+    h.controller.applyFacts({ facts, fetchedAt: Math.floor(Date.now() / 1000) });
+
+    assert.deepEqual(scheduleOf(h.accessory).zones, [{ relayId: ALPHA_RELAY_ID, state: "suspended", until: SUSPENDED_UNTIL }], "so it keeps its carry");
+    assert.equal(logCount(h.entries, "info", "Suspension lifted."), 0, "and says nothing of a suspension that never lifted");
+  });
+
+  test("an incomplete sensor list makes every zone's reading unknown, and a complete one still answers", () => {
+
+    const zones = [ { id: ALPHA_RELAY_ID }, { id: BETA_RELAY_ID } ];
+    const quiet = { model: { sensorType: "LEVEL_CLOSED" }, status: { active: false }, zones: [{ id: BETA_RELAY_ID }] };
+    const cells = [ { errorPaths: [], label: "a null entry", sensors: [ quiet, null ] },
+      { errorPaths: [[ "sensors", 0, "status", "active" ]], label: "an error under the sensors", sensors: [quiet] },
+      { errorPaths: [], label: "a counted sensor with no covered zones", sensors: [{ ...quiet, zones: undefined }] },
+      { errorPaths: [], label: "a counted sensor whose covered zones hold a null entry", sensors: [{ ...quiet, zones: [ null, { id: BETA_RELAY_ID } ] }] } ];
+
+    for(const { errorPaths, label, sensors } of cells) {
+
+      const facts = controllerV2Facts({ sensors, zones }, errorPaths);
+
+      assert.equal(facts.zones.get(ALPHA_RELAY_ID)?.sensorStopped, null, label + " leaves a zone no sensor it can read covers unknown");
+      assert.equal(facts.zones.get(BETA_RELAY_ID)?.sensorStopped, null, label + " leaves a zone the quiet sensor covers unknown too");
+    }
+
+    const complete = controllerV2Facts({ sensors: [quiet], zones });
+
+    assert.equal(complete.zones.get(ALPHA_RELAY_ID)?.sensorStopped, false, "a complete list reads an uncovered zone as clear");
+    assert.equal(complete.zones.get(BETA_RELAY_ID)?.sensorStopped, false, "and a zone its quiet sensor covers as clear");
+  });
+
+  test("with two level sensors and one nulled, a zone the nulled sensor may cover is not read as clear", async (t) => {
+
+    // Both zones under one type-1 sensor carry the unscheduled shape, which the key-based inference reads as a rain stop. A quiet reading from the facts would retire
+    // that inference, so reading the nulled sensor as absent would call a real rain stop no stop at all.
+    const body = schedule([ sentinelZone(), sentinelZone({ name: "Beta", relay: 2, relay_id: BETA_RELAY_ID }) ], sensorsCovering([ ALPHA_RELAY_ID, BETA_RELAY_ID ]));
+    const h = buildController({ hasV2Client: true, program: (recorder) => recorder.programDefault("statusschedule.php", { body, kind: "response" }),
+      signalAborted: false });
+
+    t.after(() => h.abort());
+
+    await waitUntil(() => contextOf(h.accessory).schedule !== undefined, { description: "the first poll to persist its projection" });
+
+    const quiet = { model: { sensorType: "LEVEL_CLOSED" }, status: { active: false }, zones: [{ id: BETA_RELAY_ID }] };
+    const facts = controllerV2Facts({ sensors: [ quiet, null ], zones: [ { id: ALPHA_RELAY_ID }, { id: BETA_RELAY_ID } ] });
+
+    h.controller.applyFacts({ facts, fetchedAt: Math.floor(Date.now() / 1000) });
+
+    assert.deepEqual(scheduleOf(h.accessory).zones.map(zone => zone.state), [ "sensor-stopped", "sensor-stopped" ], "the inference still decides for both");
   });
 
   test("a zone both suspended and covered by a tripped sensor classifies as suspended", () => {

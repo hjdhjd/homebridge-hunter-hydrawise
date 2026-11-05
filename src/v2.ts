@@ -2,10 +2,11 @@
  *
  * v2.ts: Hydrawise v2 GraphQL API client.
  */
-import { HYDRAWISE_TRANSPORT_FAULT_SENTENCES, HYDRAWISE_V2_CLIENT_ID, HYDRAWISE_V2_CLIENT_SECRET, HYDRAWISE_V2_GRAPH_ENDPOINT, HYDRAWISE_V2_REFRESH_THRESHOLD,
-  HYDRAWISE_V2_TIMEOUT, HYDRAWISE_V2_TOKEN_ENDPOINT, PLUGIN_NAME } from "./settings.ts";
+import { HYDRAWISE_TRANSPORT_FAULT_SENTENCES, HYDRAWISE_V2_CLIENT_ID, HYDRAWISE_V2_CLIENT_SECRET, HYDRAWISE_V2_GRAPH_ENDPOINT, HYDRAWISE_V2_RATE_LIMIT_REASON,
+  HYDRAWISE_V2_REFRESH_THRESHOLD, HYDRAWISE_V2_TIMEOUT, HYDRAWISE_V2_TOKEN_ENDPOINT, PLUGIN_NAME } from "./settings.ts";
 import type { HomebridgePluginLogging, Nullable, RateBudget } from "homebridge-plugin-utils";
-import type { HydrawiseControllerV2Facts, HydrawiseV2Account, HydrawiseV2GraphResponse, HydrawiseV2TokenResponse, HydrawiseV2TokenState } from "./types.ts";
+import type { HydrawiseControllerV2Facts, HydrawiseV2Account, HydrawiseV2ErrorPath, HydrawiseV2Grant, HydrawiseV2GraphError, HydrawiseV2GraphResponse, HydrawiseV2Read,
+  HydrawiseV2TokenResponse, HydrawiseV2TokenState } from "./types.ts";
 import { classifyTransportError, composeSignals, createApiDispatcher } from "homebridge-plugin-utils";
 import type { Dispatcher } from "undici";
 import { controllerV2Facts } from "./types.ts";
@@ -18,9 +19,9 @@ import util from "node:util";
  * one of their own.
  *
  * The selection is deliberately narrow, because every field asked for is a field that can fail: neighboring fields on these same types answer with a server-side
- * error, and a GraphQL error anywhere in a selection is reported against the whole response. Two omissions rest on probe evidence rather than caution - the
- * sensor model's `mode`, which answers a 500 and nullifies the sensor entry carrying it, and the zone status's `lastRun` and `nextRun`, which went unproven
- * against the live endpoint and which the key-based wire already answers.
+ * error, and a field that errors costs the entry it sits in, whatever else that entry would have said. Two omissions rest on probe evidence rather than caution -
+ * the sensor model's `mode`, which answers an internal error under HTTP 200 and nulls the sensor entry carrying it, and the zone status's `lastRun` and `nextRun`,
+ * which went unproven against the live endpoint and which the key-based wire already answers.
  *
  * suspendedUntil is a DateTime object rather than a scalar, so it takes a subselection; its timestamp is the absolute instant a suspension lifts. Availability
  * is read from the controller's nested status block, leaving the flat sibling field of the same name unread.
@@ -28,12 +29,12 @@ import util from "node:util";
 const ACCOUNT_QUERY = "query { me { controllers { id name status { online } hardware { model { description } firmware { type version } } " +
   "zones { id name status { suspendedUntil { timestamp } } } sensors { model { sensorType } status { active } zones { id } } } } }";
 
-// The sentence every failure of the whole-account read is reported under. Both sites that can report one - the pacing wait and the transport itself - read it from
-// here, so the operator sees the same words whichever of them failed.
+// The sentence every failure of the whole-account read is reported under. Every site that can report one reads it from here, so the operator sees the same words
+// whichever of them failed.
 const READ_FAILURE_SENTENCE = "Unable to retrieve enhanced controller details";
 
-// The sentence a sign-in failure is reported under once it reaches classification as a thrown error; the response-shape failures acquireToken() checks directly
-// state their own sentences without drawing on this constant.
+// The sentence a sign-in failure is reported under when the trouble is Hydrawise's or the transport's: a 429, a server error, or a thrown error. A refused password and
+// a grant carrying no token state their own sentences without drawing on this constant, because each says something about the answer rather than about reaching it.
 const TOKEN_FAILURE_SENTENCE = "Unable to sign in to your Hydrawise account for enhanced features";
 
 /* One transport failure, in the parts a caller needs in order to report it: the reason in the operator's own terms, and the punctuation that joins that reason
@@ -48,7 +49,35 @@ interface HydrawiseV2Failure {
   reason: string;
 }
 
-/* What the shared transport answers with: the data a successful call carried, or the failure its caller reports in its own voice.
+// The reason a 429 gives, whichever endpoint answered it. The reason is the plugin's own sentence, so it follows the caller's with a period.
+const RATE_LIMITED: HydrawiseV2Failure = { joiner: ".", reason: HYDRAWISE_V2_RATE_LIMIT_REASON };
+
+// The reason any other status gives, whichever endpoint answered it.
+function statusFailure(statusCode: number): HydrawiseV2Failure {
+
+  return { joiner: ".", reason: "The Hydrawise API answered with status " + statusCode.toString() + "." };
+}
+
+// The reason a body-level errors array gives: the API's own words, quoted rather than said, so a colon joins them.
+function errorsFailure(errors: readonly HydrawiseV2GraphError[]): HydrawiseV2Failure {
+
+  return { joiner: ":", reason: errors.map(entry => entry.message ?? "an unspecified error").join("; ") + "." };
+}
+
+// One failure joined onto the sentence a caller reports it under, so every failure reads in the same voice at whatever level it is written.
+function failureLine(sentence: string, { joiner, reason }: HydrawiseV2Failure): string {
+
+  return sentence + joiner + " " + reason;
+}
+
+// The path of every error under one controller's entry in the whole-account answer, relative to that entry, which is all a controller's facts read of the response.
+function errorPathsUnder(errors: readonly HydrawiseV2GraphError[], index: number): HydrawiseV2ErrorPath[] {
+
+  return errors.flatMap(({ path }) => ((path?.[0] === "me") && (path[1] === "controllers") && (path[2] === index)) ? [path.slice(3)] : []);
+}
+
+/* What the shared transport answers with: the data a call carried with any errors reported beside it, or the failure its caller reports in its own voice, named
+ * apart when Hydrawise throttled the call.
  *
  * It is a discriminated union rather than a nullable value because the caller reports a failure under its own sentence, which it cannot do with a bare null, and a
  * transport that logged on the caller's behalf would narrate one failure twice - once in the transport's words and once in the caller's.
@@ -57,8 +86,8 @@ interface HydrawiseV2Failure {
  * is simply teardown.
  */
 type HydrawiseV2TransportResult<T> =
-  { data: Nullable<T>; outcome: "answered" } |
-  { failure: Nullable<HydrawiseV2Failure>; outcome: "failed" };
+  { data: Nullable<T>; errors: readonly HydrawiseV2GraphError[]; outcome: "answered" } |
+  { failure: Nullable<HydrawiseV2Failure>; outcome: "failed" | "throttled" };
 
 /* Construction options for the v2 client.
  *
@@ -138,7 +167,7 @@ export class HydrawiseV2Client {
    * window - transition the state to "refreshing" SYNCHRONOUSLY, in the same frame that observed the prior state and before any await, so two concurrent callers
    * can never both observe a pre-transition state and each fire a grant of its own. A caller arriving while one is in flight joins that promise instead.
    */
-  public async ensureToken(): Promise<Nullable<string>> {
+  public async ensureToken(): Promise<HydrawiseV2Grant> {
 
     const token = this.token;
 
@@ -151,13 +180,13 @@ export class HydrawiseV2Client {
     // A token comfortably inside its lifetime answers directly, with no call spent.
     if((token.state === "valid") && (token.expiresAt > (this.now() + HYDRAWISE_V2_REFRESH_THRESHOLD))) {
 
-      return token.accessToken;
+      return { accessToken: token.accessToken, status: "granted" };
     }
 
     /* Both remaining cases - no token at all, and a token inside the proactive-renewal window - go to the network. The promise is created and stored here with no
      * await between reading the state above and writing it, which is what makes the single-flight guarantee structural rather than a race we happen to win.
      */
-    const pending = this.acquireToken((token.state === "valid") ? token.refreshToken : null);
+    const pending = this.acquireToken((token.state === "valid") ? token : null);
 
     this.token = { pending, state: "refreshing" };
 
@@ -168,42 +197,60 @@ export class HydrawiseV2Client {
    * answer names without an id cannot be correlated to anything, so it is skipped; every other controller gets an entry, with each individual fact carrying its
    * own absence rather than the whole entry being withheld for one missing field.
    *
-   * A null answer is a failed query. An empty map is a successful query that found nothing to enrich, and the two are deliberately tellable apart: the caller
-   * leaves every display standing either way, but only one of them is worth reporting.
+   * What comes back keeps the outcomes tellable apart. An empty map is a successful query that found nothing to enrich, a failed read has nothing to enrich from, and
+   * a throttled one is the failure the refresh loop paces itself by. The caller leaves every display standing unless facts arrive.
+   *
+   * Errors beside data cost only what they name: each controller is handed the errors under its own index, and every other entry stands. The read fails only when
+   * those errors leave no controller entry at all, because the server nulls a whole controller for an error under a field it cannot null on its own, and answering
+   * that as an empty map would report a connection that enriched nothing while every fact aged out unexplained.
    */
-  public async fetchAccountFacts(): Promise<Nullable<Map<number, HydrawiseControllerV2Facts>>> {
+  public async fetchAccountFacts(): Promise<HydrawiseV2Read> {
 
-    const account = await this.graph<HydrawiseV2Account>(ACCOUNT_QUERY);
+    const result = await this.graph<HydrawiseV2Account>(ACCOUNT_QUERY);
 
-    if(!account) {
+    if(result.outcome !== "answered") {
 
-      return null;
+      return { status: result.outcome };
+    }
+
+    // A body carrying neither data nor errors leaves nothing to enrich from and no reason to report.
+    if(!result.data) {
+
+      return { status: "failed" };
     }
 
     const facts = new Map<number, HydrawiseControllerV2Facts>();
 
-    for(const controller of account.me?.controllers ?? []) {
+    for(const [ index, controller ] of (result.data.me?.controllers ?? []).entries()) {
 
-      if(controller.id === undefined) {
+      if(typeof controller?.id !== "number") {
 
         continue;
       }
 
-      facts.set(controller.id, controllerV2Facts(controller));
+      facts.set(controller.id, controllerV2Facts(controller, errorPathsUnder(result.errors, index)));
     }
 
-    return facts;
+    if(result.errors.length && !facts.size) {
+
+      this.report(READ_FAILURE_SENTENCE, errorsFailure(result.errors));
+
+      return { status: "failed" };
+    }
+
+    return { facts, status: "answered" };
   }
 
-  /* Execute one GraphQL query and answer its data, or null on any failure. The ordering here is the contract: the rate budget is drawn FIRST, ahead of the token
-   * chokepoint and ahead of the request, so a call the ceiling is not ready to admit waits rather than reaching the wire - the same shape the v1 transport uses.
+  /* Execute one GraphQL query and answer what the transport answered, having reported any failure. The ordering here is the contract: the rate budget is drawn FIRST,
+   * ahead of the token chokepoint and ahead of the request, so a call the ceiling is not ready to admit waits rather than reaching the wire - the same shape the v1
+   * transport uses.
    *
    * The wait is deliberately unbounded, which is what a scheduled read wants: it has no deadline of its own to answer by, so waiting out whatever the shared
    * budget's window imposes costs it nothing a bounded wait would spare. The try envelopes BOTH the wait and the transport, so a shutdown reaching a caller still
-   * queued for a slot resolves to the same quiet null every other teardown path answers with rather than escaping as a rejection this method promises never to
+   * queued for a slot resolves to the same quiet failure every other teardown path answers with rather than escaping as a rejection this method promises never to
    * produce.
    */
-  private async graph<T>(query: string): Promise<Nullable<T>> {
+  private async graph<T>(query: string): Promise<HydrawiseV2TransportResult<T>> {
 
     try {
 
@@ -213,28 +260,37 @@ export class HydrawiseV2Client {
       const result = await this.execute<T>(query);
 
       // The read is its own reporter, which is what the transport handing back a reason rather than logging one makes possible.
-      if(result.outcome === "failed") {
+      if(result.outcome !== "answered") {
 
         this.report(READ_FAILURE_SENTENCE, result.failure);
 
-        return null;
+        return result;
       }
 
-      return result.data;
+      // Errors beside data are a partial answer rather than a failure, so they are said at debug, where someone chasing a missing fact can find them.
+      if(result.errors.length) {
+
+        this.log.debug(failureLine(READ_FAILURE_SENTENCE, errorsFailure(result.errors)));
+      }
+
+      return result;
     } catch(error) {
 
-      this.report(READ_FAILURE_SENTENCE, this.classifyFailure(error));
+      const failure = this.classifyFailure(error);
 
-      return null;
+      this.report(READ_FAILURE_SENTENCE, failure);
+
+      return { failure, outcome: "failed" };
     }
   }
 
   /* Present a token, post one GraphQL document, and classify what comes back - the transport every v2 call shares, and the whole of what a call does once it has
    * been admitted. It draws NO budget of its own: pacing belongs to the caller, which has already drawn its slot, and a draw here would count that call twice.
    *
-   * Failure classification reads BOTH halves of the answer. A non-2xx status is a failure, and so is an HTTP 200 whose body carries a GraphQL errors array: this
-   * endpoint reports a failed query in the body under a success status, so trusting the status alone would hand a caller an absent data field as though it were an
-   * answer.
+   * Classification reads BOTH halves of the answer. A non-2xx status is a failure, with a 429 named apart and a 401 dropping the token the server just refused. In
+   * the body, errors with no data are a failure as well: this endpoint reports a failed query under a success status, so trusting the status alone would hand a
+   * caller an absent data field as though it were an answer. Errors beside data are not a failure at all, because the server answers everything it could and nulls
+   * only what failed, so the data comes back with those errors beside it for the caller to weigh.
    *
    * It LOGS nothing at all, and that absence is the contract. What comes back is the reason, never a line, because who speaks about a failure is the caller's
    * business: the read says it under its own sentence. A transport that reported on its behalf would leave one failure narrated twice, in two voices, for one
@@ -244,31 +300,47 @@ export class HydrawiseV2Client {
 
     try {
 
-      const token = await this.ensureToken();
+      const grant = await this.ensureToken();
 
-      // A grant that failed has already said so in its own words, so there is nothing left for this failure to carry.
-      if(!token) {
+      // A grant that did not come has already said why in its own words, so there is nothing left for this failure to carry but its kind.
+      if(grant.status !== "granted") {
 
-        return { failure: null, outcome: "failed" };
+        return { failure: null, outcome: grant.status };
       }
 
       const response = await request(HYDRAWISE_V2_GRAPH_ENDPOINT, { body: JSON.stringify({ query }), dispatcher: this.currentDispatcher,
-        headers: { "authorization": "Bearer " + token, "content-type": "application/json" }, method: "POST", signal: this.requestSignal() });
+        headers: { "authorization": "Bearer " + grant.accessToken, "content-type": "application/json" }, method: "POST", signal: this.requestSignal() });
 
       if((response.statusCode < 200) || (response.statusCode >= 300)) {
 
-        return { failure: { joiner: ".", reason: "The Hydrawise API answered with status " + response.statusCode.toString() + "." }, outcome: "failed" };
+        // The pool holds a single connection, and a body nobody reads holds that connection until it is consumed, so an unread body would stall the next request.
+        await response.body.dump();
+
+        if(response.statusCode === 429) {
+
+          return { failure: RATE_LIMITED, outcome: "throttled" };
+        }
+
+        // The server refused this token, and without this it would be presented again until it reached its renewal window. The next tick runs the password grant.
+        // Nothing retries inside this tick, because a retry would spend a grant and a read against a ceiling that is the tick's to pace.
+        if(response.statusCode === 401) {
+
+          this.resetToken();
+        }
+
+        return { failure: statusFailure(response.statusCode), outcome: "failed" };
       }
 
       // Every field on this shape is optional by design, so the cast cannot manufacture a field this method or a caller would wrongly trust as present.
       const body = await response.body.json() as HydrawiseV2GraphResponse<T>;
+      const errors = body.errors ?? [];
 
-      if(body.errors?.length) {
+      if(errors.length && !body.data) {
 
-        return { failure: { joiner: ":", reason: body.errors.map(entry => entry.message ?? "an unspecified error").join("; ") + "." }, outcome: "failed" };
+        return { failure: errorsFailure(errors), outcome: "failed" };
       }
 
-      return { data: body.data ?? null, outcome: "answered" };
+      return { data: body.data ?? null, errors, outcome: "answered" };
     } catch(error) {
 
       return { failure: this.classifyFailure(error), outcome: "failed" };
@@ -276,7 +348,7 @@ export class HydrawiseV2Client {
   }
 
   // Join one transport failure onto the caller's own sentence, saying nothing when the failure carries nothing to add. This is the one place that pairs a sentence
-  // with a reason drawn from classifyFailure() or the transport's own result, so every failure reported that way reads in the same voice.
+  // with a reason drawn from classifyFailure() or the transport's own result at the level a failure is reported at.
   private report(sentence: string, failure: Nullable<HydrawiseV2Failure>): void {
 
     if(!failure) {
@@ -284,16 +356,22 @@ export class HydrawiseV2Client {
       return;
     }
 
-    this.log.error(sentence + failure.joiner + " " + failure.reason);
+    this.log.error(failureLine(sentence, failure));
   }
 
   /* Acquire an access token, by renewal when a refresh token is in hand and by the account password grant otherwise. This is the only method that writes the token
-   * state to anything but "refreshing", and it always writes exactly one terminal state: "valid" on success, "none" on failure.
+   * state to anything but "refreshing" apart from the reset a refused read performs, and it always leaves exactly one terminal state: "valid" on success, "none" on
+   * failure, a renewal Hydrawise answered with a 429 or a server error excepted.
    *
    * Returning to "none" on failure is what keeps a broken renewal from wedging the client. The next caller finds no token, runs the password grant, and recovers on
    * its own, where leaving a stale "valid" behind would spend every later call on a token the server has already rejected.
+   *
+   * A renewal the server refuses outright falls back to the password grant inside this same acquisition, silently for the refused renewal, so the read that needed
+   * the token still gets one. That spends the most any tick can: the refresh grant, the password grant and the read each draw the read ceiling, and the settings
+   * suite holds the arithmetic. A renewal answered with a 429 or a server error says nothing about the refresh token, so it returns to the "valid" it renewed from,
+   * and the next tick of a lockout renews again rather than presenting the password to a service that is already refusing the account.
    */
-  private async acquireToken(refreshToken: Nullable<string>): Promise<Nullable<string>> {
+  private async acquireToken(renewing: Nullable<Extract<HydrawiseV2TokenState, { state: "valid" }>>): Promise<HydrawiseV2Grant> {
 
     try {
 
@@ -308,10 +386,10 @@ export class HydrawiseV2Client {
 
       // The grant types differ only in what they present as proof. A renewal spends the refresh token the last grant returned; the password grant presents the
       // account credentials the user configured.
-      if(refreshToken) {
+      if(renewing?.refreshToken) {
 
         params.set("grant_type", "refresh_token");
-        params.set("refresh_token", refreshToken);
+        params.set("refresh_token", renewing.refreshToken);
       } else {
 
         params.set("grant_type", "password");
@@ -323,6 +401,32 @@ export class HydrawiseV2Client {
         headers: { "content-type": "application/x-www-form-urlencoded" }, method: "POST", signal: this.requestSignal() });
 
       if((response.statusCode < 200) || (response.statusCode >= 300)) {
+
+        // The pool holds a single connection, and a body nobody reads holds that connection until it is consumed, so an unread body would stall the next request.
+        await response.body.dump();
+
+        const throttled = response.statusCode === 429;
+
+        // Trouble on Hydrawise's side says nothing about the credentials, so it is reported as what it is rather than as a password to check.
+        if(throttled || (response.statusCode >= 500)) {
+
+          this.report(TOKEN_FAILURE_SENTENCE, throttled ? RATE_LIMITED : statusFailure(response.statusCode));
+
+          if(renewing?.refreshToken) {
+
+            this.token = renewing;
+          } else {
+
+            this.resetToken();
+          }
+
+          return { status: throttled ? "throttled" : "failed" };
+        }
+
+        if(renewing?.refreshToken) {
+
+          return await this.acquireToken(null);
+        }
 
         this.log.error("Unable to sign in to your Hydrawise account for enhanced features. Please check the username and password you have configured.");
 
@@ -345,7 +449,7 @@ export class HydrawiseV2Client {
        */
       this.token = { accessToken: grant.access_token, expiresAt: this.now() + (grant.expires_in ?? 0), refreshToken: grant.refresh_token ?? null, state: "valid" };
 
-      return grant.access_token;
+      return { accessToken: grant.access_token, status: "granted" };
     } catch(error) {
 
       this.report(TOKEN_FAILURE_SENTENCE, this.classifyFailure(error));
@@ -354,13 +458,13 @@ export class HydrawiseV2Client {
     }
   }
 
-  // Return the token state to holding nothing and answer the null every failed acquisition resolves to. Both halves live here, so a failure path cannot perform one
+  // Return the token state to holding nothing and answer the failed grant a failed acquisition resolves to. Both halves live here, so a failure path cannot perform one
   // without the other.
-  private resetToken(): null {
+  private resetToken(): HydrawiseV2Grant {
 
     this.token = { state: "none" };
 
-    return null;
+    return { status: "failed" };
   }
 
   /* Classify a thrown request failure into the reason a caller reports, taking whatever recovery the kind of failure calls for along the way.

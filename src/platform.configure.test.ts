@@ -813,7 +813,7 @@ describe("HydrawisePlatform feature option startup lines", () => {
     t.after(() => emit(SHUTDOWN));
     await using dispatcher = installMockDispatcher();
 
-    installV2Client(platform, makeTestV2Client(null).client);
+    installV2Client(platform, makeTestV2Client({ status: "failed" }).client);
     programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails({ controllers: [ { ...syntheticController }, { ...SECOND_CONTROLLER } ] }));
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 

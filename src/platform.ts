@@ -4,15 +4,16 @@
  */
 import type { API, Characteristic, DynamicPlatformPlugin, HAP, Logging, PlatformAccessory, PlatformConfig } from "homebridge";
 import { APIEvent, AccessoryPersistence, FeatureOptions, MQTT_AVAILABILITY_OFFLINE, RateBudget, TimerRegistry, classifyTransportError, composeSignals,
-  createApiDispatcher, createMqttClient, debugGatedLog, formatErrorMessage, loopFaultReporter, mqttTopic, notResponding, repeatDemotedLog, retry, sanitizeName,
-  superviseLoop, systemClock } from "homebridge-plugin-utils";
+  createApiDispatcher, createMqttClient, debugGatedLog, exponentialBackoff, formatErrorMessage, loopFaultReporter, mqttTopic, notResponding, repeatDemotedLog, retry,
+  sanitizeName, superviseLoop, systemClock } from "homebridge-plugin-utils";
 import type { Categories, Clock, HomebridgePluginLogging, MqttClient, Nullable, RepeatDemotedLog } from "homebridge-plugin-utils";
 import type { CustomerDetailsResponse, HydrawiseAccessory, HydrawiseAccessoryContext, HydrawiseCommandOutcome, HydrawiseControllerAccessory,
   HydrawiseControllerConfig, HydrawiseControllerIdentity, HydrawiseEndpoint, HydrawiseZoneIdentity, SetZoneResponse } from "./types.ts";
 import { HYDRAWISE_API_BASE_URL, HYDRAWISE_API_BUDGET_CALLS, HYDRAWISE_API_BUDGET_WINDOW, HYDRAWISE_API_RETRY_ATTEMPTS, HYDRAWISE_API_RETRY_INTERVAL,
   HYDRAWISE_API_RETRY_STATUS_CODES, HYDRAWISE_API_TIMEOUT, HYDRAWISE_COMMAND_BUDGET_CALLS, HYDRAWISE_COMMAND_BUDGET_WINDOW, HYDRAWISE_COMMAND_ENDPOINT,
-  HYDRAWISE_REVERT_DELAY, HYDRAWISE_TRANSPORT_FAULT_SENTENCES, HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_V2_REFRESH_INTERVAL,
-  HYDRAWISE_ZONE_ACCESSORY_CATEGORY, HYDRAWISE_ZONE_ACCESSORY_GRACE_POLLS, PLATFORM_NAME, PLUGIN_NAME } from "./settings.ts";
+  HYDRAWISE_REVERT_DELAY, HYDRAWISE_TRANSPORT_FAULT_SENTENCES, HYDRAWISE_V2_BACKOFF_CEILING, HYDRAWISE_V2_BACKOFF_JITTER, HYDRAWISE_V2_BUDGET_CALLS,
+  HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_V2_REFRESH_INTERVAL, HYDRAWISE_ZONE_ACCESSORY_CATEGORY, HYDRAWISE_ZONE_ACCESSORY_GRACE_POLLS, PLATFORM_NAME,
+  PLUGIN_NAME } from "./settings.ts";
 import type { HydrawiseGlobalFlagOption, HydrawiseGlobalValueOption, HydrawiseOptions } from "./options.ts";
 import { controllerDisplayName, controllerIdentity, isControllerIdentity, isFirmwareVersion, isZoneAccessoryContext, sameControllerIdentity, sameZoneIdentity,
   zoneAccessoryId } from "./types.ts";
@@ -57,6 +58,32 @@ type HydrawiseZoneSetupOutcome = { accessory: HydrawiseAccessory; status: "estab
 
 // The reason an unreadable command reply gives, one sentence whichever way the reply could not be read, so every reader of the outcome names it in the same words.
 const HYDRAWISE_UNREADABLE_REPLY = "The answer from Hydrawise could not be read.";
+
+/**
+ * How long the account-credentialed refresh loop sleeps after a tick, given the run of consecutive throttled ticks behind it.
+ *
+ * A lone refusal keeps the cadence with no jitter. Hydrawise's limits are shared across the account, so at this pace a refusal more likely means another client drained
+ * them, and a second refusal an interval later is what reads as a lockout. From there the sleep climbs HBPU's doubling ladder from two intervals to the ceiling, spread
+ * upward by the jitter, and the ladder's attempt numbering makes the run's second tick its first rung. A sleep that long outlasts the facts lifetime, so every enhanced
+ * reading falls back until a tick answers.
+ *
+ * @param options           - What the sleep is computed from.
+ * @param options.random    - The source of the jitter, answering in the range Math.random does.
+ * @param options.throttles - How many consecutive ticks Hydrawise has throttled, the one just finished included.
+ *
+ * @returns The sleep, in milliseconds.
+ */
+export function v2RefreshDelay({ random = Math.random, throttles }: { random?: () => number; throttles: number }): number {
+
+  if(throttles < 2) {
+
+    return HYDRAWISE_V2_REFRESH_INTERVAL * 1000;
+  }
+
+  const delay = exponentialBackoff({ ceilingMs: HYDRAWISE_V2_BACKOFF_CEILING * 1000, seedMs: HYDRAWISE_V2_REFRESH_INTERVAL * 2000 })(throttles);
+
+  return delay + Math.round(delay * HYDRAWISE_V2_BACKOFF_JITTER * random());
+}
 
 export class HydrawisePlatform implements DynamicPlatformPlugin {
 
@@ -130,6 +157,10 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
    * it on the first successful answer rather than at construction is what makes it a connection report instead of a restatement of the configuration.
    */
   private v2Connected = false;
+
+  // The run of consecutive refresh ticks Hydrawise throttled, which paces the sleep after each tick. Any other tick ends the run, an answered one and a failed one
+  // alike, because only a 429 is Hydrawise asking the plugin to slow down. It lives in memory only, so a restart begins again at the plain cadence.
+  private v2Throttles = 0;
 
   /* The wire-absence grace state behind reconcileZoneAccessories, keyed by zone-accessory UUID and holding that accessory's count of consecutive polls whose report
    * omitted its zone. It lives in memory only and is deliberately not persisted: a restart clears it, which errs toward RETAINING a HomeKit identity the user
@@ -566,9 +597,10 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
    * each controller its own share.
    *
    * The loop is SEQUENTIAL - refresh, then sleep - which is what makes overlap unrepresentable rather than guarded against: the next tick cannot begin until the
-   * current one has finished, however long the account takes to answer. It is supervised on the same terms as every other endless loop this plugin runs, so a
-   * shutdown abort unwinds it silently through the sleep while a genuine fault is reported once. The narrowed client is captured in a local before dispatch so the
-   * loop body needs no assertion about a field it cannot see reassigned.
+   * current one has finished, however long the account takes to answer. Each sleep is the one its tick answers, the plain cadence until Hydrawise keeps throttling
+   * the refresh. The loop is supervised on the same terms as every other endless loop this plugin runs, so a shutdown abort unwinds it silently through the sleep
+   * while a genuine fault is reported once. The narrowed client is captured in a local before dispatch so the loop body needs no assertion about a field it cannot
+   * see reassigned.
    */
   private startV2Refresh(): void {
 
@@ -586,10 +618,10 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       for(;;) {
 
         // eslint-disable-next-line no-await-in-loop
-        await this.refreshV2Facts(client);
+        const delay = await this.refreshV2Facts(client);
 
         // eslint-disable-next-line no-await-in-loop
-        await this.clock.delay(HYDRAWISE_V2_REFRESH_INTERVAL * 1000, { signal: this.signal });
+        await this.clock.delay(delay, { signal: this.signal });
       }
     }, onError: loopFaultReporter(this.log, "enhanced features refresh"), signal: this.signal });
   }
@@ -604,16 +636,24 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
    * fetch already in flight when a user commands a suspend-all from reading as newer than the command it cannot possibly know about.
    *
    * A failed fetch leaves every current display standing and simply returns - the client has already reported it, and the next tick is the retry.
+   *
+   * Every tick answers how long the loop sleeps before the next one, read from the run of consecutive throttled ticks this one has just extended or ended.
    */
-  private async refreshV2Facts(client: HydrawiseV2Client): Promise<void> {
+  private async refreshV2Facts(client: HydrawiseV2Client): Promise<number> {
 
     const fetchedAt = Math.floor(this.clock.now() / 1000);
-    const facts = await client.fetchAccountFacts();
+    const read = await client.fetchAccountFacts();
 
-    if(!facts) {
+    this.v2Throttles = (read.status === "throttled") ? (this.v2Throttles + 1) : 0;
 
-      return;
+    const delay = v2RefreshDelay({ throttles: this.v2Throttles });
+
+    if(read.status !== "answered") {
+
+      return delay;
     }
+
+    const { facts } = read;
 
     // Report the account tier reachable, once for the life of the process. A failed tick says nothing here - the client has already reported the failure in its
     // own words - so this line means the credentials were accepted and the account answered, which is exactly what a user checking their setup wants to see.
@@ -649,6 +689,8 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
       this.configuredController(controller)?.applyRoster(roster);
     }
+
+    return delay;
   }
 
   // The controller this plugin built for a wire controller, or undefined for one the user disabled or that discovery never reached. The UUID derivation is the

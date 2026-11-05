@@ -89,6 +89,9 @@ export const HYDRAWISE_TRANSPORT_FAULT_SENTENCES = Object.freeze({
   "unreachable": "The Hydrawise API could not be reached. Please ensure you're connected to the Internet."
 } satisfies Record<HydrawiseTransportFault, string>);
 
+// What a 429 from the account-credentialed API means to a Hydrawise user, a complete sentence that follows each caller's own sentence with a period.
+export const HYDRAWISE_V2_RATE_LIMIT_REASON = "The Hydrawise API rate limit has been exceeded.";
+
 /* The Hydrawise v2 API. This group states endpoints and credentials, which is a different kind of constant from the durations and call counts the rest of this
  * file carries, so it is marked out as its own group. Everything below is optional at runtime: the v2 surface is reached only when the user has configured their
  * account credentials, and the plugin runs its whole v1 feature set without it.
@@ -132,16 +135,33 @@ export const HYDRAWISE_V2_TIMEOUT = 15;
 export const HYDRAWISE_V2_REFRESH_THRESHOLD = 300;
 
 /* How often, in seconds, the whole-account read that feeds the enhanced features runs. The arithmetic against the envelope above is what fixes the value: the
- * number of reads that fit inside one budget window stays under the read ceiling, leaving slots for the token grants those reads carry. A brisker cadence would
- * buy fresher facts at the cost of the headroom that keeps this optional enrichment from ever crowding out the irrigation the account actually depends on.
+ * number of reads that fit inside one budget window stays under the read ceiling, leaving slots for the token grants those reads carry. The costliest tick is a
+ * refused renewal, where a refresh grant, the password grant it falls back to, and the read they authenticate each draw the read ceiling, and the settings suite
+ * holds that tick beside the window's other reads inside the ceiling. A brisker cadence would buy fresher facts at the cost of the headroom that keeps this optional
+ * enrichment from ever crowding out the irrigation the account actually depends on.
  */
 export const HYDRAWISE_V2_REFRESH_INTERVAL = 900;
 
-/* How long, in seconds, a snapshot of the account-credentialed facts stays trustworthy. It is derived from the cadence rather than restated as a literal of its
- * own, so the two can never drift apart. Twice the cadence is the deliberate ratio: a single missed refresh never flips a consumer to its fallback, while a
- * refresh loop that has genuinely stopped does, and every consumer returns to the answers an install without account credentials gives.
+// The longest the ladder climbs, in seconds, before jitter, while Hydrawise keeps throttling the refresh. The field reports' lockouts ran up to an hour, so a sleep this
+// long outlasts one.
+export const HYDRAWISE_V2_BACKOFF_CEILING = 3600;
+
+/* How far past its computed delay a backed-off sleep may run, as a fraction of that delay. The spread is upward only, so a sleep never ends sooner than the ladder
+ * asks, while installs and clients throttled together stop returning in step.
  */
-export const HYDRAWISE_V2_FACTS_TTL = HYDRAWISE_V2_REFRESH_INTERVAL * 2;
+export const HYDRAWISE_V2_BACKOFF_JITTER = 0.25;
+
+// The time, in seconds, the facts lifetime below allows beyond two intervals for the requests a refresh makes.
+export const HYDRAWISE_V2_FACTS_GRACE = 60;
+
+/* How long, in seconds, a snapshot of the account-credentialed facts stays trustworthy. It is derived from the cadence rather than restated as a literal of its
+ * own, so the two can never drift apart. Two intervals are the deliberate ratio: a single missed refresh never flips a consumer to its fallback, while a refresh
+ * loop that has genuinely stopped does, and every consumer returns to the answers an install without account credentials gives.
+ *
+ * The grace is what keeps that promise on the wire. A snapshot is stamped before its request and each sleep starts after one, so the next answer lands past two
+ * intervals by the time those requests took, and one missed refresh leaves the facts current while they take under a minute in all.
+ */
+export const HYDRAWISE_V2_FACTS_TTL = (HYDRAWISE_V2_REFRESH_INTERVAL * 2) + HYDRAWISE_V2_FACTS_GRACE;
 
 // Time until the next zone valve runtime, in seconds, that we should use to indicate that a zone should be marked as active.
 export const HYDRAWISE_ACTIVE_ZONE_INDICATOR = 3600;

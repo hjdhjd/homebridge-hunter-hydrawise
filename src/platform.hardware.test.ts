@@ -9,23 +9,25 @@
  * accessory's context carries, written back over Homebridge's placeholder while the credentials are configured.
  *
  * What these tests deliberately do NOT wait on is the loop's quarter-hour sleep. The real platform runs on the system clock and takes no other, so the second tick
- * is driven through the production refresh method directly, and the sleep between ticks is covered by the constants receipt in the settings suite rather than by a
- * test that would have to wait it out.
+ * is driven through the production refresh method directly, and the sleep between ticks is read from what each tick answers rather than waited out.
  */
 // The Hydrawise API wire shapes use snake_case keys such as controller_id, so camelcase is disabled here to let the controller fixture mirror the wire verbatim.
 /* eslint-disable camelcase */
 import { Characteristic, Service, buildPlatform, installMockDispatcher, installV2Client, makeTestV2Client, makeV2Facts, programJsonReply, refreshV2FactsOnce,
   seedAccessory, v2BudgetOf, waitFor } from "./testing/platform.helpers.ts";
-import { HOMEBRIDGE_UNKNOWN_FIRMWARE, HYDRAWISE_V2_BUDGET_CALLS } from "./settings.ts";
+import { HOMEBRIDGE_UNKNOWN_FIRMWARE, HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_GRAPH_ENDPOINT, HYDRAWISE_V2_TOKEN_ENDPOINT } from "./settings.ts";
 import type { Characteristic as HapCharacteristic, PlatformAccessory, WithUUID } from "homebridge";
-import type { HydrawiseAccessoryContext, HydrawiseControllerHardware } from "./types.ts";
+import type { HydrawiseAccessoryContext, HydrawiseControllerHardware, HydrawiseControllerV2Facts, HydrawiseV2Read } from "./types.ts";
 import { controllerIdentity, zoneAccessoryId } from "./types.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeCustomerDetails, normalSchedule } from "./api.helpers.ts";
 import { logCount, loggedAt, waitUntil } from "homebridge-plugin-utils/testing";
+import { HydrawiseV2Client } from "./v2.ts";
+import { MockAgent } from "undici";
 import type { TestLogEntry } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
 import { syntheticController } from "./api.fixtures.ts";
+import { v2RefreshDelay } from "./platform.ts";
 
 const DID_FINISH_LAUNCHING = "didFinishLaunching";
 const SHUTDOWN = "shutdown";
@@ -46,6 +48,12 @@ const SECOND_HARDWARE: HydrawiseControllerHardware = { firmware: "2.11", model: 
 const ACCOUNT_CONTROLLER_NAME = "Backyard Irrigation System";
 
 const STANDALONE_RELAY_ID = 700001;
+
+// The read of an account that answered, carrying each controller's facts.
+function answered(...entries: [ number, HydrawiseControllerV2Facts ][]): HydrawiseV2Read {
+
+  return { facts: new Map(entries), status: "answered" };
+}
 
 // Whether a line containing the text was logged at any level, for the claims that nothing of a kind was said at all. Each level is searched through the library's
 // rendering finder, so a value that arrived as a format parameter is matched as the user would read it.
@@ -132,9 +140,9 @@ describe("HydrawisePlatform hardware distribution", () => {
      * row drives is the only thing that can save it.
      */
     const { client, fetches } = makeTestV2Client((fetch) => (fetch === 1) ?
-      new Map([ [ SECOND_CONTROLLER.controller_id, makeV2Facts() ], [ syntheticController.controller_id, makeV2Facts() ] ]) :
-      new Map([ [ SECOND_CONTROLLER.controller_id, makeV2Facts({ hardware: SECOND_HARDWARE }) ], [ syntheticController.controller_id,
-        makeV2Facts({ hardware: FIRST_HARDWARE }) ] ]));
+      answered([ SECOND_CONTROLLER.controller_id, makeV2Facts() ], [ syntheticController.controller_id, makeV2Facts() ]) :
+      answered([ SECOND_CONTROLLER.controller_id, makeV2Facts({ hardware: SECOND_HARDWARE }) ], [ syntheticController.controller_id,
+        makeV2Facts({ hardware: FIRST_HARDWARE }) ]));
 
     installV2Client(platform, client);
 
@@ -180,7 +188,7 @@ describe("HydrawisePlatform hardware distribution", () => {
     t.after(() => emit(SHUTDOWN));
     await using dispatcher = installMockDispatcher();
 
-    installV2Client(platform, makeTestV2Client(new Map([[ syntheticController.controller_id, makeV2Facts({ name: ACCOUNT_CONTROLLER_NAME }) ]])).client);
+    installV2Client(platform, makeTestV2Client(answered([ syntheticController.controller_id, makeV2Facts({ name: ACCOUNT_CONTROLLER_NAME }) ])).client);
 
     programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
     programJsonReply(dispatcher.agent, "statusschedule.php", fastPolling(normalSchedule()));
@@ -211,7 +219,7 @@ describe("HydrawisePlatform hardware distribution", () => {
     t.after(() => emit(SHUTDOWN));
     await using dispatcher = installMockDispatcher();
 
-    const { client, fetches } = makeTestV2Client(null);
+    const { client, fetches } = makeTestV2Client({ status: "failed" });
 
     installV2Client(platform, client);
     programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
@@ -241,7 +249,7 @@ describe("HydrawisePlatform hardware distribution", () => {
     t.after(() => emit(SHUTDOWN));
     await using dispatcher = installMockDispatcher();
 
-    const { client, fetches } = makeTestV2Client(new Map([[ syntheticController.controller_id, makeV2Facts({ hardware: FIRST_HARDWARE }) ]]));
+    const { client, fetches } = makeTestV2Client(answered([ syntheticController.controller_id, makeV2Facts({ hardware: FIRST_HARDWARE }) ]));
 
     installV2Client(platform, client);
     programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
@@ -270,8 +278,8 @@ describe("HydrawisePlatform hardware distribution", () => {
     await using dispatcher = installMockDispatcher();
 
     // The first fetch fails and every later one succeeds, which is exactly the transient the retry exists for.
-    const { client, fetches } = makeTestV2Client((fetch) => (fetch === 1) ? null :
-      new Map([[ syntheticController.controller_id, makeV2Facts({ hardware: FIRST_HARDWARE }) ]]));
+    const { client, fetches } = makeTestV2Client((fetch) => (fetch === 1) ? { status: "failed" } :
+      answered([ syntheticController.controller_id, makeV2Facts({ hardware: FIRST_HARDWARE }) ]));
 
     installV2Client(platform, client);
     programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
@@ -300,7 +308,7 @@ describe("HydrawisePlatform hardware distribution", () => {
 
     await using dispatcher = installMockDispatcher();
 
-    const { client, fetches } = makeTestV2Client(new Map([[ syntheticController.controller_id, makeV2Facts({ hardware: FIRST_HARDWARE }) ]]));
+    const { client, fetches } = makeTestV2Client(answered([ syntheticController.controller_id, makeV2Facts({ hardware: FIRST_HARDWARE }) ]));
 
     installV2Client(platform, client);
     programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
@@ -423,7 +431,7 @@ describe("HydrawisePlatform connection reporting", () => {
 
     await using dispatcher = installMockDispatcher();
 
-    const { client, fetches } = makeTestV2Client(new Map([[ syntheticController.controller_id, makeV2Facts({ hardware: FIRST_HARDWARE }) ]]));
+    const { client, fetches } = makeTestV2Client(answered([ syntheticController.controller_id, makeV2Facts({ hardware: FIRST_HARDWARE }) ]));
 
     installV2Client(platform, client);
     programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
@@ -458,8 +466,8 @@ describe("HydrawisePlatform connection reporting", () => {
     await using dispatcher = installMockDispatcher();
 
     // The first fetch fails and every later one succeeds, so the line has to wait for an answer that actually arrived.
-    const { client, fetches } = makeTestV2Client((fetch) => (fetch === 1) ? null :
-      new Map([[ syntheticController.controller_id, makeV2Facts({ hardware: FIRST_HARDWARE }) ]]));
+    const { client, fetches } = makeTestV2Client((fetch) => (fetch === 1) ? { status: "failed" } :
+      answered([ syntheticController.controller_id, makeV2Facts({ hardware: FIRST_HARDWARE }) ]));
 
     installV2Client(platform, client);
     programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
@@ -493,5 +501,88 @@ describe("HydrawisePlatform connection reporting", () => {
 
     assert.ok(loggedAt(entries, "info", "Successfully connected to the Hydrawise API using your API key."), "the key-based line still reports");
     assert.ok(!loggedAnywhere(entries, "account API"), "and nothing claims an account connection that was never made");
+  });
+
+  test("errors that leave no controller entry report the read's line and no connection", async (t) => {
+
+    const { emit, entries, platform } = buildPlatform({ options: CREDENTIAL_OPTIONS });
+
+    t.after(() => emit(SHUTDOWN));
+
+    await using dispatcher = installMockDispatcher();
+
+    // A real client over a MockAgent of its own, installed before the launch, because a real client's own pool passes the global dispatcher the key-based API is
+    // answered through. The agent's destroy is its close, because the platform's teardown destroys whatever pool the client holds.
+    const agent = new MockAgent();
+
+    agent.disableNetConnect();
+
+    const account = agent.get(new URL(HYDRAWISE_V2_GRAPH_ENDPOINT).origin);
+
+    account.intercept({ method: "POST", path: new URL(HYDRAWISE_V2_TOKEN_ENDPOINT).pathname }).reply(200, { access_token: "access-one", expires_in: 3600 }).persist();
+    account.intercept({ method: "POST", path: new URL(HYDRAWISE_V2_GRAPH_ENDPOINT).pathname }).reply(200, { data: { me: { controllers: [null] } },
+      errors: [{ message: "Internal server error", path: [ "me", "controllers", 0, "hardware" ] }] }).persist();
+
+    installV2Client(platform, new HydrawiseV2Client({ budget: v2BudgetOf(platform),
+      dispatcherFactory: (): MockAgent => Object.assign(agent, { destroy: async (): Promise<void> => { await agent.close(); } }), log: platform.log,
+      password: "test-password", signal: platform.signal, username: "test-user" }));
+    programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
+    programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
+
+    emit(DID_FINISH_LAUNCHING);
+    await waitUntil(() => loggedAt(entries, "error", "Unable to retrieve enhanced controller details: Internal server error."),
+      { description: "the read's error line" });
+
+    assert.ok(!loggedAnywhere(entries, "connected to the Hydrawise account API"), "a read that enriched nothing reports no connection");
+  });
+});
+
+describe("HydrawisePlatform refresh pacing", () => {
+
+  test("the sleep holds the cadence through one throttle, climbs from the second to the ceiling, and spreads upward", () => {
+
+    const unspread = (throttles: number): number => v2RefreshDelay({ random: (): number => 0, throttles });
+
+    assert.equal(unspread(0), 900000, "with no throttle the sleep is the cadence");
+    assert.equal(unspread(1), 900000, "a lone refusal keeps it, since it more likely means another client drained the account's limits");
+    assert.equal(unspread(2), 1800000, "the second in a row starts the ladder at two intervals");
+    assert.equal(unspread(3), 3600000, "the third doubles it");
+    assert.equal(unspread(4), 3600000, "and the fourth stands at the ceiling rather than doubling past it");
+    assert.equal(v2RefreshDelay({ random: (): number => 0.5, throttles: 1 }), 900000, "the cadence takes no jitter");
+    assert.equal(v2RefreshDelay({ random: (): number => 0.5, throttles: 2 }), 2025000, "while a backed-off sleep runs past its rung by the jittered fraction");
+  });
+
+  test("consecutive throttled ticks lengthen the sleep, and any other tick ends the run", async (t) => {
+
+    const { emit, entries, platform } = buildPlatform({ options: CREDENTIAL_OPTIONS });
+
+    t.after(() => emit(SHUTDOWN));
+
+    await using dispatcher = installMockDispatcher();
+
+    const ready = answered([ syntheticController.controller_id, makeV2Facts({ hardware: FIRST_HARDWARE }) ]);
+    const throttled: HydrawiseV2Read = { status: "throttled" };
+    const script: HydrawiseV2Read[] = [ ready, throttled, throttled, throttled, ready, throttled, { status: "failed" }, throttled, throttled ];
+    const { client, fetches } = makeTestV2Client((fetch) => script[fetch - 1] ?? ready);
+
+    installV2Client(platform, client);
+    programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
+    programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
+
+    // The loop's own first tick answers and then sleeps a quarter hour, so every tick after it is driven here.
+    emit(DID_FINISH_LAUNCHING);
+    await waitUntil(() => logCount(entries, "info", "connected to the Hydrawise account API") === 1, { description: "the loop's first tick to land" });
+
+    const within = (delay: number, low: number, high: number, label: string): void => assert.ok((delay >= low) && (delay <= high), label + " reads " + delay.toString());
+
+    assert.equal(await refreshV2FactsOnce(platform), 900000, "the first throttled tick keeps the cadence");
+    within(await refreshV2FactsOnce(platform), 1800000, 2250000, "the second sleeps two intervals, spread up to a quarter past them");
+    within(await refreshV2FactsOnce(platform), 3600000, 4500000, "the third sleeps the ceiling, spread the same way");
+    assert.equal(await refreshV2FactsOnce(platform), 900000, "an answered tick after them restores the cadence");
+    assert.equal(await refreshV2FactsOnce(platform), 900000, "a throttle after the answer starts a new run");
+    assert.equal(await refreshV2FactsOnce(platform), 900000, "a failed tick keeps the cadence");
+    assert.equal(await refreshV2FactsOnce(platform), 900000, "and ends the run, so the next throttle is the first of its own");
+    within(await refreshV2FactsOnce(platform), 1800000, 2250000, "which the one after it follows as the second");
+    assert.equal(fetches(), script.length, "every tick spent exactly one fetch");
   });
 });

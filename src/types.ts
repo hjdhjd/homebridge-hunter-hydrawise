@@ -144,6 +144,13 @@ export interface SetZoneResponse {
  */
 export type HydrawiseCommandOutcome = { status: "aborted" | "confirmed" | "timeout" } | { reason: string; status: "failed" | "refused" | "unreadable" };
 
+/* What became of one read of the whole account's facts, as a discriminated union rather than a nullable map, because the refresh loop paces itself by more than
+ * whether facts arrived. "answered" carries the facts, which an empty map still is when a read that went well found nothing to enrich. "failed" means the read
+ * left nothing to enrich from, and the client has already said why wherever there was anything to say. "throttled" means Hydrawise answered the read or its token
+ * grant with a 429, the one failure a run of which slows the refresh.
+ */
+export type HydrawiseV2Read = { facts: Map<number, HydrawiseControllerV2Facts>; status: "answered" } | { status: "failed" | "throttled" };
+
 /* Hydrawise v2 API: the OAuth2 token endpoint's response, typed to the fields the client consumes. The lifetime arrives as a duration in seconds rather than
  * an instant, so the client turns it into an absolute expiry against its own clock at the moment it reads the response.
  *
@@ -158,16 +165,29 @@ export interface HydrawiseV2TokenResponse {
   refresh_token?: string;
 }
 
+/* Hydrawise v2 API: the path to the value one error cost, field names and list indexes in order, read from the root of the response's data or from an entry within
+ * it. It is what says which answers cannot be believed, because the server answers a failed field with a null that reads the same as a real absence.
+ */
+export type HydrawiseV2ErrorPath = readonly (number | string)[];
+
+// Hydrawise v2 API: one entry of a response's errors array, typed to the fields the client consumes.
+export interface HydrawiseV2GraphError {
+
+  message?: string;
+  path?: HydrawiseV2ErrorPath;
+}
+
 /* Hydrawise v2 API: the envelope every GraphQL response arrives in, parameterized by the selection's own data shape. Each field is optional because each absence
- * is real: a request that failed carries errors and no data, and a malformed answer can carry neither.
+ * is real: a request that failed carries errors and no data, a query that partly failed carries both, and a malformed answer can carry neither.
  *
  * The errors array is what makes GraphQL failure classification different from REST. The v2 endpoint answers a failed query with HTTP 200 and reports the failure in
- * the body, so a status-code check alone would read a failure as a success - which is why every consumer of this envelope inspects errors before it trusts data.
+ * the body, so a status-code check alone would read a failure as a success. A field that errors beside others that did not costs only its own entry: the server nulls
+ * the nearest entry that may be null, a list element above all, and answers everything else, which is why the lists below type their entries nullable.
  */
 export interface HydrawiseV2GraphResponse<T> {
 
   data?: T;
-  errors?: { message?: string }[];
+  errors?: HydrawiseV2GraphError[];
 }
 
 /* Hydrawise v2 API: one entry of a controller's firmware list. A controller reports firmware as a LIST of typed components rather than a single version string -
@@ -191,7 +211,7 @@ export interface HydrawiseV2ModelBlock {
 // are: a controller that is offline or not linked to the account can answer with a partial block, and typing off the one healthy capture would make that a crash.
 export interface HydrawiseV2HardwareBlock {
 
-  firmware?: HydrawiseV2FirmwareEntry[];
+  firmware?: Nullable<HydrawiseV2FirmwareEntry>[];
   model?: HydrawiseV2ModelBlock;
 }
 
@@ -218,7 +238,7 @@ export interface HydrawiseV2Sensor {
 
   model?: { sensorType?: string };
   status?: { active?: boolean };
-  zones?: { id?: number }[];
+  zones?: Nullable<{ id?: number }>[];
 }
 
 /* Hydrawise v2 API: one controller as the account query returns it. The id is the correlation key that matches a v2 controller to the v1 controller this plugin
@@ -233,16 +253,16 @@ export interface HydrawiseV2Controller {
   hardware?: HydrawiseV2HardwareBlock;
   id?: number;
   name?: Nullable<string>;
-  sensors?: HydrawiseV2Sensor[];
+  sensors?: Nullable<HydrawiseV2Sensor>[];
   status?: { online?: boolean };
-  zones?: HydrawiseV2Zone[];
+  zones?: Nullable<HydrawiseV2Zone>[];
 }
 
 // Hydrawise v2 API: the data half of the whole-account query. One query answers for every controller on the account, which is what lets the platform fetch once
 // and distribute rather than spending a call per controller against a budget measured in single digits.
 export interface HydrawiseV2Account {
 
-  me?: { controllers?: HydrawiseV2Controller[] };
+  me?: { controllers?: Nullable<HydrawiseV2Controller>[] };
 }
 
 /* Hydrawise v2 API: the prefix marking the sensor kinds that report a level - the family a rain or freeze sensor belongs to, and the only family whose activity
@@ -286,7 +306,7 @@ export interface HydrawiseControllerHardware {
 export function controllerHardware(hardware: HydrawiseV2HardwareBlock | undefined): Nullable<HydrawiseControllerHardware> {
 
   const model = hardware?.model?.description;
-  const firmware = hardware?.firmware?.find(entry => entry.type === HYDRAWISE_V2_CONTROLLER_FIRMWARE)?.version;
+  const firmware = hardware?.firmware?.find(entry => entry?.type === HYDRAWISE_V2_CONTROLLER_FIRMWARE)?.version;
 
   if(!model?.length || !firmware?.length) {
 
@@ -339,6 +359,21 @@ export interface HydrawiseControllerV2Facts {
   zones: Map<number, HydrawiseZoneV2Facts>;
 }
 
+// A name from the account API as a display can use it: trimmed, and required to be non-empty, because an empty or whitespace-only answer is not a name. It composes
+// null, which leaves the key-based wire's own name standing rather than blanking a label.
+function usableName(name: Nullable<string> | undefined): Nullable<string> {
+
+  const trimmed = name?.trim();
+
+  return trimmed?.length ? trimmed : null;
+}
+
+// Whether a sensor entry is one a rain-class stop is read from: a level-class sensor actually reporting its activity as a boolean.
+function countsAsRainSensor(sensor: Nullable<HydrawiseV2Sensor>): sensor is HydrawiseV2Sensor {
+
+  return (sensor?.model?.sensorType?.startsWith(HYDRAWISE_V2_LEVEL_SENSOR_PREFIX) ?? false) && (typeof sensor?.status?.active === "boolean");
+}
+
 /* Project one controller's wire answer onto the facts shape above. This is the one home for every selection rule the account query's richer body needs, so what
  * "suspended", "sensor-stopped", and "reachable" mean is decided once rather than at each read site.
  *
@@ -347,51 +382,57 @@ export interface HydrawiseControllerV2Facts {
  * sensorStopped is null, which hands the whole question back to the v1 group inference. With at least one, a zone reads true when SOME sensor covering it is
  * tripped and false otherwise - some rather than every, because one tripped sensor stops the zones it covers whatever its siblings report, and an uncovered
  * zone is honestly not stopped rather than unknown.
+ *
+ * A bad field is never believed, and the errors' paths decide what that costs, each path arriving relative to this controller's entry. The sensor list is incomplete
+ * when an error names it, when it holds a null entry, or when a counted sensor's covered zones are absent or hold a null entry. Any of those makes every zone's
+ * sensorStopped null, because a zone only the unread sensor covers would otherwise read as clear, retiring the inference that would have caught a real rain stop. A
+ * zone an error names is omitted, the rule for any entry that cannot be completed, so a suspension nulled by an error keeps its carry rather than reading as lifted.
  */
-export function controllerV2Facts(controller: HydrawiseV2Controller): HydrawiseControllerV2Facts {
+export function controllerV2Facts(controller: HydrawiseV2Controller, errorPaths: readonly HydrawiseV2ErrorPath[] = []): HydrawiseControllerV2Facts {
 
-  const sensors = (controller.sensors ?? []).filter(sensor => sensor.model?.sensorType?.startsWith(HYDRAWISE_V2_LEVEL_SENSOR_PREFIX) &&
-    (typeof sensor.status?.active === "boolean"));
+  const entries = controller.sensors ?? [];
+  const sensors = entries.filter(countsAsRainSensor);
+  const incomplete = errorPaths.some(path => path[0] === "sensors") || entries.includes(null) || sensors.some(sensor => !sensor.zones || sensor.zones.includes(null));
+  const erredZones = new Set(errorPaths.filter(path => path[0] === "zones").map(path => path[1]));
   const zones = new Map<number, HydrawiseZoneV2Facts>();
 
-  for(const zone of controller.zones ?? []) {
+  for(const [ index, zone ] of (controller.zones ?? []).entries()) {
 
     // A zone whose entry cannot be completed is deliberately omitted rather than entered as a blank: an absent entry reads as "unknown" everywhere downstream,
-    // where a present one is a real answer that clears or reasserts a zone's state.
-    if(zone.id === undefined) {
+    // where a present one is a real answer that clears or reasserts a zone's state. An id is held to being a number because a null can sit under a non-null marker.
+    if((typeof zone?.id !== "number") || erredZones.has(index)) {
 
       continue;
     }
 
-    const covering = sensors.filter(sensor => (sensor.zones ?? []).some(covered => covered.id === zone.id));
+    const covering = sensors.filter(sensor => (sensor.zones ?? []).some(covered => covered?.id === zone.id));
 
-    // A name is trimmed and then required to be non-empty, because an empty or whitespace-only answer is not a name the display can use - it composes null, which
-    // leaves the wire's own name standing rather than blanking a zone's label.
-    const name = zone.name?.trim();
-
-    zones.set(zone.id, { name: name?.length ? name : null, sensorStopped: sensors.length ? covering.some(sensor => sensor.status?.active === true) : null,
+    zones.set(zone.id, { name: usableName(zone.name), sensorStopped: (sensors.length && !incomplete) ? covering.some(sensor => sensor.status?.active === true) : null,
       suspendedUntil: zone.status?.suspendedUntil?.timestamp ?? null });
   }
 
-  // The controller's own name normalizes exactly as a zone's does above: trimmed, and required to be non-empty, so an answer with nothing usable in it composes
-  // null and leaves the wire's name standing rather than blanking the controller's label.
-  const name = controller.name?.trim();
-
-  return { hardware: controllerHardware(controller.hardware), name: name?.length ? name : null, online: controller.status?.online ?? null, zones };
+  return { hardware: controllerHardware(controller.hardware), name: usableName(controller.name), online: controller.status?.online ?? null, zones };
 }
+
+/* What one call for an access token came to, as a discriminated union so a caller can carry a 429 up the chain rather than reading every refusal as the same absence.
+ * "granted" carries the token. "failed" means no token came, which the grant has already reported in its own words unless it was teardown, and "throttled" means
+ * Hydrawise answered the grant with a 429, reported on the same terms.
+ */
+export type HydrawiseV2Grant = { accessToken: string; status: "granted" } | { status: "failed" | "throttled" };
 
 /* The v2 client's OAuth token state, as a discriminated union so the access token, its expiry, and any refresh in flight can never disagree with one another. One
  * shape and one mutation point is what makes that structural rather than a convention each write site has to honor.
  *
- * The states are the whole lifecycle. "none" is no usable token, which is both the starting state and where a failed acquisition returns to. "valid" carries
- * a token and the instant it expires. "refreshing" carries the in-flight acquisition, and it is the single-flight mechanism itself: both paths that reach the
- * network - a first acquisition and a renewal - transition here synchronously before their first await, so concurrent callers join the one promise rather than each
- * firing a grant of their own. There is deliberately no separate "acquiring" state; an acquisition and a renewal are the same wait to every caller.
+ * The states are the whole lifecycle. "none" is no usable token, which is both the starting state and where a failed acquisition returns to, a renewal Hydrawise
+ * answered with trouble of its own excepted, which returns to the "valid" it renewed from. "valid" carries a token and the instant it expires. "refreshing" carries
+ * the in-flight acquisition, and it is the single-flight mechanism itself: both paths that reach the network - a first acquisition and a renewal - transition here
+ * synchronously before their first await, so concurrent callers join the one promise rather than each firing a grant of their own. There is deliberately no separate
+ * "acquiring" state; an acquisition and a renewal are the same wait to every caller.
  */
 export type HydrawiseV2TokenState =
   { state: "none" } |
   { accessToken: string; expiresAt: number; refreshToken: Nullable<string>; state: "valid" } |
-  { pending: Promise<Nullable<string>>; state: "refreshing" };
+  { pending: Promise<HydrawiseV2Grant>; state: "refreshing" };
 
 // The persisted identity of a single irrigation controller. This is the denormalized, wire-independent shape the runtime writes into the accessory context and the
 // webUI reads back from the accessory cache and the /refreshControllers response, so a stopped plugin's controller list stays answerable without any cloud call. It

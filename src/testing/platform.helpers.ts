@@ -25,7 +25,7 @@ import { AccessoryPersistence, FeatureOptions, TimerRegistry, acquireService, sa
 import type { Clock, HomebridgePluginLogging, Nullable, RateBudget } from "homebridge-plugin-utils";
 import { HYDRAWISE_API_BASE_URL, PLATFORM_NAME, PLUGIN_NAME } from "../settings.ts";
 import type { HydrawiseAccessory, HydrawiseCommandOutcome, HydrawiseControllerConfig, HydrawiseControllerHardware, HydrawiseControllerIdentity,
-  HydrawiseControllerV2Facts, HydrawiseZoneConfig, HydrawiseZoneV2Facts } from "../types.ts";
+  HydrawiseControllerV2Facts, HydrawiseV2Read, HydrawiseZoneConfig, HydrawiseZoneV2Facts } from "../types.ts";
 import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
 import { TestClock, TestMqttClient, capturingLog, loadHomebridge, present, waitUntil, watchServerWarnings } from "homebridge-plugin-utils/testing";
 import type { TestHomebridgeApi, TestHomebridgeApiCall, TestLogEntry, TestPlatformAccessory } from "homebridge-plugin-utils/testing";
@@ -687,7 +687,7 @@ export function v2DispatcherOf(platform: HydrawisePlatform): { destroyed: boolea
 export interface TestV2Client {
 
   dispatcher: { destroy: () => Promise<void> };
-  fetchAccountFacts: () => Promise<Nullable<Map<number, HydrawiseControllerV2Facts>>>;
+  fetchAccountFacts: () => Promise<HydrawiseV2Read>;
 }
 
 /**
@@ -718,42 +718,41 @@ export function installV2Client(platform: HydrawisePlatform, client: TestV2Clien
  *
  * @param platform - The constructed HydrawisePlatform, whose client the tick will ask.
  *
- * @returns A promise resolving when the tick has fetched and distributed.
+ * @returns A promise resolving, once the tick has fetched and distributed, to how long in milliseconds the loop would sleep before its next tick.
  */
-export async function refreshV2FactsOnce(platform: HydrawisePlatform): Promise<void> {
+export async function refreshV2FactsOnce(platform: HydrawisePlatform): Promise<number> {
 
-  const slot = platform as unknown as { refreshV2Facts: (client: TestV2Client) => Promise<void>; v2Client?: TestV2Client };
+  const slot = platform as unknown as { refreshV2Facts: (client: TestV2Client) => Promise<number>; v2Client?: TestV2Client };
 
   if(!slot.v2Client) {
 
     throw new Error("refreshV2FactsOnce: the platform has no account-credentialed client installed.");
   }
 
-  await slot.refreshV2Facts(slot.v2Client);
+  return slot.refreshV2Facts(slot.v2Client);
 }
 
 /**
- * Build a recording double of the account-credentialed client, answering a programmed facts result and counting how many times it was asked. The count is what the
+ * Build a recording double of the account-credentialed client, answering a programmed read and counting how many times it was asked. The count is what the
  * single-start and cadence assertions read: a second refresh loop, or a discovery re-entry that started one, shows up here as extra calls.
  *
- * The programmed result may be a FUNCTION of the call number, which is what lets a test answer differently tick by tick - a failed first fetch followed by a
+ * The programmed read may be a FUNCTION of the call number, which is what lets a test answer differently tick by tick - a failed first fetch followed by a
  * successful retry, say - without reaching for a mutable variable in the test body.
  *
- * @param facts - The result fetchAccountFacts resolves to, or null for a failed fetch; a function is called with the one-based fetch number.
+ * @param read - The read fetchAccountFacts resolves to; a function is called with the one-based fetch number.
  *
  * @returns The double, plus a reader for the number of fetches it served.
  */
-export function makeTestV2Client(facts: Nullable<Map<number, HydrawiseControllerV2Facts>> |
-  ((fetch: number) => Nullable<Map<number, HydrawiseControllerV2Facts>>)): { client: TestV2Client; fetches: () => number } {
+export function makeTestV2Client(read: HydrawiseV2Read | ((fetch: number) => HydrawiseV2Read)): { client: TestV2Client; fetches: () => number } {
 
   let fetches = 0;
 
   return { client: { dispatcher: { destroy: async (): Promise<void> => undefined },
-    fetchAccountFacts: async (): Promise<Nullable<Map<number, HydrawiseControllerV2Facts>>> => {
+    fetchAccountFacts: async (): Promise<HydrawiseV2Read> => {
 
       fetches++;
 
-      return (typeof facts === "function") ? facts(fetches) : facts;
+      return (typeof read === "function") ? read(fetches) : read;
     } }, fetches: (): number => fetches };
 }
 

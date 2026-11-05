@@ -7,7 +7,8 @@ import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_BUDGET_CALLS, HYDRAWISE_
   HYDRAWISE_API_RETRY_ATTEMPTS, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_RETRY_STATUS_CODES, HYDRAWISE_API_TIMEOUT, HYDRAWISE_COMMAND_ATTEMPTS,
   HYDRAWISE_COMMAND_BUDGET_CALLS,
   HYDRAWISE_COMMAND_BUDGET_WINDOW, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_MQTT_TOPIC, HYDRAWISE_SUSPEND_DURATION,
-  HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_V2_FACTS_TTL, HYDRAWISE_V2_REFRESH_INTERVAL, PLATFORM_NAME, PLUGIN_NAME } from "./settings.ts";
+  HYDRAWISE_V2_BACKOFF_CEILING, HYDRAWISE_V2_BACKOFF_JITTER, HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_V2_FACTS_GRACE, HYDRAWISE_V2_FACTS_TTL,
+  HYDRAWISE_V2_RATE_LIMIT_REASON, HYDRAWISE_V2_REFRESH_INTERVAL, PLATFORM_NAME, PLUGIN_NAME } from "./settings.ts";
 import { describe, test } from "node:test";
 import { apiRetryOptions } from "homebridge-plugin-utils";
 import assert from "node:assert/strict";
@@ -70,6 +71,28 @@ describe("settings", () => {
       "leaving headroom inside the ceiling for the token grants those reads carry");
   });
 
+  test("a refused renewal's fallback fits inside the ceiling beside the window's other reads", () => {
+
+    // The costliest tick there is: a refresh grant, the password grant it falls back to, and the read they authenticate each draw the read ceiling. It shares a budget
+    // window with the window's other reads, so the sum has to fit, or a fallback would wait a window out in the middle of a tick.
+    const fallbackTick = 3;
+    const otherReads = (HYDRAWISE_V2_BUDGET_WINDOW / HYDRAWISE_V2_REFRESH_INTERVAL) - 1;
+
+    assert.ok((fallbackTick + otherReads) <= HYDRAWISE_V2_BUDGET_CALLS, "the fallback tick and the window's other reads draw no more than the ceiling admits");
+  });
+
+  test("the refresh's backoff climbs to an hour with an upward quarter of jitter", () => {
+
+    assert.equal(HYDRAWISE_V2_BACKOFF_CEILING, 3600, "the longest backed-off sleep before jitter is an hour in seconds, the longest lockout the field reports describe");
+    assert.ok(HYDRAWISE_V2_BACKOFF_CEILING >= (HYDRAWISE_V2_REFRESH_INTERVAL * 2), "and the ladder's first rung, two intervals, sits at or under that ceiling");
+    assert.equal(HYDRAWISE_V2_BACKOFF_JITTER, 0.25, "a backed-off sleep runs up to a quarter past its computed delay");
+  });
+
+  test("a throttled account read is named in the plugin's own sentence", () => {
+
+    assert.equal(HYDRAWISE_V2_RATE_LIMIT_REASON, "The Hydrawise API rate limit has been exceeded.", "the reason reads as a complete sentence of its own");
+  });
+
   test("an unanswered command is sent no more often than the command ceiling admits in one window", () => {
 
     // Every send of an unanswered command draws the command ceiling, so the attempts one command can take stay within what one window admits, and a command
@@ -80,8 +103,11 @@ describe("settings", () => {
 
   test("the facts lifetime is derived from the cadence rather than restated beside it", () => {
 
-    // Twice the cadence is the deliberate ratio: one missed refresh never flips a consumer to its fallback, while a refresh loop that has stopped does.
-    assert.equal(HYDRAWISE_V2_FACTS_TTL, HYDRAWISE_V2_REFRESH_INTERVAL * 2, "a facts snapshot outlives exactly one missed refresh");
+    // Two intervals are the deliberate ratio: one missed refresh never flips a consumer to its fallback, while a refresh loop that has stopped does. The snapshot is
+    // stamped before its request and each sleep starts after one, so the next answer lands past two intervals by the time those requests took, and the grace leaves
+    // the facts current through one missed refresh while they take under a minute in all.
+    assert.equal(HYDRAWISE_V2_FACTS_GRACE, 60, "the requests a refresh makes are allowed a minute in all");
+    assert.equal(HYDRAWISE_V2_FACTS_TTL, (HYDRAWISE_V2_REFRESH_INTERVAL * 2) + HYDRAWISE_V2_FACTS_GRACE, "a facts snapshot outlives exactly one missed refresh");
   });
 
   test("locks in the MQTT and platform identity constants", () => {
