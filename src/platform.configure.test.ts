@@ -5,22 +5,23 @@
  * HomeKit can carry nothing of its name, the short-circuiting second pass and cached-accessory reuse,
  * orphan pruning, the bug-16 device gate in both directions, the no-API-key early return, the bug-2 debug routing, the MQTT construction arms, the discovery
  * retry failure paths and the report of a repeating one, the shutdown teardown and the retained offline each built controller states through the MQTT client's
- * end ahead of it, the refusal a restored accessory answers with until its controller vouches for it, and the retained offline the platform states for a
- * restored controller this run does not build.
+ * end ahead of it, the refusal a restored accessory answers with until its controller vouches for it, the retained offline the platform states for a restored
+ * controller this run does not build, and the one startup line an option set globally or on one controller writes across a whole account.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as controller_id, so camelcase is disabled here to let the controller fixture mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { Characteristic, Service, TestMqttClient, buildPlatform, dispatcherOf, installMockDispatcher, programJsonReply, programStatusReply, seedAccessory,
-  v2DispatcherOf } from "./testing/platform.helpers.ts";
+import { Characteristic, Service, TestMqttClient, buildPlatform, dispatcherOf, installMockDispatcher, installV2Client, makeTestV2Client, programJsonReply,
+  programStatusReply, seedAccessory, v2DispatcherOf } from "./testing/platform.helpers.ts";
 import { HAPStatus, MQTT_DEFAULT_END_GRACE_MS, MqttClient, onAbort } from "homebridge-plugin-utils";
 import { HYDRAWISE_CONTROLLER_FALLBACK_NAME, HydrawiseReservedNames, suspendZoneSubtype, zoneAccessoryId } from "./types.ts";
 import type { Characteristic as HapCharacteristic, PlatformAccessory } from "homebridge";
 import { describe, test } from "node:test";
-import { formatLogEntry, hapStatus, logCount, loggedAt, present, settle, settleUntil, triggerGet, triggerSet, waitUntil } from "homebridge-plugin-utils/testing";
+import { formatLogEntry, hapStatus, linesAt, logCount, loggedAt, present, settle, settleUntil, triggerGet, triggerSet, waitUntil } from "homebridge-plugin-utils/testing";
 import { makeCustomerDetails, normalSchedule } from "./api.helpers.ts";
 import { HYDRAWISE_API_RETRY_INTERVAL } from "./settings.ts";
 import type { MqttConnectHandler } from "homebridge-plugin-utils";
+import type { TestContext } from "node:test";
 import type { TestLogEntry } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
 import { stripVTControlCharacters } from "node:util";
@@ -797,4 +798,44 @@ describe("HydrawisePlatform restore-time refusal and unconfigured availability",
     assert.equal(mqtt.publishedTo(unbuilt).length, unbuiltBefore, "shutdown states nothing for the controller this run did not build");
     assert.equal(mqtt.publishedTo(AVAILABILITY).at(-1)?.payload, "offline", "while the controller it built is stated offline");
   });
+});
+
+describe("HydrawisePlatform feature option startup lines", () => {
+
+  // A second controller on the account, so a line written per controller and a line written once read differently.
+  const SECOND_CONTROLLER = { ...syntheticController, controller_id: 500002, name: "Second Controller", serial_number: "SN9Z8Y7X6W5" };
+
+  // Discover both controllers under the account login, which every option's line is open under, and answer the startup lines one label wrote, as a user reads them.
+  async function startupLines(t: TestContext, label: string, option: string): Promise<string[]> {
+
+    const { emit, entries, platform, registered } = buildPlatform({ options: [ "Enable.Account.Password=test-password", "Enable.Account.Username=test-user", option ] });
+
+    t.after(() => emit(SHUTDOWN));
+    await using dispatcher = installMockDispatcher();
+
+    installV2Client(platform, makeTestV2Client(null).client);
+    programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails({ controllers: [ { ...syntheticController }, { ...SECOND_CONTROLLER } ] }));
+    programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
+
+    emit(DID_FINISH_LAUNCHING);
+    await waitUntil(() => registered().length === 2, { description: "both controllers' accessories to register" });
+
+    return linesAt(entries, "info").filter(line => line.includes(label));
+  }
+
+  for(const [ label, option ] of [ [ "Name synchronization", "Device.SyncName" ], [ "Per-zone suspension switches", "Device.Suspend.Zone" ],
+    [ "Suspend all zones switch", "Device.Suspend.All" ] ] as const) {
+
+    test(option + " set globally writes one line through the plugin's logger however many controllers there are", async (t) => {
+
+      assert.deepEqual(await startupLines(t, label, "Enable." + option), [label + " enabled."],
+        "both controllers ask, and the plugin's logger writes the setting's one line, naming no controller");
+    });
+
+    test(option + " set on a controller writes one line through that controller's logger", async (t) => {
+
+      assert.deepEqual(await startupLines(t, label, "Enable." + option + "." + SECOND_CONTROLLER.serial_number), [SECOND_CONTROLLER.name + ": " + label + " enabled."],
+        "the line names the controller the setting was made on, and its sibling writes nothing");
+    });
+  }
 });

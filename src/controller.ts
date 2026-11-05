@@ -438,15 +438,20 @@ export class HydrawiseController {
 
     this.hints.suspendAll = this.hasFeature("Device.Suspend.All");
 
-    // Surface name synchronization at startup where it departs from its default. Synchronization is read live on each poll rather than cached in a hint, since a
-    // zone can set it independently of its controller; this line reports the controller-scope answer, which is the one that governs when no zone says otherwise.
-    this.platform.featureOptions.logFeature("Device.SyncName", "Name synchronization", this.log, undefined, this.controller.serial_number);
+    /* Surface name synchronization at startup where it departs from its default. HBPU walks the levels a call names, lowest first, and writes one line for the level
+     * the setting was made at: a setting on this controller goes through this controller's logger, and a global one through the plugin's logger, once however many
+     * controllers ask. Synchronization is read live on each poll rather than cached in a hint, since a zone can set it independently of its controller, so the call
+     * names no zone and a zone's own setting stays unlogged.
+     */
+    this.platform.featureOptions.logFeature({ controller: { id: this.controller.serial_number, log: this.log }, label: "Name synchronization", log: this.platform.log,
+      option: "Device.SyncName" });
 
     // Surface the per-zone suspension switches on the same terms, and only where the account credentials that can command a suspension are configured: without them
     // these switches are never created, so naming them would advertise a feature this install does not have.
     if(this.platform.hasV2Client) {
 
-      this.platform.featureOptions.logFeature("Device.Suspend.Zone", "Per-zone suspension switches", this.log, undefined, this.controller.serial_number);
+      this.platform.featureOptions.logFeature({ controller: { id: this.controller.serial_number, log: this.log }, label: "Per-zone suspension switches",
+        log: this.platform.log, option: "Device.Suspend.Zone" });
     }
   }
 
@@ -1316,7 +1321,8 @@ export class HydrawiseController {
 
     service.updateCharacteristic(this.hap.Characteristic.On, this.isAllSuspended(this.currentFacts));
 
-    this.platform.featureOptions.logFeature("Device.Suspend.All", "Suspend all zones switch", this.log, undefined, this.controller.serial_number);
+    this.platform.featureOptions.logFeature({ controller: { id: this.controller.serial_number, log: this.log }, label: "Suspend all zones switch",
+      log: this.platform.log, option: "Device.Suspend.All" });
   }
 
   /* Poll the Hydrawise API forever, yielding one update per completed poll. This is the wire half of the loop: it owns the fetch, the retry policy that recovers
