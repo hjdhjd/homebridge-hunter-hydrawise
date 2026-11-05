@@ -4,10 +4,11 @@
  * and the MQTT set - against the platform double's command double, which can hold a command in flight until a row releases it. Covers what the queue promises:
  * a write that returns before its command is answered, the latest choice alone sent behind a command in flight, a reversal that sends nothing, a poll that cannot
  * move a control off a pending choice, a refusal that speaks only for the latest choice, the choice waiting behind a refused or unanswered command sent and a tap
- * back to that command's value sent too, a tap back sent while a resend waits for admission or while the choice behind an unanswered command waits, the resend a
- * timeout earns with one command still in flight and the warning when none is answered, a failure that is not resent, the silence after shutdown, the order of the
- * latest taps, the withdrawal of a command still waiting for admission, the drop of a command whose controller stopped responding, an MQTT start that moves the
- * valve as a tap does, and a valve run whose reply could not be read.
+ * back to that command's value sent too, a tap away and back behind a refused command that sends nothing further, a tap back sent while a resend waits for admission
+ * or while the choice behind an unanswered command waits, the resend a timeout earns with one command still in flight and the warning when none is answered, a
+ * failure that is not resent, the silence after shutdown, the order of the latest taps, the withdrawal of a command still waiting for admission, the drop of a command
+ * whose controller stopped responding, an MQTT start that moves the valve as a tap does and survives a Suspend All confirmed over a wire reporting no zones, and a
+ * valve run whose reply could not be read.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
@@ -215,6 +216,34 @@ describe("HydrawiseController command queue", () => {
     assert.deepEqual(suspendAlls(h), [ "suspend", "suspend" ], "the unanswered suspend, then the suspend the last tap asked for");
     assert.equal(await triggerGet(suspend.getCharacteristic(Characteristic.On)), true, "and the switch reads the last tap");
     assert.equal(h.entries.filter(line => [ "error", "warn" ].includes(line.level)).length, 0, "a timeout the user has moved past is not news");
+  });
+
+  test("a tap away and back, made while the choice behind a refused command waits, sends nothing further", async (t) => {
+
+    const { h, suspend, valve } = await suspendAllController();
+
+    t.after(() => h.abort());
+
+    const first = h.commands.hold();
+
+    await triggerSet(suspend.getCharacteristic(Characteristic.On), true);
+    await first.reached;
+    await triggerSet(valve.getCharacteristic(Characteristic.Active), Characteristic.Active.ACTIVE);
+    await triggerSet(suspend.getCharacteristic(Characteristic.On), false);
+
+    // The valve run goes ahead of the choice the refusal put back in line and is held, so the taps below land while that choice waits.
+    const run = h.commands.hold();
+
+    first.release({ reason: "denied", status: "refused" });
+    await run.reached;
+    await triggerSet(suspend.getCharacteristic(Characteristic.On), true);
+    await triggerSet(suspend.getCharacteristic(Characteristic.On), false);
+
+    run.release();
+    await h.controller.commandsIdle;
+
+    assert.deepEqual(suspendAlls(h), ["suspend"], "a refused command never took, so returning to what the switch first showed is a reversal");
+    assert.equal(await triggerGet(suspend.getCharacteristic(Characteristic.On)), false, "and the switch reads the last tap");
   });
 
   test("a tap back while a resend waits for admission is sent, because the unanswered command may have taken", async (t) => {
@@ -457,6 +486,29 @@ describe("HydrawiseController valve commands", () => {
 
     assert.equal(valve.getCharacteristic(Characteristic.InUse).value, Characteristic.InUse.IN_USE, "and the confirmation shows the water flowing");
     assert.ok(loggedAt(h.entries, "info", "Bravo [Zone 2]: Manually started (duration: 5 minutes)."), "narrated as a manual start");
+  });
+
+  test("a Suspend All confirmed while the wire reports no zones leaves an MQTT start queued behind it to be sent", async (t) => {
+
+    const { h, suspend } = await suspendAllController({ mqtt: true });
+
+    t.after(() => h.abort());
+
+    const held = h.commands.hold();
+
+    await triggerSet(suspend.getCharacteristic(Characteristic.On), true);
+    await held.reached;
+    await h.mqtt?.invokeSet("controller/set", "start 2 300");
+
+    // Every later poll reads this body, so the wire reports no zones from the moment the poll counted here completes.
+    h.retrieve.programDefault("statusschedule.php", { body: schedule([]), kind: "response" });
+    await pollsCompleted(h, h.retrieve.callsTo("statusschedule.php").length + 1);
+
+    held.release();
+    await h.controller.commandsIdle;
+
+    assert.deepEqual(h.commands.params.map(params => params["action"]), [ "suspendall", "run" ], "a confirmation weighs nothing against the wire, so each is sent");
+    assert.equal(h.commands.params.at(-1)?.["relay_id"], "700002", "the run for the zone it named");
   });
 
   test("a valve run refused in its reply puts the valve back and says why", async (t) => {

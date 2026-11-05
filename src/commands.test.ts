@@ -4,8 +4,11 @@
  * a confirmation's effects, the preparing of a command, a send that rejects or throws as it is made, and the write that puts a control back. Covers the
  * containment the queue promises: a fault is said once through the logger the queue is handed, the next target in line is still sent, the queue falls idle, no
  * rejection goes unhandled, and a fault met after the platform shuts down says nothing. Covers too the one slot in flight across a timeout's answer, with another
- * target tapped in the same turn.
+ * target tapped in the same turn, and what forgetting, sweeping or retiring a record leaves behind.
  */
+
+// The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
+/* eslint-disable camelcase */
 import type { HydrawiseCommandHandlers, HydrawiseCommandTarget, HydrawiseCommandValue, HydrawisePreparedCommand } from "./commands.ts";
 import { assertNoUnhandledRejections, capturingLog, linesAt, present, waitUntil } from "homebridge-plugin-utils/testing";
 import { describe, test } from "node:test";
@@ -29,6 +32,9 @@ const IDLE_MS = 1000;
 // The targets every row queues, in the order it queues them: the account-wide switch, whose handlers a row makes throw, then a zone's valve, waiting its turn.
 const SUSPEND_ALL: HydrawiseCommandTarget = { kind: "suspend-all" };
 const VALVE: HydrawiseCommandTarget = { kind: "valve", zone: makeZone() };
+
+// The confirmed suspension a row forgets or sweeps. The harness's one fault in those rows is in writing the switch's control, which none of them reaches.
+const RECORD = { at: 100, commandedUntil: 200 };
 
 // Where a row makes the account-wide switch's handlers throw: in its confirmation's effects, as its command is prepared, in a send that rejects, when its
 // control is written, or in a send that throws as it is made.
@@ -333,5 +339,119 @@ describe("HydrawiseCommandQueue one command in flight", () => {
 
     present(sends[2], "the valve's send").answer.resolve({ status: "confirmed" });
     await idleWithin(queue);
+  });
+});
+
+describe("HydrawiseCommandQueue forgetting a record", () => {
+
+  test("a target resting on its record is forgotten, and a target holding nothing stays that way", async (t) => {
+
+    const h = buildQueue({ fault: "render" });
+
+    t.after(() => h.lifetime.abort());
+
+    h.queue.stamp(SUSPEND_ALL, RECORD);
+    h.queue.forget(SUSPEND_ALL);
+
+    assert.equal(h.queue.record(SUSPEND_ALL), undefined, "the record is gone");
+
+    h.queue.forget(SUSPEND_ALL);
+
+    assert.equal(h.queue.record(SUSPEND_ALL), undefined, "and forgetting it again changes nothing");
+
+    await idleWithin(h.queue);
+  });
+
+  test("a target with a request pending keeps the request and rests on nothing once it settles", async (t) => {
+
+    const h = buildQueue({ fault: "render", held: true });
+
+    t.after(() => h.lifetime.abort());
+
+    h.queue.stamp(SUSPEND_ALL, RECORD);
+    h.queue.enqueue(SUSPEND_ALL, { on: true, origin: "homekit" });
+    h.queue.forget(SUSPEND_ALL);
+
+    assert.equal(h.queue.record(SUSPEND_ALL), undefined, "the record is gone");
+    assert.deepEqual(h.queue.pending(SUSPEND_ALL), { on: true, origin: "homekit" }, "and the request is still pending");
+
+    h.release();
+    await idleWithin(h.queue);
+
+    assert.deepEqual(h.sent, ["suspend-all"], "the request is still sent");
+    assert.equal(h.queue.record(SUSPEND_ALL), undefined, "and the target has no record to rest on");
+  });
+});
+
+describe("HydrawiseCommandQueue sweeping records", () => {
+
+  test("the account-wide record answers to the judgment alone, while a zone's also leaves with its zone", async (t) => {
+
+    const h = buildQueue({ fault: "render" });
+    const zone: HydrawiseCommandTarget = { kind: "zone-suspend", zone: makeZone() };
+
+    t.after(() => h.lifetime.abort());
+
+    h.queue.stamp(SUSPEND_ALL, RECORD);
+    h.queue.stamp(zone, RECORD);
+    h.queue.sweep({ reported: new Set(), stands: (): boolean => true });
+
+    assert.equal(h.queue.record(zone), undefined, "a zone the wire no longer reports takes its record along");
+    assert.deepEqual(h.queue.record(SUSPEND_ALL), RECORD, "and no zone report can speak for the account-wide record, which still stands");
+
+    h.queue.sweep({ reported: new Set(), stands: (): boolean => false });
+
+    assert.equal(h.queue.record(SUSPEND_ALL), undefined, "a record that no longer stands retires");
+
+    await idleWithin(h.queue);
+  });
+
+  test("a request pending on the account-wide target survives its record's retirement and rests on nothing once it settles", async (t) => {
+
+    const h = buildQueue({ fault: "render", held: true });
+
+    t.after(() => h.lifetime.abort());
+
+    h.queue.stamp(SUSPEND_ALL, RECORD);
+    h.queue.enqueue(SUSPEND_ALL, { on: true, origin: "homekit" });
+    h.queue.sweep({ reported: new Set(), stands: (): boolean => false });
+
+    assert.equal(h.queue.record(SUSPEND_ALL), undefined, "the record is gone");
+    assert.deepEqual(h.queue.pending(SUSPEND_ALL), { on: true, origin: "homekit" }, "and the request is still pending");
+
+    h.release();
+    await idleWithin(h.queue);
+
+    assert.deepEqual(h.sent, ["suspend-all"], "the request is still sent");
+    assert.equal(h.queue.record(SUSPEND_ALL), undefined, "and the target has no record to rest on");
+  });
+});
+
+describe("HydrawiseCommandQueue retiring zone records", () => {
+
+  test("every zone's record retires, the account-wide record stands, and a request pending on a zone keeps its turn", async (t) => {
+
+    const h = buildQueue({ fault: "render", held: true });
+    const resting: HydrawiseCommandTarget = { kind: "zone-suspend", zone: makeZone({ relay_id: 700001 }) };
+    const pending: HydrawiseCommandTarget = { kind: "zone-suspend", zone: makeZone({ relay_id: 700002 }) };
+
+    t.after(() => h.lifetime.abort());
+
+    h.queue.stamp(SUSPEND_ALL, RECORD);
+    h.queue.stamp(resting, RECORD);
+    h.queue.stamp(pending, RECORD);
+    h.queue.enqueue(pending, { on: true, origin: "homekit" });
+    h.queue.retireZoneRecords();
+
+    assert.equal(h.queue.record(resting), undefined, "a zone resting on its record is left with none");
+    assert.equal(h.queue.record(pending), undefined, "and so is a zone with a request pending");
+    assert.deepEqual(h.queue.pending(pending), { on: true, origin: "homekit" }, "whose request is still pending");
+    assert.deepEqual(h.queue.record(SUSPEND_ALL), RECORD, "while the account-wide record is the confirmation's own to replace");
+
+    h.release();
+    await idleWithin(h.queue);
+
+    assert.deepEqual(h.sent, ["zone-suspend"], "the request is still sent");
+    assert.equal(h.queue.record(pending), undefined, "and the target has no record to rest on");
   });
 });

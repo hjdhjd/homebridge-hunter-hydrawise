@@ -2,13 +2,14 @@
  *
  * types.test.ts: The reserved-name constants, the controller and zone name composers, the accessory-context classification, and the fixture-versus-interface
  * conformance check. The interfaces are compile-time contracts; this file asserts the reserved-name constant and its subtype compose/recognize pair, each source a
- * composer answers from, the context predicate's reading of cache JSON no static type governs, and verifies the synthetic fixtures carry the required wire fields
- * with wire-accurate types.
+ * composer answers from, the context predicate's reading of cache JSON no static type governs, the one definition of a real upcoming run, and verifies the synthetic
+ * fixtures carry the required wire fields with wire-accurate types.
  */
 import { HYDRAWISE_CONTROLLER_FALLBACK_NAME, HYDRAWISE_ZONE_FALLBACK_NAME, HydrawiseReservedNames, controllerDisplayName, controllerIdentity, isRainSensorSubtype,
-  isSuspendZoneSubtype, isZoneAccessoryContext, rainSensorSubtype, suspendZoneSubtype, zoneDisplayName } from "./types.ts";
+  isSuspendZoneSubtype, isZoneAccessoryContext, rainSensorSubtype, suspendZoneSubtype, zoneDisplayName, zoneHasUpcomingRun } from "./types.ts";
 import { UNSCHEDULED_SENTINEL, normalZoneMatrix, sentinelZoneMatrix, syntheticController, syntheticCustomerDetails } from "./api.fixtures.ts";
 import { describe, test } from "node:test";
+import { makeStatusSchedule, makeZone } from "./api.helpers.ts";
 import type { HydrawiseAccessoryContext } from "./types.ts";
 import assert from "node:assert/strict";
 import { expectAt } from "homebridge-plugin-utils/testing";
@@ -111,6 +112,19 @@ describe("hydrawise accessory contexts", () => {
 
     assert.ok(isZoneAccessoryContext({ ownerController, zone }), "the zone pair alone is a zone accessory context");
     assert.ok(!isZoneAccessoryContext(ambiguous), "a firmware version on a zone accessory makes it classify as not-a-zone, the self-healing direction");
+  });
+});
+
+describe("hydrawise upcoming run", () => {
+
+  test("only a real upcoming run answers true", () => {
+
+    const status = makeStatusSchedule({ relays: [], sensors: [] });
+
+    assert.ok(zoneHasUpcomingRun(makeZone({ run: 300, time: 69000, timestr: "16:08" }), status), "a countdown to a run of real length is an upcoming run");
+    assert.ok(!zoneHasUpcomingRun(makeZone({ run: 600, time: 1, timestr: "" }), status), "a running zone has none, since a manual run can flow during a suspension");
+    assert.ok(!zoneHasUpcomingRun(makeZone({ run: 0, time: UNSCHEDULED_SENTINEL, timestr: "" }), status), "the sentinel with nothing beside it is no run");
+    assert.ok(!zoneHasUpcomingRun(makeZone({ run: 300, time: UNSCHEDULED_SENTINEL, timestr: "16:08" }), status), "and neither is the sentinel beside a stale schedule");
   });
 });
 

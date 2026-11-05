@@ -823,6 +823,15 @@ export function zoneScheduleStatus(zone: HydrawiseZoneConfig, status: StatusSche
   return { durationSeconds: zone.run, nextRunAt: status.time + zone.time, relayId: zone.relay_id, state: "scheduled" };
 }
 
+/* Whether the wire shows a real upcoming run for a zone, which is the classifier asked with no facts and no commands, so "a real upcoming run" has one definition. A
+ * running zone answers false, as does a zone with no run, because neither contradicts a suspension: a manual run can flow during one, and "no upcoming run" has several
+ * meanings on this wire.
+ */
+export function zoneHasUpcomingRun(zone: HydrawiseZoneConfig, status: StatusScheduleResponse): boolean {
+
+  return zoneScheduleStatus(zone, status).state === "scheduled";
+}
+
 /* The account-credentialed inputs a whole-controller projection can be composed with: the suspension commands the account has accepted, the facts one refresh
  * reported, and the suspension instants carried forward from the prior projection for the zones this refresh has nothing to say about.
  *

@@ -285,23 +285,17 @@ export class HydrawiseCommandQueue {
   }
 
   /**
-   * Every zone's confirmed suspension record, keyed by relay id.
+   * The suspension that speaks for one zone: the record Hydrawise confirmed for the zone itself, and otherwise the account-wide one, which is a fact about every zone
+   * beneath it. A zone's own record is always the newer of the two, because an account-wide confirmation retires every zone's record as it lands, so nothing here
+   * weighs one against the other.
    *
-   * @returns The records the zone suspension targets hold.
+   * @param zone - The wire zone asked about.
+   *
+   * @returns The record, or undefined when neither exists.
    */
-  public zoneRecords(): Map<number, HydrawiseCommandRecord> {
+  public zoneRecord(zone: HydrawiseZoneConfig): HydrawiseCommandRecord | undefined {
 
-    const records = new Map<number, HydrawiseCommandRecord>();
-
-    for(const { state, target } of this.entries.values()) {
-
-      if((target.kind === "zone-suspend") && state.record) {
-
-        records.set(target.zone.relay_id, state.record);
-      }
-    }
-
-    return records;
+    return this.record({ kind: "zone-suspend", zone }) ?? this.record({ kind: "suspend-all" });
   }
 
   /**
@@ -326,24 +320,35 @@ export class HydrawiseCommandQueue {
   }
 
   /**
+   * Forget the suspension Hydrawise last confirmed for a target, leaving anything it has pending in place.
+   *
+   * @param target - The control whose record is forgotten.
+   */
+  public forget(target: HydrawiseCommandTarget): void {
+
+    const key = this.keyOf(target);
+    const entry = this.entries.get(key);
+
+    if(entry) {
+
+      this.retire(key, entry);
+    }
+  }
+
+  /**
    * Drop what a pass of the projection supersedes. A zone the wire no longer reports takes its record and every request pending for it along, since nothing is left
-   * for them to speak for, and a command still in flight for it settles with nothing to show for it. A zone's record that no longer stands retires. The account-wide
-   * record is left to its readers, which weigh it on every read.
+   * for them to speak for, and a command still in flight for it settles with nothing to show for it. Any record that no longer stands retires, the account-wide one
+   * among them, and a request pending on its target stays pending.
    *
    * @param options          - The pass.
    * @param options.reported - The relay id of every zone the wire reports.
-   * @param options.stands   - Whether a record still speaks for its zone.
+   * @param options.stands   - Whether a record still speaks for its target.
    */
   public sweep({ reported, stands }: { reported: ReadonlySet<number>; stands: (record: HydrawiseCommandRecord) => boolean }): void {
 
     for(const [ key, entry ] of this.entries) {
 
-      if(entry.target.kind === "suspend-all") {
-
-        continue;
-      }
-
-      if(!reported.has(entry.target.zone.relay_id)) {
+      if((entry.target.kind !== "suspend-all") && !reported.has(entry.target.zone.relay_id)) {
 
         this.entries.delete(key);
         this.queued.delete(key);
@@ -353,14 +358,24 @@ export class HydrawiseCommandQueue {
 
       if(entry.state.record && !stands(entry.state.record)) {
 
-        if(entry.state.status === "confirmed") {
+        this.retire(key, entry);
+      }
+    }
 
-          this.entries.delete(key);
+    this.settleIdle();
+  }
 
-          continue;
-        }
+  /**
+   * Retire every zone's record, for an account-wide confirmation that replaces what each zone held. Every request stays pending, the request of a zone the wire no
+   * longer reports among them, since what the wire reports is for a pass of the projection to weigh.
+   */
+  public retireZoneRecords(): void {
 
-        entry.state = { ...entry.state, record: undefined };
+    for(const [ key, entry ] of this.entries) {
+
+      if(entry.target.kind !== "suspend-all") {
+
+        this.retire(key, entry);
       }
     }
 
@@ -442,6 +457,19 @@ export class HydrawiseCommandQueue {
     }
 
     this.entries.delete(key);
+  }
+
+  // Drop a target's record: a target with nothing pending is forgotten whole, and one with a request pending keeps it, resting on nothing once it settles.
+  private retire(key: string, entry: HydrawiseTargetEntry): void {
+
+    if(entry.state.status === "confirmed") {
+
+      this.entries.delete(key);
+
+      return;
+    }
+
+    entry.state = { ...entry.state, record: undefined };
   }
 
   // End a target's latest request without it taking: rest the target on its record, say why, and put back what its control reads.
