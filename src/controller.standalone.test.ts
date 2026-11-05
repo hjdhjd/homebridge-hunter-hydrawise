@@ -556,16 +556,16 @@ describe("HydrawiseController standalone zones", () => {
       { description: "the standalone zone's valve on its own accessory to appear" });
 
     assert.ok(h.zoneAccessories.get(STANDALONE_RELAY_ID)?.getServiceById(Service.Valve, STANDALONE_SUBTYPE), "the valve genuinely landed on the standalone host");
-    assert.ok(!loggedAt(h.entries, "info", "Rain sensor is stopping irrigation"),
+    assert.ok(!loggedAt(h.entries, "info", "Rain sensor appears to be stopping irrigation"),
       "a valve rediscovery refreshes the stored sensor state before the comparison, so a promotion narrates no transition the zone never made");
 
     // Clearing the stop is the positive control: the line firing here proves Log.Zone is live for this zone and that the promotion poll stored the live
     // stopped state rather than leaving the seeded false standing.
     h.retrieve.programDefault("statusschedule.php", { body: pacedSchedule([standaloneZone(SCHEDULED)], rainSensors), kind: "response" });
 
-    await waitUntil(() => loggedAt(h.entries, "info", "Rain sensor is allowing irrigation"),
-      { description: "an info line containing \"Rain sensor is allowing irrigation\"" });
+    await waitUntil(() => loggedAt(h.entries, "info", "Rain sensor appears to be allowing irrigation"),
+      { description: "an info line containing \"Rain sensor appears to be allowing irrigation\"" });
 
-    assert.ok(loggedAt(h.entries, "info", "Rain sensor is allowing irrigation"), "the sensor clearing after the promotion does narrate its transition");
+    assert.ok(loggedAt(h.entries, "info", "Rain sensor appears to be allowing irrigation"), "the sensor clearing after the promotion does narrate its transition");
   });
 });

@@ -1366,6 +1366,14 @@ export class HydrawiseController {
 
     this.platform.featureOptions.logFeature({ controller: { id: this.controller.serial_number, log: this.log }, label: "Suspend all zones switch",
       log: this.platform.log, option: "Device.Suspend.All" });
+
+    // Without the account's word the switch reads the key-based wire's estimate, which cannot tell a suspension from an account with nothing scheduled, so the user is
+    // told once what the switch can and cannot vouch for.
+    if(!this.platform.hasV2Client) {
+
+      this.log.info("Without your Hydrawise account login, the Suspend All switch shows an estimate, because the API key alone cannot confirm whether watering is " +
+        "suspended.");
+    }
   }
 
   // The rain sensors this controller's accessory carries, the cached ones included, matched on the service type and the composed subtype as the zone sweep matches.
@@ -1767,13 +1775,16 @@ export class HydrawiseController {
        * happened while the sensor was still tripping.
        *
        * The reading prefers the account API's own live answer and falls back to the group inference drawn from the wire, which is the order the classifier
-       * applies to the same question.
+       * applies to the same question. A reading from that inference is an estimate, and the one value below decides the wording of this zone's rain line and of its
+       * status sentence, so each says so in the same words.
        *
        * Both are resolved before the hint entry so a first-sighted zone seeds its stored state from the live readings rather than from static defaults, which
        * would otherwise fire a spurious transition the first time a zone appears during a rain delay or under a suspension.
        */
       const state = classified.get(zone.relay_id);
-      const isStopped = facts?.zones.get(zone.relay_id)?.sensorStopped ?? this.isStoppedBySensor(zone);
+      const sensorStopped = facts?.zones.get(zone.relay_id)?.sensorStopped ?? null;
+      const isInferred = sensorStopped === null;
+      const isStopped = sensorStopped ?? this.isStoppedBySensor(zone);
 
       // Resolve this zone's hint entry, seeded on first sighting with the live state. The view is the ledger's own entry, so the reads below see every write the
       // rest of this pass makes to it.
@@ -1794,7 +1805,7 @@ export class HydrawiseController {
         // transition check below does not fire on the zone's first appearance.
         this.zoneHints.refreshStopped(zone.relay_id, isStopped);
 
-        this.log.info("%s: %s", this.zoneLabel(zone, valveService), this.zoneStatus(zone, state));
+        this.log.info("%s: %s", this.zoneLabel(zone, valveService), this.zoneStatus(zone, isInferred, state));
 
         /* The valve's handlers go through the Not Responding rule of the accessory hosting it, so a run is never sent while the controller cannot be reached, nor
          * while the host is a standalone accessory the last poll did not host. A standalone valve is its accessory's primary characteristic, so it answers reads
@@ -1870,13 +1881,14 @@ export class HydrawiseController {
         if(isValveInUse !== hints.isOn) {
 
           this.log.info("%s: %s %s", this.zoneLabel(zone, valveService), hints.isOn ? "Started" : "Stopped.",
-            hints.isOn ? "(duration: " + this.getMinutes(zone.run) + ")." : this.zoneStatus(zone, state));
+            hints.isOn ? "(duration: " + this.getMinutes(zone.run) + ")." : this.zoneStatus(zone, isInferred, state));
         }
 
         // Inform the user if the zone has been stopped due to a rain sensor.
         if(isStopped !== hints.isStopped) {
 
-          this.log.info("%s: Rain sensor is %s irrigation.", this.zoneLabel(zone, valveService), isStopped ? "stopping" : "allowing");
+          this.log.info(isInferred ? "%s: Rain sensor appears to be %s irrigation." : "%s: Rain sensor is %s irrigation.", this.zoneLabel(zone, valveService),
+            isStopped ? "stopping" : "allowing");
         }
       }
 
@@ -2332,12 +2344,13 @@ export class HydrawiseController {
 
   /* Utility to return the status of a zone to a user. The sentence comes from the schedule classifier's own reading of this poll, which is the same reading the
    * persisted projection and the webUI display are built from, so a zone's log line and its displayed status can never tell different stories. Each arm then
-   * composes its sentence from the wire fields the classifier already weighed.
+   * composes its sentence from the wire fields the classifier already weighed, and a rain stop read from the wire's inference rather than from current account
+   * facts says only that it appears to be one, on the caller's word.
    *
    * Every state the union declares is named here with no default arm, so a state added to the union surfaces as a compile error - a return path the analysis can
    * see falling off the end - rather than as a zone silently rendering someone else's sentence.
    */
-  private zoneStatus(zone: HydrawiseZoneConfig, state: HydrawiseZoneScheduleStatus | undefined = zoneScheduleStatus(zone, this.status)): string {
+  private zoneStatus(zone: HydrawiseZoneConfig, isInferred: boolean, state: HydrawiseZoneScheduleStatus | undefined = zoneScheduleStatus(zone, this.status)): string {
 
     switch(state.state) {
 
@@ -2352,7 +2365,7 @@ export class HydrawiseController {
 
       case "sensor-stopped":
 
-        return "Rain sensor is preventing irrigation.";
+        return isInferred ? "Rain sensor appears to be preventing irrigation." : "Rain sensor is preventing irrigation.";
 
       case "suspended":
 

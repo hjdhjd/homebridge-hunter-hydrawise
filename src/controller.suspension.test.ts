@@ -56,6 +56,10 @@ const BETA_DISABLED = "Disable.Device." + BETA_RELAY_ID.toString();
 // A far-future suspension instant, in the shape the account API reports one.
 const SUSPENDED_UNTIL = 1903928399;
 
+// The line that says what the account-wide switch can vouch for without the account's word.
+const ESTIMATE_LINE = "Without your Hydrawise account login, the Suspend All switch shows an estimate, because the API key alone cannot confirm" +
+  " whether watering is suspended.";
+
 // The reason a refused command carries back, which the controller's one sentence has to name.
 const REFUSAL_SUMMARY = "Hydrawise refused this one.";
 
@@ -331,6 +335,30 @@ describe("HydrawiseController per-zone suspension switches", () => {
     await waitUntil(() => getServiceName(suspendSwitch(h.accessory)) === "Alpha North Suspend",
       { description: "Alpha's suspension switch to take the renamed zone's name" });
     assert.equal(getServiceName(h.accessory.getServiceById(Service.Valve, ALPHA_VALVE_SUBTYPE)), "Alpha North", "the valve moved with it");
+  });
+});
+
+describe("HydrawiseController Suspend All estimate line", () => {
+
+  test("is written once with the switch on and no account login", () => {
+
+    const h = buildController({ userOptions: [SUSPEND_ALL_ON] });
+
+    assert.equal(logCount(h.entries, "info", ESTIMATE_LINE), 1, "the wire's estimate is what the switch shows, so the user is told");
+  });
+
+  test("is not written with an account login", () => {
+
+    const h = buildController({ hasV2Client: true, userOptions: [SUSPEND_ALL_ON] });
+
+    assert.equal(logCount(h.entries, "info", ESTIMATE_LINE), 0, "the account's facts confirm what the switch shows");
+  });
+
+  test("is not written with the switch off", () => {
+
+    const h = buildController();
+
+    assert.equal(logCount(h.entries, "info", ESTIMATE_LINE), 0, "with no switch, there is nothing to explain");
   });
 });
 

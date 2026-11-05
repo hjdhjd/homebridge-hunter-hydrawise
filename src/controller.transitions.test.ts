@@ -94,11 +94,11 @@ describe("HydrawiseController updateState transitions", () => {
 
     t.after(() => h.abort());
 
-    await waitUntil(() => loggedAt(h.entries, "info", "Rain sensor is allowing irrigation"),
-      { description: "an info line containing \"Rain sensor is allowing irrigation\"" });
+    await waitUntil(() => loggedAt(h.entries, "info", "Rain sensor appears to be allowing irrigation"),
+      { description: "an info line containing \"Rain sensor appears to be allowing irrigation\"" });
 
-    assert.ok(loggedAt(h.entries, "info", "Rain sensor is stopping irrigation"), "a rain stop should be logged");
-    assert.ok(loggedAt(h.entries, "info", "Rain sensor is allowing irrigation"), "a rain clear should be logged");
+    assert.ok(loggedAt(h.entries, "info", "Rain sensor appears to be stopping irrigation"), "a rain stop should be logged");
+    assert.ok(loggedAt(h.entries, "info", "Rain sensor appears to be allowing irrigation"), "a rain clear should be logged");
   });
 
   test("names each zone's own state at its first sighting", async (t) => {
@@ -132,8 +132,8 @@ describe("HydrawiseController updateState transitions", () => {
     await waitUntil(() => loggedAt(h.entries, "info", "Beta [Zone 2]:"), { description: "an info line containing \"Beta [Zone 2]:\"" });
 
     // Every zone the sensor covers carries the sentinel, so the sensor itself is the evidence and both zones read as rain-stopped rather than merely unscheduled.
-    assert.ok(loggedAt(h.entries, "info", "Alpha [Zone 1]: Rain sensor is preventing irrigation."), "a fully sentineled covered group reads as a rain stop");
-    assert.ok(loggedAt(h.entries, "info", "Beta [Zone 2]: Rain sensor is preventing irrigation."), "every zone of that group reads the same way");
+    assert.ok(loggedAt(h.entries, "info", "Alpha [Zone 1]: Rain sensor appears to be preventing irrigation."), "a fully sentineled covered group reads as a rain stop");
+    assert.ok(loggedAt(h.entries, "info", "Beta [Zone 2]: Rain sensor appears to be preventing irrigation."), "every zone of that group reads the same way");
   });
 
   test("a zone losing its schedule while a covered sibling still has one logs no rain transition", async (t) => {
@@ -154,7 +154,8 @@ describe("HydrawiseController updateState transitions", () => {
     await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 3, { description: "the third status poll" });
 
     assert.ok(loggedAt(h.entries, "info", "Alpha [Zone 1]: No runs are currently scheduled."), "the first poll's mixed body was processed");
-    assert.equal(logCount(h.entries, "info", "Rain sensor is stopping irrigation"), 0, "suspending a zone under a sensor that is not tripping is not a rain stop");
+    assert.equal(logCount(h.entries, "info", "Rain sensor appears to be stopping irrigation"), 0,
+      "suspending a zone under a sensor that is not tripping is not a rain stop");
   });
 
   test("the last covered sibling losing its schedule flips the whole group, and regaining it flips the group back", async (t) => {
@@ -171,17 +172,18 @@ describe("HydrawiseController updateState transitions", () => {
 
     t.after(() => h.abort());
 
-    await waitUntil(() => loggedAt(h.entries, "info", "Beta [Zone 2]: Rain sensor is allowing irrigation."),
-      { description: "an info line containing \"Beta [Zone 2]: Rain sensor is allowing irrigation.\"" });
+    await waitUntil(() => loggedAt(h.entries, "info", "Beta [Zone 2]: Rain sensor appears to be allowing irrigation."),
+      { description: "an info line containing \"Beta [Zone 2]: Rain sensor appears to be allowing irrigation.\"" });
 
     /* Alpha's own wire body never moves across these three polls - it carries the sentinel throughout - so both of its lines are driven entirely by Beta, the last
      * covered sibling holding a schedule. Each line is asserted name-qualified because a bare substring cannot tell both zones logging from only the zone whose
      * own body changed, and Alpha's line is precisely the sibling-driven flip worth asserting.
      */
-    assert.ok(loggedAt(h.entries, "info", "Alpha [Zone 1]: Rain sensor is stopping irrigation."), "the group completing stops the zone that never moved");
-    assert.ok(loggedAt(h.entries, "info", "Beta [Zone 2]: Rain sensor is stopping irrigation."), "the group completing stops the zone that moved");
-    assert.ok(loggedAt(h.entries, "info", "Alpha [Zone 1]: Rain sensor is allowing irrigation."), "the group breaking again releases the zone that never moved");
-    assert.ok(loggedAt(h.entries, "info", "Beta [Zone 2]: Rain sensor is allowing irrigation."), "the group breaking again releases the zone that moved");
+    assert.ok(loggedAt(h.entries, "info", "Alpha [Zone 1]: Rain sensor appears to be stopping irrigation."), "the group completing stops the zone that never moved");
+    assert.ok(loggedAt(h.entries, "info", "Beta [Zone 2]: Rain sensor appears to be stopping irrigation."), "the group completing stops the zone that moved");
+    assert.ok(loggedAt(h.entries, "info", "Alpha [Zone 1]: Rain sensor appears to be allowing irrigation."),
+      "the group breaking again releases the zone that never moved");
+    assert.ok(loggedAt(h.entries, "info", "Beta [Zone 2]: Rain sensor appears to be allowing irrigation."), "the group breaking again releases the zone that moved");
   });
 
   test("prunes a valve when its zone disappears from the response", async (t) => {
@@ -481,4 +483,30 @@ describe("HydrawiseController rain transitions speak for the sensor", () => {
     assert.equal(lines.filter(line => line.includes("Rain sensor is stopping irrigation")).length, 1,
       "a sensor that begins tripping is narrated even while the zone stays suspended");
   });
+
+  test("a reading from current account facts reads as it does today, in the rain line and the status sentence alike", async () => {
+
+    const lines = await driveFacts(facts(true, null), facts(false, null));
+
+    assert.ok(lines.some(line => line.includes("Alpha [Zone 1]: Rain sensor is preventing irrigation.")), "the status sentence states the account's reading");
+    assert.ok(lines.some(line => line.includes("Alpha [Zone 1]: Rain sensor is allowing irrigation.")), "and so does the rain line");
+    assert.equal(lines.filter(line => line.includes("appears")).length, 0, "neither calls the account's own reading an estimate");
+  });
+
+  for(const [ label, unread ] of [ [ "null", makeV2Facts({ zones: [[ 700001, { name: null, sensorStopped: null, suspendedUntil: null } ]] }) ],
+    [ "absent", makeV2Facts() ] ] as const) {
+
+    test("a reading inferred from the wire because the facts' answer is " + label + " reads as an estimate, in the rain line and the status sentence alike", async () => {
+
+      const stopping = await driveFacts(unread, facts(false, null));
+
+      assert.ok(stopping.some(line => line.includes("Alpha [Zone 1]: Rain sensor appears to be preventing irrigation.")),
+        "the status sentence calls the inference an estimate");
+      assert.ok(stopping.some(line => line.includes("Alpha [Zone 1]: Rain sensor is allowing irrigation.")), "and the account's own reading that follows does not");
+
+      const allowing = await driveFacts(facts(false, null), unread);
+
+      assert.ok(allowing.some(line => line.includes("Alpha [Zone 1]: Rain sensor appears to be stopping irrigation.")), "the rain line calls the inference an estimate");
+    });
+  }
 });
