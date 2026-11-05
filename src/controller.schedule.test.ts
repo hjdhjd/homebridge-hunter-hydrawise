@@ -674,6 +674,18 @@ describe("HydrawiseController schedule classification with account facts", () =>
     assert.equal(complete.zones.get(BETA_RELAY_ID)?.sensorStopped, false, "and a zone its quiet sensor covers as clear");
   });
 
+  test("a level sensor answering a null activity beside a good one leaves the rain sensors and every zone's reading unknown", () => {
+
+    // The schema lets a sensor's activity be null with no error beside it. Reading that sensor as absent would call the zone only it covers clear during a rain stop.
+    const good = { id: 394649, model: { sensorType: "LEVEL_CLOSED" }, name: "Good", status: { active: false }, zones: [{ id: ALPHA_RELAY_ID }] };
+    const unread = { id: 394650, model: { sensorType: "LEVEL_CLOSED" }, name: "Unread", status: { active: null }, zones: [{ id: BETA_RELAY_ID }] };
+    const facts = controllerV2Facts({ sensors: [ good, unread ], zones: [ { id: ALPHA_RELAY_ID }, { id: BETA_RELAY_ID } ] });
+
+    assert.equal(facts.rainSensors, null, "the answer cannot say which rain sensors read what");
+    assert.equal(facts.zones.get(ALPHA_RELAY_ID)?.sensorStopped, null, "a zone the good sensor covers is left unknown");
+    assert.equal(facts.zones.get(BETA_RELAY_ID)?.sensorStopped, null, "and so is the zone only the unread sensor covers");
+  });
+
   test("with two level sensors and one nulled, a zone the nulled sensor may cover is not read as clear", async (t) => {
 
     // Both zones under one type-1 sensor carry the unscheduled shape, which the key-based inference reads as a rain stop. A quiet reading from the facts would retire

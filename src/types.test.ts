@@ -5,8 +5,8 @@
  * composer answers from, the context predicate's reading of cache JSON no static type governs, and verifies the synthetic fixtures carry the required wire fields
  * with wire-accurate types.
  */
-import { HYDRAWISE_CONTROLLER_FALLBACK_NAME, HYDRAWISE_ZONE_FALLBACK_NAME, HydrawiseReservedNames, controllerDisplayName, controllerIdentity, isSuspendZoneSubtype,
-  isZoneAccessoryContext, suspendZoneSubtype, zoneDisplayName } from "./types.ts";
+import { HYDRAWISE_CONTROLLER_FALLBACK_NAME, HYDRAWISE_ZONE_FALLBACK_NAME, HydrawiseReservedNames, controllerDisplayName, controllerIdentity, isRainSensorSubtype,
+  isSuspendZoneSubtype, isZoneAccessoryContext, rainSensorSubtype, suspendZoneSubtype, zoneDisplayName } from "./types.ts";
 import { UNSCHEDULED_SENTINEL, normalZoneMatrix, sentinelZoneMatrix, syntheticController, syntheticCustomerDetails } from "./api.fixtures.ts";
 import { describe, test } from "node:test";
 import type { HydrawiseAccessoryContext } from "./types.ts";
@@ -32,6 +32,17 @@ describe("hydrawise reserved names", () => {
     assert.ok(!isSuspendZoneSubtype(HydrawiseReservedNames.SWITCH_SUSPEND_ALL), "the account-wide switch is never mistaken for a zone's own");
     assert.ok(!isSuspendZoneSubtype("700001"), "and neither is a valve subtype");
     assert.ok(!isSuspendZoneSubtype(undefined), "a service carrying no subtype at all is not this sweep's business");
+  });
+
+  test("composes and recognizes a rain sensor's subtype, apart from every other subtype a controller's accessory carries", () => {
+
+    assert.equal(rainSensorSubtype(394649), "Rain.394649", "a sensor's subtype is the reserved prefix and its Hydrawise id");
+    assert.ok(isRainSensorSubtype(rainSensorSubtype(394649)), "what the composer produces, the recognizer recognizes");
+    assert.ok(!isRainSensorSubtype(suspendZoneSubtype(700001)), "a zone's suspension switch is never mistaken for one");
+    assert.ok(!isSuspendZoneSubtype(rainSensorSubtype(394649)), "and one is never mistaken for a zone's suspension switch");
+    assert.ok(!isRainSensorSubtype(HydrawiseReservedNames.SWITCH_SUSPEND_ALL), "the account-wide switch is not one");
+    assert.ok(!isRainSensorSubtype("700001"), "and neither is a valve subtype");
+    assert.ok(!isRainSensorSubtype(undefined), "a service carrying no subtype at all is not this sweep's business");
   });
 });
 

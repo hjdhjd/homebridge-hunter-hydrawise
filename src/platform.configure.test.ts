@@ -838,4 +838,17 @@ describe("HydrawisePlatform feature option startup lines", () => {
         "the line names the controller the setting was made on, and its sibling writes nothing");
     });
   }
+
+  // The rain sensors default to on, so the setting a user makes is turning them off, and the default writes no line at all.
+  test("Device.Sensor.Rain turned off globally writes one line through the plugin's logger however many controllers there are", async (t) => {
+
+    assert.deepEqual(await startupLines(t, "Rain sensors", "Disable.Device.Sensor.Rain"), ["Rain sensors disabled."],
+      "the plugin's logger writes the setting's one line, naming no controller");
+  });
+
+  test("Device.Sensor.Rain turned off on a controller writes one line through that controller's logger", async (t) => {
+
+    assert.deepEqual(await startupLines(t, "Rain sensors", "Disable.Device.Sensor.Rain." + SECOND_CONTROLLER.serial_number),
+      [SECOND_CONTROLLER.name + ": Rain sensors disabled."], "the line names the controller the setting was made on, and its sibling writes nothing");
+  });
 });

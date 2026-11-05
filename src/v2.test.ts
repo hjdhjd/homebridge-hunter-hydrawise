@@ -403,7 +403,7 @@ describe("HydrawiseV2Client account facts", () => {
      * controller name from a dropped zone name.
      */
     for(const selection of [ "id", "controllers { id name", "zones { id name", "status { online }", "model { description }", "firmware { type version }",
-      "suspendedUntil { timestamp }", "model { sensorType }", "status { active }" ]) {
+      "suspendedUntil { timestamp }", "sensors { id name", "model { sensorType }", "status { active }" ]) {
 
       assert.ok(asked.includes(selection), "the account query asks for " + selection);
     }
@@ -595,6 +595,33 @@ describe("HydrawiseV2Client account facts", () => {
     const facts = await answeredFacts(harness.client);
 
     assert.equal(facts.get(1058515)?.zones.get(QUIET_ZONE_ID)?.sensorStopped, true, "one tripped sensor is enough to stop the zone it covers");
+  });
+
+  test("the read's facts carry the captured rain sensor by its id, with its name and its activity", async () => {
+
+    const harness = makeV2Harness((agent, record) => {
+
+      programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
+      programReply(agent, record, GRAPH_PATH, ACCOUNT_BODY);
+    });
+
+    const facts = await answeredFacts(harness.client);
+
+    assert.deepEqual(facts.get(1058515)?.rainSensors, new Map([[ 394649, { name: "Hunter Rain Freeze Sensor", tripped: true } ]]),
+      "the sensor the zone classification counts is the one the map holds");
+  });
+
+  test("a captured partial answer that nulled the sensor's entry cannot say which rain sensors exist", async () => {
+
+    const harness = makeV2Harness((agent, record) => {
+
+      programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
+      programReply(agent, record, GRAPH_PATH, GRAPH_ERRORS_BODY);
+    });
+
+    const facts = await answeredFacts(harness.client);
+
+    assert.equal(facts.get(1058515)?.rainSensors, null, "so the sensor's service can neither be added nor removed on this answer");
   });
 
   test("an answer carrying no usable sensor leaves every zone's sensor state UNKNOWN", async () => {

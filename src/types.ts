@@ -9,6 +9,9 @@ import type { PlatformAccessory } from "homebridge";
 // HBHH reserved names.
 export const HydrawiseReservedNames = {
 
+  // Manage our rain sensors, which share a PREFIX that the sensor's own Hydrawise id completes, since a controller carries one for each sensor Hydrawise lists.
+  SENSOR_RAIN: "Rain.",
+
   // Manage our switch types. The account-wide switch names itself outright, while the per-zone switches share a PREFIX that the zone's own relay id completes, since
   // a controller carries one of the first and one of the second per zone.
   SWITCH_SUSPEND_ALL: "All",
@@ -33,6 +36,20 @@ export function suspendZoneSubtype(relayId: number): string {
 export function isSuspendZoneSubtype(subtype: string | undefined): boolean {
 
   return subtype?.startsWith(HydrawiseReservedNames.SWITCH_SUSPEND_ZONE) ?? false;
+}
+
+// Compose the service subtype a rain sensor's contact sensor carries, on the terms the suspension switch's composer above states: every site that creates, looks up, or
+// sweeps one of these services composes its subtype here.
+export function rainSensorSubtype(sensorId: number): string {
+
+  return HydrawiseReservedNames.SENSOR_RAIN + sensorId.toString();
+}
+
+// Whether a service subtype names a rain sensor's contact sensor, the recognition half of the composition above. A service carrying no subtype, or one carrying any
+// other name, is not this sweep's business.
+export function isRainSensorSubtype(subtype: string | undefined): boolean {
+
+  return subtype?.startsWith(HydrawiseReservedNames.SENSOR_RAIN) ?? false;
 }
 
 // Hydrawise API: the endpoints this plugin calls. Naming them as a union rather than a bare string keeps the platform's rate-ceiling classification total: a call
@@ -229,15 +246,17 @@ export interface HydrawiseV2Zone {
 }
 
 /* Hydrawise v2 API: one sensor as the account query returns it, typed to the facts a rain-class stop is read from - what kind of sensor it is, whether it
- * is tripped right now, and which zones it covers.
+ * is tripped right now, and which zones it covers - and to what names it in HomeKit, its id and its name.
  *
  * The activity flag is what v1 cannot report at all. A v1 status body carries a sensor block naming the zones a sensor covers but nothing about whether that
  * sensor is currently stopping them, which is the whole reason the v1 path has to infer a stop from the shape of the group it covers.
  */
 export interface HydrawiseV2Sensor {
 
-  model?: { sensorType?: string };
-  status?: { active?: boolean };
+  id?: number;
+  model?: { sensorType?: Nullable<string> };
+  name?: Nullable<string>;
+  status?: { active?: Nullable<boolean> };
   zones?: Nullable<{ id?: number }>[];
 }
 
@@ -342,11 +361,21 @@ export interface HydrawiseZoneV2Facts {
   suspendedUntil: Nullable<number>;
 }
 
-/* What the account-credentialed API knows about a whole controller: its hardware, its own full name, whether Hydrawise can currently reach it, and the per-zone
- * facts above keyed by the zone id v1 and v2 agree about.
+// What the account-credentialed API knows about one rain sensor: its name, where a null means only that no usable name arrived, and whether it is tripped right now.
+export interface HydrawiseRainSensorFacts {
+
+  name: Nullable<string>;
+  tripped: boolean;
+}
+
+/* What the account-credentialed API knows about a whole controller: its hardware, its own full name, whether Hydrawise can currently reach it, its rain sensors keyed
+ * by sensor id, and the per-zone facts above keyed by the zone id v1 and v2 agree about.
  *
  * The name follows the zone name's rule at the controller grain, and the null arm means the same thing: no usable name arrived, so whatever the key-based wire
  * reported still stands. Reading it as an empty string instead would blank a controller's label on an answer that simply said nothing.
+ *
+ * The rain sensors' null arm means this answer cannot say which sensors exist, where an empty map is a complete answer that lists none. Keeping those apart is what
+ * keeps one bad answer from costing a sensor's HomeKit service, and the automations built on it.
  *
  * This shape is IN MEMORY only, on the same terms and for the same reason as the hardware shape above. What gets persisted is the CLASSIFIED projection these
  * facts feed, never the facts themselves - one store for a zone's state rather than two that eventually disagree about it.
@@ -356,6 +385,7 @@ export interface HydrawiseControllerV2Facts {
   hardware: Nullable<HydrawiseControllerHardware>;
   name: Nullable<string>;
   online: Nullable<boolean>;
+  rainSensors: Nullable<Map<number, HydrawiseRainSensorFacts>>;
   zones: Map<number, HydrawiseZoneV2Facts>;
 }
 
@@ -368,32 +398,73 @@ function usableName(name: Nullable<string> | undefined): Nullable<string> {
   return trimmed?.length ? trimmed : null;
 }
 
+// Whether a sensor entry names a level-class kind. A kind that is null or absent names no class at all.
+function isLevelClass(sensor: Nullable<HydrawiseV2Sensor>): sensor is HydrawiseV2Sensor {
+
+  const kind = sensor?.model?.sensorType;
+
+  return (typeof kind === "string") && kind.startsWith(HYDRAWISE_V2_LEVEL_SENSOR_PREFIX);
+}
+
 // Whether a sensor entry is one a rain-class stop is read from: a level-class sensor actually reporting its activity as a boolean.
 function countsAsRainSensor(sensor: Nullable<HydrawiseV2Sensor>): sensor is HydrawiseV2Sensor {
 
-  return (sensor?.model?.sensorType?.startsWith(HYDRAWISE_V2_LEVEL_SENSOR_PREFIX) ?? false) && (typeof sensor?.status?.active === "boolean");
+  return isLevelClass(sensor) && (typeof sensor.status?.active === "boolean");
+}
+
+/* The rain sensors one complete sensor list names, keyed by sensor id, or null when the list cannot say which ones exist. An entry whose kind is not a level-class
+ * string says nothing here, a null kind among them: an error that nulled a kind names the sensor list, which has already left the answer unknown before this reads it,
+ * so a null kind reaching here is a sensor of no kind Hydrawise names. A level-class entry whose activity is not a boolean never reaches here, having made the list
+ * incomplete. One whose id is not a number is a sensor the list names and cannot read, so it leaves the whole answer unknown: none can read as a sensor that left, and
+ * none reaches the subtype a sensor's service is composed from.
+ */
+function rainSensorFacts(entries: readonly Nullable<HydrawiseV2Sensor>[]): Nullable<Map<number, HydrawiseRainSensorFacts>> {
+
+  const rainSensors = new Map<number, HydrawiseRainSensorFacts>();
+
+  for(const sensor of entries) {
+
+    if(!isLevelClass(sensor)) {
+
+      continue;
+    }
+
+    if(typeof sensor.id !== "number") {
+
+      return null;
+    }
+
+    rainSensors.set(sensor.id, { name: usableName(sensor.name), tripped: sensor.status?.active === true });
+  }
+
+  return rainSensors;
 }
 
 /* Project one controller's wire answer onto the facts shape above. This is the one home for every selection rule the account query's richer body needs, so what
  * "suspended", "sensor-stopped", and "reachable" mean is decided once rather than at each read site.
  *
- * The sensor derivation is the substantial half. Only level-class sensors are weighed, and only those actually reporting their activity as a boolean: a sensor
- * of an unrecognized kind, or one whose activity the response did not carry, contributes nothing at all. With no such sensor in the answer every zone's
- * sensorStopped is null, which hands the whole question back to the v1 group inference. With at least one, a zone reads true when SOME sensor covering it is
- * tripped and false otherwise - some rather than every, because one tripped sensor stops the zones it covers whatever its siblings report, and an uncovered
- * zone is honestly not stopped rather than unknown.
+ * The sensor derivation is the substantial half. Only level-class sensors are weighed: a sensor of an unrecognized kind contributes nothing at all. With no such
+ * sensor in the answer every zone's sensorStopped is null, which hands the whole question back to the v1 group inference. With at least one, a zone reads true when
+ * SOME sensor covering it is tripped and false otherwise - some rather than every, because one tripped sensor stops the zones it covers whatever its siblings report,
+ * and an uncovered zone is honestly not stopped rather than unknown.
  *
  * A bad field is never believed, and the errors' paths decide what that costs, each path arriving relative to this controller's entry. The sensor list is incomplete
- * when an error names it, when it holds a null entry, or when a counted sensor's covered zones are absent or hold a null entry. Any of those makes every zone's
- * sensorStopped null, because a zone only the unread sensor covers would otherwise read as clear, retiring the inference that would have caught a real rain stop. A
- * zone an error names is omitted, the rule for any entry that cannot be completed, so a suspension nulled by an error keeps its carry rather than reading as lifted.
+ * when an error names it, when it holds a null entry, when a level-class sensor's activity is not a boolean, or when a counted sensor's covered zones are absent or
+ * hold a null entry. Any of those makes every zone's sensorStopped null, because a zone only the unread sensor covers would otherwise read as clear, retiring the
+ * inference that would have caught a real rain stop. A zone an error names is omitted, the rule for any entry that cannot be completed, so a suspension nulled by an
+ * error keeps its carry rather than reading as lifted.
+ *
+ * The rain sensors are exactly the sensors the zone derivation weighs, read through the one level-class test above, and their answer is null when the list is absent
+ * or incomplete.
  */
 export function controllerV2Facts(controller: HydrawiseV2Controller, errorPaths: readonly HydrawiseV2ErrorPath[] = []): HydrawiseControllerV2Facts {
 
   const entries = controller.sensors ?? [];
   const sensors = entries.filter(countsAsRainSensor);
-  const incomplete = errorPaths.some(path => path[0] === "sensors") || entries.includes(null) || sensors.some(sensor => !sensor.zones || sensor.zones.includes(null));
+  const incomplete = errorPaths.some(path => path[0] === "sensors") || entries.includes(null) ||
+    entries.some(sensor => isLevelClass(sensor) && !countsAsRainSensor(sensor)) || sensors.some(sensor => !sensor.zones || sensor.zones.includes(null));
   const erredZones = new Set(errorPaths.filter(path => path[0] === "zones").map(path => path[1]));
+  const rainSensors = (controller.sensors && !incomplete) ? rainSensorFacts(controller.sensors) : null;
   const zones = new Map<number, HydrawiseZoneV2Facts>();
 
   for(const [ index, zone ] of (controller.zones ?? []).entries()) {
@@ -411,7 +482,7 @@ export function controllerV2Facts(controller: HydrawiseV2Controller, errorPaths:
       suspendedUntil: zone.status?.suspendedUntil?.timestamp ?? null });
   }
 
-  return { hardware: controllerHardware(controller.hardware), name: usableName(controller.name), online: controller.status?.online ?? null, zones };
+  return { hardware: controllerHardware(controller.hardware), name: usableName(controller.name), online: controller.status?.online ?? null, rainSensors, zones };
 }
 
 /* What one call for an access token came to, as a discriminated union so a caller can carry a 429 up the chain rather than reading every refusal as the same absence.

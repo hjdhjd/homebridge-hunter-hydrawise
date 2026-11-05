@@ -3,20 +3,21 @@
  * controller.standalone.test.ts: The controller's projection of standalone zones onto accessories of their own. Asserts where a zone's valve is hosted and
  * where it is not, the enumeration difference a standalone host implies, the controller aggregates that deliberately still span standalone zones, the reconcile
  * request the projection builds, the zone accessory's information and name synchronization, the warm-restart handler attach, the fall back to controller hosting,
- * and the default-off parity floor.
+ * the valve that keeps answering beside a rain sensor whose read refuses, and the default-off parity floor.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { Characteristic, Service, buildController, pollsCompleted, restoreCached, seedEstablished } from "./testing/platform.helpers.ts";
+import { Characteristic, Service, buildController, makeV2Facts, pollsCompleted, restoreCached, seedEstablished } from "./testing/platform.helpers.ts";
+import { HAPStatus, getServiceName } from "homebridge-plugin-utils";
 import type { HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
+import { TestClock, advanceThroughSchedule, hapStatus, loggedAt, present, settle, triggerGet, triggerSet, waitUntil } from "homebridge-plugin-utils/testing";
 import { UNSCHEDULED_SENTINEL, bareSensors, rainSensors, syntheticController } from "./api.fixtures.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
-import { loggedAt, present, settle, triggerSet, waitUntil } from "homebridge-plugin-utils/testing";
+import { rainSensorSubtype, zoneAccessoryId } from "./types.ts";
+import { HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
 import assert from "node:assert/strict";
-import { getServiceName } from "homebridge-plugin-utils";
-import { zoneAccessoryId } from "./types.ts";
 
 const CONTROLLER_SERIAL = "SN0A1B2C3D4";
 const STANDALONE_RELAY_ID = 700001;
@@ -39,6 +40,9 @@ const WIRE_NAME_SANITIZED = "Front Lawn North";
 const WIRE_RENAMED = "Rear/Lawn South";
 const WIRE_RENAMED_SANITIZED = "Rear Lawn South";
 const OVERRIDE_NAME = "Front Bed Drip Line";
+
+// The id of the rain sensor a row hosts on the controller's accessory, beside the standalone zone.
+const SENSOR_ID = 394649;
 
 // The name a user gives the zone accessory's tile in the Home app, which lands on its information service's ConfiguredName.
 const HOME_APP_NAME = "Patio Sprinklers";
@@ -163,6 +167,34 @@ describe("HydrawiseController standalone zones", () => {
 
     assert.equal(h.accessory.getService(Service.IrrigationSystem)?.getCharacteristic(Characteristic.ProgramMode).value,
       Characteristic.ProgramMode.PROGRAM_SCHEDULED_MANUAL_MODE, "a manual run started from a standalone valve reaches the controller's program mode");
+  });
+
+  test("a standalone zone beside a rain sensor whose read refuses answers its valve read and sends its write", async (t) => {
+
+    const clock = new TestClock();
+    const h = buildController({ clock, hasV2Client: true, program: (recorder) => recorder.programDefault("statusschedule.php",
+      { body: schedule([ standaloneZone(SCHEDULED), hostedZone() ]), kind: "response" }), signalAborted: false, userOptions: [STANDALONE_ON] });
+
+    t.after(() => h.abort());
+
+    await advanceThroughSchedule(clock, []);
+
+    // The reading lands a whole lifetime old, so a second more leaves it past its lifetime with no poll or refresh in between to re-judge anything.
+    h.controller.applyFacts({ facts: makeV2Facts({ rainSensors: [[ SENSOR_ID, { name: "Hunter Rain Freeze Sensor", tripped: true } ]] }),
+      fetchedAt: Math.floor(clock.now() / 1000) - HYDRAWISE_V2_FACTS_TTL });
+    clock.advance(1000);
+
+    const sensor = present(h.accessory.getServiceById(Service.ContactSensor, rainSensorSubtype(SENSOR_ID)), "the rain sensor on the controller's accessory");
+    const valve = present(h.zoneAccessories.get(STANDALONE_RELAY_ID)?.getServiceById(Service.Valve, STANDALONE_SUBTYPE), "the standalone valve");
+
+    await assert.rejects(() => triggerGet(sensor.getCharacteristic(Characteristic.ContactSensorState)), hapStatus(HAPStatus.SERVICE_COMMUNICATION_FAILURE),
+      "the sensor's read refuses");
+    assert.equal(await triggerGet(valve.getCharacteristic(Characteristic.Active)), Characteristic.Active.INACTIVE, "while the zone's own accessory answers");
+
+    await triggerSet(valve.getCharacteristic(Characteristic.Active), Characteristic.Active.ACTIVE);
+    await h.controller.commandsIdle;
+
+    assert.deepEqual(h.commands.params.map(params => params["action"]), ["run"], "and its write is sent");
   });
 
   test("sends the wire name in the reconcile identity and the effective name as the display name", async (t) => {

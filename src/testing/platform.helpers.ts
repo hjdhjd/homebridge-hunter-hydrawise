@@ -25,7 +25,7 @@ import { AccessoryPersistence, FeatureOptions, TimerRegistry, acquireService, sa
 import type { Clock, HomebridgePluginLogging, Nullable, RateBudget } from "homebridge-plugin-utils";
 import { HYDRAWISE_API_BASE_URL, PLATFORM_NAME, PLUGIN_NAME } from "../settings.ts";
 import type { HydrawiseAccessory, HydrawiseCommandOutcome, HydrawiseControllerConfig, HydrawiseControllerHardware, HydrawiseControllerIdentity,
-  HydrawiseControllerV2Facts, HydrawiseV2Read, HydrawiseZoneConfig, HydrawiseZoneV2Facts } from "../types.ts";
+  HydrawiseControllerV2Facts, HydrawiseRainSensorFacts, HydrawiseV2Read, HydrawiseZoneConfig, HydrawiseZoneV2Facts } from "../types.ts";
 import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
 import { TestClock, TestMqttClient, capturingLog, loadHomebridge, present, waitUntil, watchServerWarnings } from "homebridge-plugin-utils/testing";
 import type { TestHomebridgeApi, TestHomebridgeApiCall, TestLogEntry, TestPlatformAccessory } from "homebridge-plugin-utils/testing";
@@ -757,16 +757,19 @@ export function makeTestV2Client(read: HydrawiseV2Read | ((fetch: number) => Hyd
 }
 
 /**
- * Compose one controller's account-credentialed facts, defaulting every field to the "nothing to say" answer so a test states only what it is actually asserting.
+ * Compose one controller's account-credentialed facts, defaulting every field to the "nothing to say" answer so a test states only what it is actually asserting. The
+ * rain sensors default to a complete answer that lists none, and a null override states an answer that cannot say which sensors exist.
  *
- * @param overrides - The facts to state: the hardware, the name, the availability, and the per-zone entries keyed by relay id.
+ * @param overrides - The facts to state: the hardware, the name, the availability, the rain sensors keyed by sensor id, and the per-zone entries keyed by relay id.
  *
  * @returns A fresh facts value.
  */
 export function makeV2Facts(overrides: { hardware?: Nullable<HydrawiseControllerHardware>; name?: Nullable<string>; online?: Nullable<boolean>;
+  rainSensors?: Nullable<Iterable<readonly [ number, HydrawiseRainSensorFacts ]>>;
   zones?: Iterable<readonly [ number, HydrawiseZoneV2Facts ]>; } = {}): HydrawiseControllerV2Facts {
 
-  return { hardware: overrides.hardware ?? null, name: overrides.name ?? null, online: overrides.online ?? null, zones: new Map(overrides.zones ?? []) };
+  return { hardware: overrides.hardware ?? null, name: overrides.name ?? null, online: overrides.online ?? null,
+    rainSensors: (overrides.rainSensors === null) ? null : new Map(overrides.rainSensors ?? []), zones: new Map(overrides.zones ?? []) };
 }
 
 /**

@@ -7,8 +7,8 @@ import { HAP_DEFAULT_MODEL, HAP_DURATION_CEILING, HOMEBRIDGE_UNKNOWN_FIRMWARE, H
   HYDRAWISE_API_NEXTPOLL_MAX, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_COMMAND_ATTEMPTS, HYDRAWISE_POLL_LOSS_THRESHOLD, HYDRAWISE_REVERT_DELAY,
   HYDRAWISE_SUSPEND_DURATION, HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
 import { HYDRAWISE_UNSCHEDULED_SENTINEL, HydrawiseReservedNames, controllerDisplayName, controllerIdentity, isControllerIdentity, isFirmwareVersion,
-  isScheduleStatus, isSuspendZoneSubtype, isZoneIdentity, isZoneStoppedBySensor, sameControllerIdentity, sameScheduleStatus, sameZoneIdentity, scheduleStatus,
-  suspendZoneSubtype, zoneDisplayName, zoneIdentity, zoneScheduleStatus } from "./types.ts";
+  isRainSensorSubtype, isScheduleStatus, isSuspendZoneSubtype, isZoneIdentity, isZoneStoppedBySensor, rainSensorSubtype, sameControllerIdentity, sameScheduleStatus,
+  sameZoneIdentity, scheduleStatus, suspendZoneSubtype, zoneDisplayName, zoneIdentity, zoneScheduleStatus } from "./types.ts";
 import type { HomebridgePluginLogging, MqttAvailabilityPayload, Nullable, RepeatDemotedLog } from "homebridge-plugin-utils";
 import type { HydrawiseAccessory, HydrawiseCommandOutcome, HydrawiseComposedName, HydrawiseControllerAccessory, HydrawiseControllerConfig,
   HydrawiseControllerHardware, HydrawiseControllerIdentity, HydrawiseControllerV2Facts, HydrawiseScheduleStatus, HydrawiseZoneConfig, HydrawiseZoneIdentity,
@@ -17,8 +17,8 @@ import type { HydrawiseCommandIntent, HydrawiseCommandRecord, HydrawiseCommandTa
   HydrawiseUnconfirmedCommand } from "./commands.ts";
 import type { HydrawiseControllerOption, HydrawiseControllerValueOption, HydrawiseZoneOption, HydrawiseZoneValueOption } from "./options.ts";
 import { MQTT_AVAILABILITY_OFFLINE, MQTT_AVAILABILITY_ONLINE, acquireService, formatErrorMessage, getServiceName, loopFaultReporter, mqttTopic, notResponding,
-  ownedName, prefixedLog, presenceChanged, repeatDemotedLog, retry, sameEntries, setAccessoryName, setServiceName, superviseLoop, validCharacteristic,
-  validService, watchServiceName } from "homebridge-plugin-utils";
+  ownedName, prefixedLog, presenceChanged, repeatDemotedLog, retry, sameEntries, sanitizeName, setAccessoryName, setServiceName, superviseLoop,
+  validCharacteristic, validService, watchServiceName } from "homebridge-plugin-utils";
 import { HydrawiseCommandQueue } from "./commands.ts";
 import type { HydrawisePlatform } from "./platform.ts";
 import { mqttTopics } from "./mqtt.ts";
@@ -27,6 +27,7 @@ import util from "node:util";
 // Device-specific options and settings.
 interface HydrawiseHints {
 
+  rainSensors: boolean;
   suspendAll: boolean;
 }
 
@@ -220,17 +221,18 @@ export class HydrawiseController {
   private readonly accessory: HydrawiseControllerAccessory;
 
   // The one place that decides whether this controller's own accessory answers HomeKit at all, bound once over the per-host verdict below. Every handler on the
-  // controller accessory is wired through it, and the verdict is read fresh on each call, so a loss refuses the very next read or write and a return answers it,
-  // with no rewiring.
+  // controller accessory but a rain sensor's read is wired through it, and the verdict is read fresh on each call, so a loss refuses the very next read or write and a
+  // return answers it, with no rewiring.
   private readonly answering: ReturnType<typeof notResponding>;
   private readonly api: API;
 
   // This controller's availability topic tail, composed once beside the controller topic and for the same reason.
   private readonly availabilityTopic: string;
 
-  /* Every service this process has bound its handlers to: each valve, and each per-zone suspension switch. The walk binds a service the first time it reaches it
-   * and never again, whichever way the service arrived - created this pass, kept from the accessory cache on the first poll, or a cached standalone valve a later
-   * poll hosts for the first time - so each service is bound once. It holds services weakly, so one removed with its zone leaves nothing behind.
+  /* Every service this process has bound its handlers to: each valve, each per-zone suspension switch, and each rain sensor. The pass that reaches a service first
+   * binds it, and none binds it again, whichever way the service arrived - created this pass, kept from the accessory cache on the first pass, or a cached standalone
+   * valve a later poll hosts for the first time - so each service is bound once. It holds services weakly, so one removed with its zone or its sensor leaves nothing
+   * behind.
    */
   private readonly bound = new WeakSet<Service>();
 
@@ -272,11 +274,11 @@ export class HydrawiseController {
    */
   private lastKnownOnline: Nullable<boolean> = null;
 
-  /* The name watches the last pass registered: one on each information service, valve and suspension switch whose name that pass found the plugin owning, each
-   * putting back the name that pass decided the moment the Home app renames the service. Each pass disposes them and registers its own, which is what keeps the
-   * watches in step with the services: every removal of a service a pass can have watched happens inside a pass, after that disposal, so a removed service is
-   * simply never watched again, and a service whose owner changed is watched, or not, from the pass that reads the change. The platform signal ends them all at
-   * shutdown.
+  /* The name watches the last pass registered: one on each information service, valve, suspension switch and rain sensor whose name that pass found the plugin owning,
+   * each putting back the name that pass decided the moment the Home app renames the service. Each pass disposes them and registers its own, which is what keeps the
+   * watches in step with the services: a removal inside a pass happens after that disposal, so the removed service is simply never watched again, a rain sensor a
+   * facts arrival removes between passes keeps its watch only until the next pass, which acts on nothing because HAP's removal drops the service's listeners, and a
+   * service whose owner changed is watched, or not, from the pass that reads the change. The platform signal ends them all at shutdown.
    */
   private nameWatches = new DisposableStack();
 
@@ -285,6 +287,16 @@ export class HydrawiseController {
 
   // How many polls in a row have failed since the last good one, the count the loss verdict is read from. The retry that finally succeeds resets it.
   private pollFailures = 0;
+
+  // The Not Responding rule for this controller's rain sensors, bound once over the verdict on its whole accessory, and read on every call as the controller's own is.
+  private readonly rainAnswering: ReturnType<typeof notResponding>;
+
+  // Whether the rain sensors' reading was current when last judged, and null until a carried sensor has had one this run, which is what keeps a first reading quiet.
+  private rainReading: Nullable<boolean> = null;
+
+  // This controller's rain sensors topic tail, composed once beside the controller topic and for the same reason.
+  private readonly rainSensorsTopic: string;
+
   private status: StatusScheduleResponse;
 
   /* The status log: how this controller's poll reports a body it fetched and could not adopt. The adapter lives and dies with the controller, so a failure is
@@ -323,15 +335,17 @@ export class HydrawiseController {
     this.enabledZones = [];
     this.hap = this.api.hap;
 
-    // Populated synchronously by configureDevice(), called at the end of this constructor, which runs configureHints() first among its steps and so sets
-    // this.hints.suspendAll before any external reader can observe this.hints - that ordering is what makes the empty-object cast safe.
+    // Populated synchronously by configureDevice(), called at the end of this constructor, which runs configureHints() first among its steps and so sets every hint
+    // before any external reader can observe this.hints - that ordering is what makes the empty-object cast safe.
     this.hints = {} as HydrawiseHints;
     this.controller = controller;
     this.availabilityTopic = mqttTopic(this.controller.serial_number, mqttTopics.availability.topic);
     this.controllerTopic = mqttTopic(this.controller.serial_number, mqttTopics.controller.topic);
+    this.rainSensorsTopic = mqttTopic(this.controller.serial_number, mqttTopics.rainSensors.topic);
     this.platform = platform;
     this.zoneHints = new HydrawiseZoneHintLedger();
     this.answering = this.answeringFor(this.accessory);
+    this.rainAnswering = notResponding({ errorClass: this.hap.HapStatusError, unavailable: () => this.accessoryRefuses });
 
     // Prefix every log line with the name HomeKit shows for this controller, read live from its information service, so a log line names the controller as the
     // Home app and the settings page do. The irrigation system carries Name alone, which HAP keeps read-only to a HomeKit controller, so no rename made in the
@@ -397,6 +411,7 @@ export class HydrawiseController {
     this.configureInfo();
     this.configureIrrigationSystem();
     this.configureSuspendSwitches();
+    this.reconcileRainSensors();
     this.configureMqtt();
 
     /* Kick off our state updates under supervision so a genuine fault in the polling loop surfaces once through the reporter, while a shutdown abort unwinds the
@@ -427,6 +442,7 @@ export class HydrawiseController {
   // Configure controller-specific settings.
   private configureHints(): void {
 
+    this.hints.rainSensors = this.platform.hasV2Client && this.hasFeature("Device.Sensor.Rain");
     this.hints.suspendAll = this.hasFeature("Device.Suspend.All");
 
     /* Surface name synchronization at startup where it departs from its default. HBPU walks the levels a call names, lowest first, and writes one line for the level
@@ -437,12 +453,14 @@ export class HydrawiseController {
     this.platform.featureOptions.logFeature({ controller: { id: this.controller.serial_number, log: this.log }, label: "Name synchronization", log: this.platform.log,
       option: "Device.SyncName" });
 
-    // Surface the per-zone suspension switches on the same terms, and only where the account credentials the switches read their zones from are configured: without
-    // them these switches are never created, so naming them would advertise a feature this install does not have.
+    // Surface the per-zone suspension switches and the rain sensors on the same terms, and only where the account credentials each reads from are configured: without
+    // them neither is ever created, so naming them would advertise a feature this install does not have.
     if(this.platform.hasV2Client) {
 
       this.platform.featureOptions.logFeature({ controller: { id: this.controller.serial_number, log: this.log }, label: "Per-zone suspension switches",
         log: this.platform.log, option: "Device.Suspend.Zone" });
+      this.platform.featureOptions.logFeature({ controller: { id: this.controller.serial_number, log: this.log }, label: "Rain sensors", log: this.platform.log,
+        option: "Device.Sensor.Rain" });
     }
   }
 
@@ -550,7 +568,10 @@ export class HydrawiseController {
    * every quarter hour for no reason at all. It is made only when the hardware genuinely differs from what this controller already held, and a projection the
    * tick moved marks its own write.
    *
-   * @param facts     - The hardware, availability, and per-zone facts the account API reported for this controller.
+   * The rain sensors are reconciled ahead of the re-derive, because the availability word it re-judges reads which sensors the accessory carries, and their topic is
+   * published behind it, from the facts as they stand after the re-derive.
+   *
+   * @param facts     - The hardware, availability, rain sensor, and per-zone facts the account API reported for this controller.
    * @param fetchedAt - The local instant, in epoch seconds, the request that fetched them was made.
    */
   public applyFacts({ facts, fetchedAt }: { facts: HydrawiseControllerV2Facts; fetchedAt: number }): void {
@@ -571,7 +592,9 @@ export class HydrawiseController {
 
     this.reportAvailability(facts.online);
 
+    this.reconcileRainSensors();
     this.rederiveProjection();
+    this.publishRainSensors(this.currentFacts);
 
     this.log.debug("Enhanced details updated: model %s, firmware %s, reachable %s, zones %s.", facts.hardware?.model ?? "unknown",
       facts.hardware?.firmware ?? "unknown", facts.online ?? "unknown", facts.zones.size.toString());
@@ -669,7 +692,7 @@ export class HydrawiseController {
 
   /** Whether one accessory this controller projects onto refuses: the controller-wide answer above, or a standalone zone accessory the last poll did not host. An
    * accessory held through its wire-absence grace is one no poll is describing, so nothing vouches for its values until a poll hosts it again. Every refusal reads
-   * this, the controller's own handlers and the platform's restore-time ones alike.
+   * this, the controller's own handlers and the platform's restore-time ones alike, a rain sensor's through the wider verdict below.
    *
    * @param host - The accessory a refusal speaks for.
    *
@@ -678,6 +701,22 @@ export class HydrawiseController {
   public unavailableFor(host: HydrawiseAccessory): boolean {
 
     return this.unavailable || ((host !== this.accessory) && ![...this.zoneHosts.values()].includes(host));
+  }
+
+  /* Whether this controller's own accessory refuses: the controller-wide answer above, or a rain sensor it carries with no current reading, which is no current
+   * facts or an answer that cannot say which sensors exist. HomeKit shows a whole accessory as not responding when one characteristic refuses, so this is the answer
+   * the Home app renders for the accessory, while its other handlers keep to the answer above. A rain sensor's read and the availability word read this one. With no
+   * rain sensor carried it is the answer above, and a standalone zone accessory, which carries none, is not asked.
+   */
+  private get accessoryRefuses(): boolean {
+
+    return this.unavailable || ((this.rainSensorServices.length > 0) && !this.rainReadingCurrent);
+  }
+
+  // Whether the account's facts can answer for the rain sensors right now: there are current facts, and they can say which sensors exist.
+  private get rainReadingCurrent(): boolean {
+
+    return Boolean(this.currentFacts?.rainSensors);
   }
 
   // The Not Responding rule for one accessory this controller projects onto, bound once per accessory over the per-host answer above. The predicate is read on
@@ -729,15 +768,47 @@ export class HydrawiseController {
   }
 
   /* Publish this controller's availability word on its own topic, retained so a subscriber attaching later reads the last statement, and change-gated so a
-   * verdict re-judged with nothing moved costs nothing on the wire. The word reads the same verdict the refusals do, so MQTT and HomeKit cannot disagree. Once
-   * the MQTT client's end begins, HBPU's end() refuses every publish but the words its handlers state, so a poll or a reconnect landing inside the end's window
-   * restates nothing and the offline the plugin stops on stays the last word on the topic.
+   * verdict re-judged with nothing moved costs nothing on the wire. The word reads the verdict on the controller's own accessory, rain sensors included, so a poll or
+   * a facts arrival re-judges it and MQTT and HomeKit stay in agreement, a reading that ages out reaching the word at the next poll. Once the MQTT client's end
+   * begins, HBPU's end() refuses every publish but the words its handlers state, so a poll or a reconnect landing inside the end's window restates nothing and the
+   * offline the plugin stops on stays the last word on the topic.
    */
   private refreshAvailability(): void {
 
-    const word: MqttAvailabilityPayload = this.unavailable ? MQTT_AVAILABILITY_OFFLINE : MQTT_AVAILABILITY_ONLINE;
+    this.reportRainReading();
+
+    const word: MqttAvailabilityPayload = this.accessoryRefuses ? MQTT_AVAILABILITY_OFFLINE : MQTT_AVAILABILITY_ONLINE;
 
     this.platform.mqtt?.publishGuarded(this.availabilityTopic, word, { ifChanged: true, retain: true });
+  }
+
+  /* Say why the controller shows No Response when a rain sensor's reading is the cause: one line as the reading goes and one as it returns, judged where the word is.
+   * A process with no reading yet says nothing, since its first refresh may simply not have landed and a failed one has already said why. With no rain sensor carried
+   * there is no reading to speak for, so the record starts afresh.
+   */
+  private reportRainReading(): void {
+
+    if(!this.rainSensorServices.length) {
+
+      this.rainReading = null;
+
+      return;
+    }
+
+    const current = this.rainReadingCurrent;
+
+    if((this.rainReading === null) && !current) {
+
+      return;
+    }
+
+    if((this.rainReading !== null) && (this.rainReading !== current)) {
+
+      this.log.info(current ? "Rain sensors are responding again." :
+        "Rain sensors are not responding because your Hydrawise account details could not be refreshed.");
+    }
+
+    this.rainReading = current;
   }
 
   /* The account-credentialed facts if and only if they can still be trusted, and null otherwise. This is the single freshness judgment in the class, and every
@@ -745,9 +816,9 @@ export class HydrawiseController {
    * null, so no consumer has to tell them apart.
    *
    * It hands back the WHOLE snapshot rather than the zones map alone, because every gated consumer draws the same judgment: the per-zone classifier inputs, the
-   * projection's availability stamp, the MQTT payload's additive fields, and the availability verdict, which reads the cloud's word on whether the controller is
-   * online. Returning the map alone would force a second, parallel freshness read for the facts that are not per-zone, which is exactly the divergence one
-   * chokepoint exists to prevent.
+   * projection's availability stamp, the MQTT payload's additive fields, the rain sensors' reading, and the availability verdict, which reads the cloud's word on
+   * whether the controller is online. Returning the map alone would force a second, parallel freshness read for the facts that are not per-zone, which is exactly the
+   * divergence one chokepoint exists to prevent.
    *
    * A pass resolves this ONCE and threads the answer down, so a lifetime boundary crossed midway through a poll can never split that poll's classifications
    * between two different answers.
@@ -964,6 +1035,34 @@ export class HydrawiseController {
     this.decideControllerFallback(composed);
   }
 
+  /* Bring each rain sensor's name into line with the name Hydrawise reports for it while Sync Name holds at the controller, and hold it to that name for this pass, as
+   * a zone's suspension switch is held. This runs on the poll alone, so a name a facts arrival learned reaches the sensor when it reaches every other surface. A sensor
+   * whose facts carry no name keeps the one it has, and with synchronization off the name is the user's. HBPU's name helper refuses a name HomeKit cannot carry, so
+   * such a name writes nothing and its watch restores nothing.
+   *
+   * @param facts - The account-credentialed facts this pass resolved, or null when there are none to trust.
+   */
+  private applyRainSensorNames(facts: Nullable<HydrawiseControllerFactsSnapshot>): void {
+
+    for(const [ id, { name } ] of facts?.rainSensors ?? []) {
+
+      const service = this.accessory.getServiceById(this.hap.Service.ContactSensor, rainSensorSubtype(id));
+      const owned = (name === null) ? null : ownedName({ fallback: name, sync: this.hasFeature("Device.SyncName") });
+
+      if(!service || (owned === null)) {
+
+        continue;
+      }
+
+      if(setServiceName(service, owned)) {
+
+        this.platform.persistence.persist(this.accessory);
+      }
+
+      this.holdServiceName(service, owned);
+    }
+  }
+
   // Hold one service to the name this pass decided the plugin owns for it, until the next pass replaces this pass's watches. The watch answers the name this pass
   // wrote rather than one composed afresh at the rename, because a name composed from facts newer than the pass would be one no other surface carries.
   private holdServiceName(service: Service, owned: string): void {
@@ -1086,6 +1185,12 @@ export class HydrawiseController {
 
     // Return our irrigation controller state.
     this.platform.mqtt?.subscribeGet(this.controllerTopic, mqttTopics.controller.label, (): string => this.statusJson(this.currentFacts));
+
+    // Return our rain sensors, on an install that has them.
+    if(this.hints.rainSensors) {
+
+      this.platform.mqtt?.subscribeGet(this.rainSensorsTopic, mqttTopics.rainSensors.label, (): string => this.rainSensorsJson(this.currentFacts));
+    }
 
     // Set the state of a given irrigation zone. The command goes through the controller's queue on the same terms a tap on the zone's valve does, so the handler
     // returns as soon as the command is queued, and only a set it cannot read throws.
@@ -1263,6 +1368,102 @@ export class HydrawiseController {
       log: this.platform.log, option: "Device.Suspend.All" });
   }
 
+  // The rain sensors this controller's accessory carries, the cached ones included, matched on the service type and the composed subtype as the zone sweep matches.
+  private get rainSensorServices(): Service[] {
+
+    return this.accessory.services.filter(x => (x.UUID === this.hap.Service.ContactSensor.UUID) && isRainSensorSubtype(x.subtype));
+  }
+
+  /* Bring the rain sensors this controller's accessory carries into line with what this controller knows, at configuration and on each facts arrival. Only the account
+   * can say which sensors exist, so what exists is decided from its answer rather than at construction alone.
+   *
+   * With the feature off, or no account login, every rain sensor the cache restored is removed. Otherwise every sensor carried is bound first, ahead of reading the
+   * facts, so the pass from configuration binds what the cache restored and a cached sensor refuses until a reading lands. Current facts carrying a list then decide
+   * which sensors exist and what each reads. With no current facts, or an answer that cannot say which sensors exist, nothing is added or removed, so one bad answer
+   * cannot cost a sensor's service and the automations built on it. A sensor the list has stopped naming leaves at once, as a valve does.
+   *
+   * The contact state follows the family's moisture sensor: a tripped sensor reads open, not detected. Each add or removal marks the accessory for the save window,
+   * since the cache holds the services an accessory carries. A throw here would end the refresh until a restart, which is why the facts reach this only with
+   * their ids held to being numbers.
+   */
+  private reconcileRainSensors(): void {
+
+    const services = this.rainSensorServices;
+
+    if(!this.hints.rainSensors) {
+
+      this.removeRainSensors(services);
+
+      return;
+    }
+
+    for(const service of services) {
+
+      this.bindRainSensor(service);
+    }
+
+    const listed = this.currentFacts?.rainSensors;
+
+    if(!listed) {
+
+      return;
+    }
+
+    const kept = new Set<Service>();
+
+    for(const [ id, { name, tripped } ] of listed) {
+
+      const { service, transition } = acquireService({ accessory: this.accessory, name: this.rainSensorName(name), serviceType: this.hap.Service.ContactSensor,
+        subtype: rainSensorSubtype(id) });
+
+      if(presenceChanged(transition)) {
+
+        this.platform.persistence.persist(this.accessory);
+      }
+
+      this.bindRainSensor(service);
+      service.updateCharacteristic(this.hap.Characteristic.ContactSensorState, tripped ? this.hap.Characteristic.ContactSensorState.CONTACT_NOT_DETECTED :
+        this.hap.Characteristic.ContactSensorState.CONTACT_DETECTED);
+      kept.add(service);
+    }
+
+    this.removeRainSensors(services.filter(service => !kept.has(service)));
+  }
+
+  // Remove rain sensors from this controller's accessory, each removal marking it for the save window.
+  private removeRainSensors(services: Service[]): void {
+
+    for(const service of services) {
+
+      this.accessory.removeService(service);
+      this.platform.persistence.persist(this.accessory);
+    }
+  }
+
+  /* Bind one rain sensor's read, once, under the establishment gate the valve uses. The read answers what facts last wrote, through the verdict on the whole accessory
+   * rather than the controller's own rule, because a reading only the account can vouch for refuses as soon as the account's facts go stale, whatever the poll says.
+   */
+  private bindRainSensor(service: Service): void {
+
+    if(this.bound.has(service)) {
+
+      return;
+    }
+
+    const state = service.getCharacteristic(this.hap.Characteristic.ContactSensorState);
+
+    state.onGet(this.rainAnswering(() => state.value));
+    this.bound.add(service);
+  }
+
+  // The name a new rain sensor takes: the one Hydrawise reports where HomeKit can carry it, and otherwise one composed from the controller's, as the suspend-all switch
+  // composes its own, so a sensor is always created under a name.
+  private rainSensorName(name: Nullable<string>): string {
+
+    return ((name !== null) && sanitizeName(name).length) ? name :
+      controllerDisplayName({ override: this.controllerNameOverride("Device.Name"), reported: this.accessoryName }).name + " Rain Sensor";
+  }
+
   /* Poll the Hydrawise API forever, yielding one update per completed poll. This is the wire half of the loop: it owns the fetch, the retry policy that recovers
    * from a failed poll, the count of failed polls the loss verdict is read from, and the pacing the API asks for, and it touches no HomeKit service - a verdict it
    * moves reaches HomeKit through the handlers, which read it on each call. A shutdown abort unwinds it through the signal, which superviseLoop treats as the
@@ -1347,6 +1548,7 @@ export class HydrawiseController {
     // Bring this controller's own names into line before anything reads them, so the log prefix and every label this pass writes speak with one voice. What it
     // wrote marks the accessory for the save window, because the accessory's display name is persisted in Homebridge's cache rather than derived on each start.
     this.applyControllerName(facts);
+    this.applyRainSensorNames(facts);
 
     /* Persist the identity roster, the schedule projection, and this controller's own identity, each on change. Each write marks the accessory where it is made,
      * and the platform's save window carries every mark this pass makes into one cache write, so a poll costs at most one write no matter how many projections it
@@ -1720,6 +1922,7 @@ export class HydrawiseController {
     // Publish our status to MQTT if configured to do so, through the client's guarded publish so a rejected write - the broker vanishing mid-write, a teardown race -
     // lands in the client's log instead of floating as an unhandled rejection.
     this.platform.mqtt?.publishGuarded(this.controllerTopic, this.statusJson(facts));
+    this.publishRainSensors(facts);
 
     /* This poll landed, so Hydrawise answers for this controller. The verdict moves only here, after the walk has bound every handler and written every value, so the
      * first read a recovered accessory answers is this poll's own. The word is then re-judged whether or not the verdict moved, because the cloud's word on the
@@ -2515,6 +2718,22 @@ export class HydrawiseController {
 
       return (state.state === "suspended") ? { ...base, state: state.state, suspendedUntil: state.until } : { ...base, state: state.state };
     }));
+  }
+
+  // Our rain sensors as JSON for MQTT: one entry per sensor the current facts list, and an empty array with none current or an answer that cannot say which exist.
+  private rainSensorsJson(facts: Nullable<HydrawiseControllerFactsSnapshot>): string {
+
+    return JSON.stringify([...(facts?.rainSensors ?? [])].map(([ id, { name, tripped } ]) => ({ id, name, tripped })));
+  }
+
+  // Publish our rain sensors on an install that has them. Every refresh tick and poll pass asks and the change gate answers, so an unchanged reading costs nothing on
+  // the wire and one that ages out, which no event marks, reaches the topic at the next poll.
+  private publishRainSensors(facts: Nullable<HydrawiseControllerFactsSnapshot>): void {
+
+    if(this.hints.rainSensors) {
+
+      this.platform.mqtt?.publishGuarded(this.rainSensorsTopic, this.rainSensorsJson(facts), { ifChanged: true });
+    }
   }
 
   /* This controller's persisted identity, composed from the wire identity with the effective name overlaid - the account's own name where a trustworthy snapshot

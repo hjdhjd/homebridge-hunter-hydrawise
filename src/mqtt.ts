@@ -31,7 +31,15 @@ export const mqttTopics = mqttTopicCatalog({
     set: "`start <zone> [<duration>]` runs a zone and `stop <zone>` stops it, where the zone is the zone number shown on the irrigation controller and the " +
       "duration is in seconds. With no duration, the zone runs for its next scheduled duration, or for its remaining time while already running. A duration " +
       "that is not an integer, or no duration for a zone with no scheduled run, is refused and logged. Every command is refused and logged while the controller " +
-      "is not responding.",
+      "is not responding. A rain sensor with no current reading refuses no command, even while `availability` reads `offline`.",
     topic: "controller"
+  },
+  rainSensors: {
+
+    get: "`true` requests a publish of the controller's rain sensors on the `rainsensors` topic.",
+    label: "rain sensors",
+    publish: "A JSON array with one entry per rain sensor Hydrawise lists for the controller, carrying each sensor's `id`, `name`, and `tripped`. It is empty while " +
+      "the enhanced-features data from your Hydrawise account login is not current, or cannot say which rain sensors exist.",
+    topic: "rainsensors"
   }
 });

@@ -65,15 +65,17 @@ describe("hydrawise feature options", () => {
 
     const device = optionEntry("Device", "");
     const name = optionEntry("Device", "Name");
+    const sensorRain = optionEntry("Device", "Sensor.Rain");
     const suspend = optionEntry("Device", "Suspend.All");
     const suspendZone = optionEntry("Device", "Suspend.Zone");
     const syncName = optionEntry("Device", "SyncName");
     const logZone = optionEntry("Log", "Zone");
 
-    assert.ok(device && name && suspend && suspendZone && syncName && logZone, "every catalog entry the runtime names should exist");
+    assert.ok(device && name && sensorRain && suspend && suspendZone && syncName && logZone, "every catalog entry the runtime names should exist");
     assert.equal(device.default, true, "the base Device option defaults to enabled");
     assert.equal(name.default, false, "the name option defaults to disabled, so an unconfigured controller or zone resolves no override at all");
     assert.equal(name.defaultValue, "", "the name option is value-centric and defaults to empty, which the runtime reads as no override");
+    assert.equal(sensorRain.default, true, "the rain sensors default to enabled, so a sensor Hydrawise lists appears with nothing to configure");
     assert.equal(suspend.default, false, "the suspend switch defaults to disabled");
     assert.equal(suspendZone.default, false, "the per-zone suspension switches default to disabled");
     assert.equal(syncName.default, false, "name synchronization defaults to disabled, so a zone's or a controller's name is the user's and a Home app rename stands");
@@ -83,6 +85,7 @@ describe("hydrawise feature options", () => {
      * is the only place a user learns that the switches need one. Losing that sentence would leave the option silently doing nothing for them.
      */
     assert.ok(suspendZone.description.includes("account login"), "the per-zone suspension description states the account login it needs");
+    assert.ok(sensorRain.description.endsWith("Requires your Hydrawise account login (enhanced features)."), "and so does the rain sensors'");
   });
 
   test("the controller-scopable options match the controller option-name union", () => {
@@ -91,8 +94,8 @@ describe("hydrawise feature options", () => {
      * HydrawiseControllerOption plus the value-centric HydrawiseControllerValueOption, which is where the name override is named. A catalog scope change that is
      * not mirrored in either surfaces here.
      */
-    assert.deepEqual(scopedOptions("controller"), [ "Device", "Device.Name", "Device.Standalone", "Device.Suspend.All", "Device.Suspend.Zone", "Device.SyncName",
-      "Log.Zone" ], "every controller-scoped option should be named in one of the controller unions");
+    assert.deepEqual(scopedOptions("controller"), [ "Device", "Device.Name", "Device.Sensor.Rain", "Device.Standalone", "Device.Suspend.All", "Device.Suspend.Zone",
+      "Device.SyncName", "Log.Zone" ], "every controller-scoped option should be named in one of the controller unions");
   });
 
   test("the zone-scopable options match the zone option-name union", () => {
@@ -120,8 +123,8 @@ describe("hydrawise feature options", () => {
 
     // A globally-scoped option applies across every controller on the account. The name override is deliberately absent: one name cannot be right for every
     // controller and zone at once, so it resolves at those grains alone.
-    assert.deepEqual(scopedOptions("global"), [ "Account.ApiKey", "Account.Password", "Account.Username", "Device", "Device.Standalone", "Device.Suspend.All",
-      "Device.Suspend.Zone", "Device.SyncName", "Log.Debug", "Log.Zone", "Mqtt.Topic", "Mqtt.Url" ],
+    assert.deepEqual(scopedOptions("global"), [ "Account.ApiKey", "Account.Password", "Account.Username", "Device", "Device.Sensor.Rain", "Device.Standalone",
+      "Device.Suspend.All", "Device.Suspend.Zone", "Device.SyncName", "Log.Debug", "Log.Zone", "Mqtt.Topic", "Mqtt.Url" ],
     "the name override is the only option that does not resolve globally");
   });
 

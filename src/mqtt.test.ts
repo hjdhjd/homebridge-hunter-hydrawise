@@ -36,4 +36,17 @@ describe("the MQTT topic catalog", () => {
     assert.ok(reference.published.includes(mqttTopics.availability.publish), "the published tables carry the per-controller availability row");
     assert.ok(reference.published.includes("| `controller`"), "beside the controller topic");
   });
+
+  test("declares the rain sensors topic under its label, publishing and answering a get, with nothing to set", () => {
+
+    assert.equal(mqttTopics.rainSensors.topic, "rainsensors", "the catalog's tail is the one the plugin ships");
+    assert.equal(mqttTopics.rainSensors.label, "rain sensors", "and its label is the word the client's get log lines carry");
+    assert.equal("set" in mqttTopics.rainSensors, false, "a rain sensor takes no command");
+
+    const reference = renderMqttTopicsReference(mqttTopics);
+
+    assert.ok(reference.published.includes("| `rainsensors`"), "the published tables document the topic");
+    assert.ok(reference.subscribed.includes("| `rainsensors/get`"), "and the subscribed table its get child");
+    assert.ok(!reference.subscribed.includes("| `rainsensors/set`"), "and no set child");
+  });
 });

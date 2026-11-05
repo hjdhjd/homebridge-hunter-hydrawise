@@ -27,7 +27,7 @@ import util from "node:util";
  * is read from the controller's nested status block, leaving the flat sibling field of the same name unread.
  */
 const ACCOUNT_QUERY = "query { me { controllers { id name status { online } hardware { model { description } firmware { type version } } " +
-  "zones { id name status { suspendedUntil { timestamp } } } sensors { model { sensorType } status { active } zones { id } } } } }";
+  "zones { id name status { suspendedUntil { timestamp } } } sensors { id name model { sensorType } status { active } zones { id } } } } }";
 
 // The sentence every failure of the whole-account read is reported under. Every site that can report one reads it from here, so the operator sees the same words
 // whichever of them failed.
