@@ -2,7 +2,8 @@
  *
  * controller.onset.test.ts: HomeKit set-handler behavior on the HydrawiseController valves and the suspend switch, driven through the captured onSet
  * handlers. Covers the manual run and stop commands and their recorded setzone parameters, the system in-use collapse when the only running zone stops, the
- * command-failure revert and the shutdown lifetime it answers to, and the suspend / resume commands including the floored suspend timestamp assertion (the bug 14 fix).
+ * command-failure revert and the shutdown lifetime it answers to, the zero-duration guard, and the suspend / resume commands including the floored suspend
+ * timestamp assertion (the bug 14 fix). Every row reads what a command did once the controller's command queue has fallen idle.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
@@ -52,7 +53,6 @@ describe("HydrawiseController valve and suspend onSet", () => {
     const h = buildController({ program: (recorder) => {
 
       recorder.programDefault("statusschedule.php", { body: schedule([scheduledZone()]), kind: "response" });
-      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
     }, signalAborted: false });
 
     t.after(() => h.abort());
@@ -60,13 +60,14 @@ describe("HydrawiseController valve and suspend onSet", () => {
     const valve = await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001"), { description: "the valve for zone 700001 to appear" });
 
     await triggerSet(valve.getCharacteristic(Characteristic.Active), Characteristic.Active.ACTIVE);
+    await h.controller.commandsIdle;
 
-    const command = expectAt(h.retrieve.callsTo("setzone.php"), 0, "setzone call");
+    const command = expectAt(h.commands.params, 0, "setzone call");
 
-    assert.equal(command.params?.["action"], "run", "a manual start should send the run action");
-    assert.equal(command.params["relay_id"], "700001", "the run command should target the zone relay");
-    assert.equal(command.params["custom"], "480", "the run command should carry the scheduled duration");
-    assert.equal(command.params["period_id"], "999", "the run command should use the manual period id");
+    assert.equal(command["action"], "run", "a manual start should send the run action");
+    assert.equal(command["relay_id"], "700001", "the run command should target the zone relay");
+    assert.equal(command["custom"], "480", "the run command should carry the scheduled duration");
+    assert.equal(command["period_id"], "999", "the run command should use the manual period id");
   });
 
   test("a manual stop sends the stop command for the zone", async (t) => {
@@ -74,7 +75,6 @@ describe("HydrawiseController valve and suspend onSet", () => {
     const h = buildController({ program: (recorder) => {
 
       recorder.programDefault("statusschedule.php", { body: schedule([runningZone()]), kind: "response" });
-      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
     }, signalAborted: false });
 
     t.after(() => h.abort());
@@ -82,12 +82,13 @@ describe("HydrawiseController valve and suspend onSet", () => {
     const valve = await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001"), { description: "the valve for zone 700001 to appear" });
 
     await triggerSet(valve.getCharacteristic(Characteristic.Active), Characteristic.Active.INACTIVE);
+    await h.controller.commandsIdle;
 
-    const command = expectAt(h.retrieve.callsTo("setzone.php"), 0, "setzone call");
+    const command = expectAt(h.commands.params, 0, "setzone call");
 
-    assert.equal(command.params?.["action"], "stop", "a manual stop should send the stop action");
-    assert.equal(command.params["relay_id"], "700001", "the stop command should target the zone relay");
-    assert.equal(command.params["custom"], undefined, "a stop command carries no custom duration");
+    assert.equal(command["action"], "stop", "a manual stop should send the stop action");
+    assert.equal(command["relay_id"], "700001", "the stop command should target the zone relay");
+    assert.equal(command["custom"], undefined, "a stop command carries no custom duration");
   });
 
   test("stopping the only running zone collapses the system to not in use", async (t) => {
@@ -95,7 +96,6 @@ describe("HydrawiseController valve and suspend onSet", () => {
     const h = buildController({ program: (recorder) => {
 
       recorder.programDefault("statusschedule.php", { body: schedule([runningZone()]), kind: "response" });
-      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
     }, signalAborted: false });
 
     t.after(() => h.abort());
@@ -103,6 +103,7 @@ describe("HydrawiseController valve and suspend onSet", () => {
     const valve = await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001"), { description: "the valve for zone 700001 to appear" });
 
     await triggerSet(valve.getCharacteristic(Characteristic.Active), Characteristic.Active.INACTIVE);
+    await h.controller.commandsIdle;
 
     const irrigation = h.accessory.getService(Service.IrrigationSystem);
 
@@ -117,7 +118,6 @@ describe("HydrawiseController valve and suspend onSet", () => {
 
       recorder.program("statusschedule.php", { body: schedule([scheduledZone()]), kind: "response" });
       recorder.programDefault("statusschedule.php", { body: schedule([runningZone()]), kind: "response" });
-      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
     }, signalAborted: false });
 
     t.after(() => h.abort());
@@ -127,6 +127,7 @@ describe("HydrawiseController valve and suspend onSet", () => {
 
     assert.ok(irrigation, "the irrigation system service should exist");
     await triggerSet(valve.getCharacteristic(Characteristic.Active), Characteristic.Active.ACTIVE);
+    await h.controller.commandsIdle;
 
     assert.equal(irrigation.getCharacteristic(Characteristic.ProgramMode).value, Characteristic.ProgramMode.PROGRAM_SCHEDULED_MANUAL_MODE,
       "a manual start puts the controller in manual program mode");
@@ -167,7 +168,6 @@ describe("HydrawiseController valve and suspend onSet", () => {
 
       recorder.program("statusschedule.php", { body: schedule([ scheduledZone(), siblingZone() ]), kind: "response" });
       recorder.programDefault("statusschedule.php", { body: schedule([siblingZone()]), kind: "response" });
-      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
     }, signalAborted: false });
 
     t.after(() => h.abort());
@@ -203,7 +203,6 @@ describe("HydrawiseController valve and suspend onSet", () => {
 
       recorder.program("statusschedule.php", { body: schedule([ runningZone(), siblingZone() ]), kind: "response" });
       recorder.programDefault("statusschedule.php", { body: schedule([siblingZone()]), kind: "response" });
-      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
     }, signalAborted: false });
 
     t.after(() => h.abort());
@@ -227,24 +226,28 @@ describe("HydrawiseController valve and suspend onSet", () => {
     const h = buildController({ program: (recorder) => {
 
       recorder.programDefault("statusschedule.php", { body: schedule([scheduledZone()]), kind: "response" });
-      recorder.programDefault("setzone.php", { kind: "null" });
     }, signalAborted: false });
 
     t.after(() => h.abort());
 
     const valve = await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001"), { description: "the valve for zone 700001 to appear" });
 
-    await triggerSet(valve.getCharacteristic(Characteristic.Active), Characteristic.Active.ACTIVE);
+    h.commands.programDefault({ reason: "Hydrawise API rate limit has been exceeded.", status: "failed" });
 
-    // The record and the poll count are taken at the tap, so what follows is measured from it.
+    await triggerSet(valve.getCharacteristic(Characteristic.Active), Characteristic.Active.ACTIVE);
+    await h.controller.commandsIdle;
+
+    // The record and the poll count are taken once the command has failed, so what follows is measured from the failure.
     h.accessory.clearObservations();
 
     const pollsAtTap = h.retrieve.callsTo("statusschedule.php").length;
 
-    // The null command schedules a HYDRAWISE_REVERT_DELAY revert that flips the optimistic ACTIVE back to INACTIVE.
+    // The failed command schedules a HYDRAWISE_REVERT_DELAY write of what the valve reads, which flips the ACTIVE the tap stored back to INACTIVE.
     await waitUntil(() => valve.getCharacteristic(Characteristic.Active).value === Characteristic.Active.INACTIVE, { description: "the valve to read inactive" });
 
     assert.equal(valve.getCharacteristic(Characteristic.Active).value, Characteristic.Active.INACTIVE, "a failed run should revert the valve to inactive");
+    assert.ok(loggedAt(h.entries, "error", "Alpha [Zone 1]: Unable to start this zone. Hydrawise API rate limit has been exceeded."),
+      "and the failure is said once, naming the zone, what it was asked to do, and why");
 
     /* Every poll of this scheduled zone writes INACTIVE as well, so the value alone cannot say which write put it there. The revert lands a beat after the tap,
      * well inside the poll cadence, so with no poll fetched since the tap, the one change to Active the record holds is the revert's own.
@@ -254,12 +257,11 @@ describe("HydrawiseController valve and suspend onSet", () => {
       "the change that put the valve back is the revert's own write");
   });
 
-  test("a revert pending at shutdown drains, and one scheduled afterward stays inert", async (t) => {
+  test("a revert pending at shutdown drains, and a set after shutdown sends nothing and reverts nothing", async (t) => {
 
     const h = buildController({ program: (recorder) => {
 
       recorder.programDefault("statusschedule.php", { body: schedule([activeSoonZone()]), kind: "response" });
-      recorder.programDefault("setzone.php", { kind: "null" });
     }, signalAborted: false });
 
     t.after(() => h.abort());
@@ -267,26 +269,52 @@ describe("HydrawiseController valve and suspend onSet", () => {
     const valve = await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001"), { description: "the valve for zone 700001 to appear" });
     const active = valve.getCharacteristic(Characteristic.Active);
 
+    h.commands.programDefault({ reason: "Hydrawise API rate limit has been exceeded.", status: "failed" });
+
     /* Phase one: a failed command schedules a revert, and the platform shuts down while that revert is still pending. Every wait here is computed from the
      * production delay rather than restating it - half of it lands the abort squarely inside the window, and a few multiples of it settle well past the beat the
      * revert would have fired on.
      */
     await triggerSet(active, Characteristic.Active.ACTIVE);
+    await h.controller.commandsIdle;
     await delay(HYDRAWISE_REVERT_DELAY / 2);
 
     await h.abort();
 
     await delay(HYDRAWISE_REVERT_DELAY * 3);
 
-    assert.equal(h.retrieve.callsTo("setzone.php").length, 1, "the failed command reached the wire, so a revert was genuinely scheduled");
+    assert.equal(h.commands.calls.length, 1, "the failed command reached the wire, so a revert was genuinely scheduled");
     assert.equal(active.value, Characteristic.Active.ACTIVE, "a revert pending when the platform shuts down drains instead of landing");
 
-    // Phase two: the platform is down, so the registry is disposed and the revert this failed command asks for is never armed at all.
+    // Phase two: the platform is down, so the queue takes no new command at all, and the value HomeKit stored is left as it stands.
     await triggerSet(active, Characteristic.Active.INACTIVE);
+    await h.controller.commandsIdle;
     await delay(HYDRAWISE_REVERT_DELAY * 3);
 
-    assert.equal(h.retrieve.callsTo("setzone.php").length, 2, "the second command reached the wire, so the revert site ran again");
-    assert.equal(active.value, Characteristic.Active.INACTIVE, "a revert scheduled after shutdown never fires");
+    assert.equal(h.commands.calls.length, 1, "a set after shutdown sends nothing");
+    assert.equal(active.value, Characteristic.Active.INACTIVE, "and nothing writes over what HomeKit stored");
+  });
+
+  test("a run with no duration to give is no command, and the valve is put back without a word", async (t) => {
+
+    // A zone with no scheduled run carries a SetDuration of zero, so a tap on its valve asks for a run of no length at all, which the guard declines before
+    // anything is queued.
+    const h = buildController({ program: (recorder) => {
+
+      recorder.programDefault("statusschedule.php", { body: schedule([makeZone({ name: "Alpha", relay: 1, relay_id: 700001, run: 0, time: 68000, timestr: "16:00" })]),
+        kind: "response" });
+    }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    const valve = await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001"), { description: "the valve for zone 700001 to appear" });
+
+    await triggerSet(valve.getCharacteristic(Characteristic.Active), Characteristic.Active.ACTIVE);
+    await h.controller.commandsIdle;
+    await waitUntil(() => valve.getCharacteristic(Characteristic.Active).value === Characteristic.Active.INACTIVE, { description: "the valve to read inactive" });
+
+    assert.equal(h.commands.calls.length, 0, "a run of no length sends nothing");
+    assert.equal(h.entries.filter(line => line.level === "error").length, 0, "and says nothing, since nothing was asked of Hydrawise");
   });
 
   test("the suspend command floors its timestamp to a whole second (the bug 14 fix)", async (t) => {
@@ -294,7 +322,6 @@ describe("HydrawiseController valve and suspend onSet", () => {
     const h = buildController({ program: (recorder) => {
 
       recorder.programDefault("statusschedule.php", { body: schedule([runningZone()]), kind: "response" });
-      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
     }, signalAborted: false, userOptions: ["Enable.Device.Suspend.All.SN0A1B2C3D4"] });
 
     t.after(() => h.abort());
@@ -311,15 +338,16 @@ describe("HydrawiseController valve and suspend onSet", () => {
     const before = Date.now();
 
     await triggerSet(suspend.getCharacteristic(Characteristic.On), true);
+    await h.controller.commandsIdle;
 
     const after = Date.now();
-    const command = expectAt(h.retrieve.callsTo("setzone.php"), 0, "setzone call");
+    const command = expectAt(h.commands.params, 0, "setzone call");
 
-    assert.equal(command.params?.["action"], "suspendall", "the suspend should send the suspendall action");
-    assert.equal(command.params["period_id"], "999", "the suspend should use the manual period id");
-    assert.equal(command.params["relay_id"], undefined, "a controller-wide suspend carries no relay id");
+    assert.equal(command["action"], "suspendall", "the suspend should send the suspendall action");
+    assert.equal(command["period_id"], "999", "the suspend should use the manual period id");
+    assert.equal(command["relay_id"], undefined, "a controller-wide suspend carries no relay id");
 
-    const custom = Number(command.params["custom"]);
+    const custom = Number(command["custom"]);
     const low = Math.floor(before / 1000) + HYDRAWISE_SUSPEND_DURATION;
     const high = Math.floor(after / 1000) + HYDRAWISE_SUSPEND_DURATION;
 
@@ -332,10 +360,11 @@ describe("HydrawiseController valve and suspend onSet", () => {
     const h = buildController({ program: (recorder) => {
 
       recorder.programDefault("statusschedule.php", { body: schedule([runningZone()]), kind: "response" });
-      recorder.programDefault("setzone.php", { body: { message: "denied", message_type: "error" }, kind: "response" });
     }, signalAborted: false, userOptions: ["Enable.Device.Suspend.All.SN0A1B2C3D4"] });
 
     t.after(() => h.abort());
+
+    h.commands.programDefault({ reason: "denied", status: "refused" });
 
     // Wait until the first poll has run, so the controller answers HomeKit, then drive the suspend.
     await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
@@ -344,13 +373,14 @@ describe("HydrawiseController valve and suspend onSet", () => {
 
     assert.ok(suspend, "the suspend switch should exist");
     await triggerSet(suspend.getCharacteristic(Characteristic.On), true);
+    await h.controller.commandsIdle;
 
-    // The record and the poll count are taken at the tap, so what follows is measured from it.
+    // The record and the poll count are taken once the command has been refused, so what follows is measured from the refusal.
     h.accessory.clearObservations();
 
     const pollsAtTap = h.retrieve.callsTo("statusschedule.php").length;
 
-    // An error response schedules the 50ms revert that flips the optimistic true back off.
+    // A refusal schedules the 50ms write of what the switch reads, which flips the true the tap stored back off.
     await waitUntil(() => suspend.getCharacteristic(Characteristic.On).value === false, { description: "the suspend-all switch to read off" });
 
     assert.ok(loggedAt(h.entries, "error", "Unable to complete the suspend request"), "the suspend failure should be logged");
@@ -368,10 +398,12 @@ describe("HydrawiseController valve and suspend onSet", () => {
     const h = buildController({ program: (recorder) => {
 
       recorder.programDefault("statusschedule.php", { body: schedule([runningZone()]), kind: "response" });
-      recorder.programDefault("setzone.php", { kind: "malformed" });
     }, signalAborted: false, userOptions: ["Enable.Device.Suspend.All.SN0A1B2C3D4"] });
 
     t.after(() => h.abort());
+
+    // A reply carrying no verdict the platform could read is unreadable.
+    h.commands.programDefault({ reason: "The answer from Hydrawise could not be read.", status: "unreadable" });
 
     // Wait until the first poll has run, so the controller answers HomeKit, then drive the suspend.
     await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
@@ -380,10 +412,12 @@ describe("HydrawiseController valve and suspend onSet", () => {
 
     assert.ok(suspend, "the suspend switch should exist");
     await triggerSet(suspend.getCharacteristic(Characteristic.On), true);
+    await h.controller.commandsIdle;
 
     await waitUntil(() => suspend.getCharacteristic(Characteristic.On).value === false, { description: "the suspend-all switch to read off" });
 
     assert.ok(loggedAt(h.entries, "error", "Unable to retrieve the result of the suspend request"), "the malformed suspend response should be logged");
+    assert.equal(h.commands.calls.length, 1, "and a reply that could not be read is not resent");
   });
 
   test("a resume command sends suspendall with the current-time offset", async (t) => {
@@ -391,7 +425,6 @@ describe("HydrawiseController valve and suspend onSet", () => {
     const h = buildController({ program: (recorder) => {
 
       recorder.programDefault("statusschedule.php", { body: schedule([runningZone()]), kind: "response" });
-      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
     }, signalAborted: false, userOptions: ["Enable.Device.Suspend.All.SN0A1B2C3D4"] });
 
     t.after(() => h.abort());
@@ -405,12 +438,13 @@ describe("HydrawiseController valve and suspend onSet", () => {
     const before = Date.now();
 
     await triggerSet(suspend.getCharacteristic(Characteristic.On), false);
+    await h.controller.commandsIdle;
 
     const after = Date.now();
-    const command = expectAt(h.retrieve.callsTo("setzone.php"), 0, "setzone call");
-    const custom = Number(command.params?.["custom"]);
+    const command = expectAt(h.commands.params, 0, "setzone call");
+    const custom = Number(command["custom"]);
 
-    assert.equal(command.params?.["action"], "suspendall", "a resume also sends the suspendall action");
+    assert.equal(command["action"], "suspendall", "a resume also sends the suspendall action");
     assert.ok((custom >= Math.floor(before / 1000)) && (custom <= Math.floor(after / 1000)), "a resume timestamp is the current whole second, no one-year offset");
   });
 });

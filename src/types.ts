@@ -126,6 +126,24 @@ export interface SetZoneResponse {
   message_type: "error" | "info";
 }
 
+/* What became of one command sent to the key-based API, as a discriminated union rather than a bare response, because each outcome asks the caller for something
+ * different.
+ *
+ * "confirmed" means Hydrawise answered that the command took. "refused" means it did not, and a resend would meet the same answer: Hydrawise said so in its reply,
+ * or the platform refused the status it came back with. "unreadable" means a reply arrived and its verdict could not be read: a body that does not parse, carries
+ * no message type this plugin knows, or failed partway through for any reason but a deadline or a shutdown. The command may have taken, but nothing in the reply
+ * says so, and it is not resent. "timeout" means no answer arrived inside the request deadline, so the command may or may not have taken, and a resend is how to
+ * find out. "failed" means the request did not complete for a reason a resend would only run into again: the rate limit, a server error the transport already
+ * retried, or a transport fault. "aborted" means the command was withdrawn before it reached the wire, or Homebridge is shutting down, and neither is news.
+ *
+ * A refusal's reason is Hydrawise's own message for a refusal in its reply, or the platform's sentence for a status it refused. An unreadable reply's reason is the
+ * platform's one sentence for a reply it could not read. A failure's reason is the platform's sentence for what went wrong. The platform's request log has already
+ * logged a refused status and every failure, each in the sentence its reason gives, apart from a failure carrying no marker, which it logs as the error's full dump,
+ * and it logs nothing for a refusal in the reply or an unreadable reply, so a caller that names the reason beside the command it was sending is saying which command
+ * that answer was about.
+ */
+export type HydrawiseCommandOutcome = { status: "aborted" | "confirmed" | "timeout" } | { reason: string; status: "failed" | "refused" | "unreadable" };
+
 /* Hydrawise v2 API: the OAuth2 token endpoint's response, typed to the fields the client consumes. The lifetime arrives as a duration in seconds rather than
  * an instant, so the client turns it into an absolute expiry against its own clock at the moment it reads the response.
  *
@@ -226,48 +244,6 @@ export interface HydrawiseV2Account {
 
   me?: { controllers?: HydrawiseV2Controller[] };
 }
-
-/* Hydrawise v2 API: what a suspension mutation answers with - a status word and the sentence the account composed about what it did.
- *
- * The status word is the necessary half, and a 2026-08-10 live probe is why: both mutations report a refusal INSIDE a clean HTTP 200 carrying no GraphQL errors
- * array at all, so the transport-level classification every read relies on cannot see it and only a caller that reads this field can.
- */
-export interface HydrawiseV2MutationStatus {
-
-  status?: string;
-  summary?: string;
-}
-
-// Hydrawise v2 API: the data half of a suspension mutation, whose single field is named after the mutation that was sent. Both mutations answer the same status pair
-// under their own name, so one shape describes either and the caller reads the field it asked for.
-export interface HydrawiseV2MutationData {
-
-  resumeZone?: HydrawiseV2MutationStatus;
-  suspendZone?: HydrawiseV2MutationStatus;
-}
-
-// Hydrawise v2 API: the status word a mutation answers with when it succeeded. Anything else is a refusal, whatever it spells, so the comparison is against this one
-// value rather than against a list of failures nobody published.
-export const HYDRAWISE_V2_MUTATION_OK = "OK";
-
-/* The answer one per-zone suspension command gives, as a discriminated union rather than a boolean, because its outcomes ask the caller for different things.
- *
- * "done" means the account accepted the command, so the optimistic state the user is already looking at stands. "failed" means a genuinely attempted command did not
- * take. "rejected" means the command never reached the wire at all - the ceiling had no slot to admit it inside the beat a user will wait - which asks for a retry in
- * a moment rather than reporting a refusal that never happened.
- *
- * The failed arm's reason is ONE field for however a command can fail: the account's own summary when it refused in band, and the transport's reason when the
- * request itself did not land. They are one field because they answer one question the user is asking - why did my command not take - and because the layer that
- * writes the sentence should not have to know which of the two it is holding. A null reason means the failure was already reported in its own words elsewhere.
- */
-export type HydrawiseV2MutationResult =
-  { status: "done" } |
-  { reason: Nullable<string>; status: "failed" } |
-  { status: "rejected" };
-
-// The answer the platform's own per-zone suspension surface gives: the client's own outcomes, plus the one only the platform can know, which is that no
-// account-credentialed client exists to command through.
-export type HydrawiseZoneSuspensionResult = HydrawiseV2MutationResult | { status: "unavailable" };
 
 /* Hydrawise v2 API: the prefix marking the sensor kinds that report a level - the family a rain or freeze sensor belongs to, and the only family whose activity
  * can stop a zone's irrigation. The live capture records the owner's rain and freeze sensor answering LEVEL_CLOSED, and the schema declares the field as an

@@ -7,29 +7,24 @@
  * the MQTT payload, and the log line, including the window a running zone's honest projection holds open against an accepted command and a restart's carried
  * suspension reconciling against the first fresh facts to arrive.
  *
- * Every command but one runs against the platform double's recording suspension surface, so most of this file never reaches the account API or its client - the
- * client's own admission and transport behavior is asserted in its own suite, and what these tests assert is the projection above it. The one exception drives a real
- * account-credentialed client over a mocked transport, proving that a transport failure produces exactly one sentence for the user across every layer that could
- * have spoken about it.
+ * Every command runs against the platform double's command double, so no row here reaches the wire - the platform's own command path is asserted in its own
+ * suite, and what these tests assert is the projection above it.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
 import { Characteristic, Service, buildController, makeV2Facts, makeZoneV2Facts, pollsCompleted, seedEstablished, waitFor } from "./testing/platform.helpers.ts";
-import { HAPStatus, RateBudget, getServiceName } from "homebridge-plugin-utils";
-import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_SUSPEND_DURATION, HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_V2_FACTS_TTL,
-  HYDRAWISE_V2_GRAPH_ENDPOINT, HYDRAWISE_V2_MUTATION_BUDGET_CALLS, HYDRAWISE_V2_MUTATION_BUDGET_WINDOW, HYDRAWISE_V2_TOKEN_ENDPOINT } from "./settings.ts";
+import { HAPStatus, getServiceName } from "homebridge-plugin-utils";
+import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_SUSPEND_DURATION, HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
 import { HYDRAWISE_RAIN_SENSOR_TYPE, scheduleStatus, suspendZoneSubtype, zoneIdentity } from "./types.ts";
 import type { Service as HapService, PlatformAccessory } from "homebridge";
 import type { HydrawiseAccessoryContext, HydrawiseZoneConfig, HydrawiseZoneScheduleStatus, HydrawiseZoneV2Facts,
   StatusScheduleResponse } from "./types.ts";
-import { TestClock, advanceThroughSchedule, hapStatus, logCount, loggedAt, triggerGet, triggerSet, waitUntil } from "homebridge-plugin-utils/testing";
+import { TestClock, advanceThroughSchedule, expectAt, hapStatus, logCount, loggedAt, triggerGet, triggerSet, waitUntil } from "homebridge-plugin-utils/testing";
 import { UNSCHEDULED_SENTINEL, bareSensors } from "./api.fixtures.ts";
 import { describe, test } from "node:test";
 import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
 import type { BuildControllerResult } from "./testing/platform.helpers.ts";
-import { HydrawiseV2Client } from "./v2.ts";
-import { MockAgent } from "undici";
 import type { TestContext } from "node:test";
 import assert from "node:assert/strict";
 
@@ -67,16 +62,6 @@ const REFUSAL_SUMMARY = "Hydrawise refused this one.";
 // The refusal HomeKit renders as No Response: HAP's communication-failure status from a deliberate refusal, which the matcher tells apart from a handler that
 // faulted into the same status.
 const noResponse = hapStatus(HAPStatus.SERVICE_COMMUNICATION_FAILURE);
-
-// The v2 origin and paths the real client used by the combined-layers assertion below targets, derived from the endpoint constants exactly as the client derives its own.
-const V2_ORIGIN = new URL(HYDRAWISE_V2_GRAPH_ENDPOINT).origin;
-
-const GRAPH_PATH = new URL(HYDRAWISE_V2_GRAPH_ENDPOINT).pathname;
-
-const TOKEN_PATH = new URL(HYDRAWISE_V2_TOKEN_ENDPOINT).pathname;
-
-// A successful token grant, shaped as the live capture recorded it, so the command under test gets past the token chokepoint and reaches the transport.
-const TOKEN_BODY = { access_token: "access-one", expires_in: 3600, refresh_token: "refresh-one" };
 
 /* The zone under test, carrying the unscheduled sentinel shape. That shape is the one body the key-based wire cannot read further, so it is the only shape the
  * account API's suspension FACTS can classify - the facts arm sits inside the branch that owns it, and a running or scheduled zone answers from the wire there.
@@ -289,7 +274,7 @@ describe("HydrawiseController per-zone suspension switches", () => {
     await pollsCompleted(h, 2);
 
     assert.equal(suspendSwitch(h.accessory), undefined, "the default-off option publishes no switch at all");
-    assert.equal(h.suspensions.length, 0, "and nothing can command a suspension");
+    assert.equal(h.commands.calls.length, 0, "and nothing can command a suspension");
     assert.ok(!loggedAt(h.entries, "info", "Per-zone suspension switches"), "a default left alone says nothing at startup");
   });
 
@@ -351,7 +336,7 @@ describe("HydrawiseController per-zone suspension switches", () => {
 
 describe("HydrawiseController per-zone suspension commands", () => {
 
-  test("turning the switch on suspends the zone for the account-wide duration", async (t) => {
+  test("turning the switch on suspends the zone through setzone for the account-wide duration", async (t) => {
 
     const h = buildController({ hasV2Client: true,
       program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" }), signalAborted: false,
@@ -363,21 +348,25 @@ describe("HydrawiseController per-zone suspension commands", () => {
     const before = now();
 
     await triggerSet(service.getCharacteristic(Characteristic.On), true);
+    await h.controller.commandsIdle;
 
     const after = now();
+    const command = expectAt(h.commands.params, 0, "setzone call");
 
-    assert.equal(h.suspensions.length, 1, "one tap sends exactly one command");
-    assert.equal(h.suspensions[0]?.zoneId, ALPHA_RELAY_ID, "and it names the zone the switch belongs to");
+    assert.equal(h.commands.calls.length, 1, "one tap sends exactly one command");
+    assert.equal(command["action"], "suspend", "the command is the key-based API's own per-zone suspend");
+    assert.equal(command["relay_id"], ALPHA_RELAY_ID.toString(), "and it names the zone the switch belongs to");
+    assert.equal(command["period_id"], "999", "with the custom period");
 
-    // The horizon is the account-wide suspend's own constant, bracketed by whole-second reads either side of the tap. One convention, one constant, both grains.
-    const until = h.suspensions[0].until ?? 0;
+    // The horizon is the account-wide suspend's own constant, bracketed by whole-second reads either side of the command. One convention, one constant, both grains.
+    const until = Number(command["custom"]);
 
     assert.ok((until >= (before + HYDRAWISE_SUSPEND_DURATION)) && (until <= (after + HYDRAWISE_SUSPEND_DURATION)),
       "the suspension runs to the same one-year horizon the account-wide suspend uses");
     assert.equal(readsSuspended(h.accessory), true, "and the switch holds the state the user just chose");
   });
 
-  test("turning the switch off resumes the zone, carrying no instant at all", async (t) => {
+  test("turning the switch off resumes the zone by suspending it until the current second", async (t) => {
 
     const h = buildController({ hasV2Client: true,
       program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" }), signalAborted: false,
@@ -389,13 +378,23 @@ describe("HydrawiseController per-zone suspension commands", () => {
 
     applyFacts(h, { [ALPHA_RELAY_ID]: true }, now());
 
-    await triggerSet(service.getCharacteristic(Characteristic.On), false);
+    const before = now();
 
-    // A null instant is what composes the resume rather than a suspension to some instant in the past, which is the shape the two commands are told apart by.
-    assert.deepEqual(h.suspensions, [{ until: null, zoneId: ALPHA_RELAY_ID }], "a resume names the zone and no instant");
+    await triggerSet(service.getCharacteristic(Characteristic.On), false);
+    await h.controller.commandsIdle;
+
+    const after = now();
+    const command = expectAt(h.commands.params, 0, "setzone call");
+    const custom = Number(command["custom"]);
+
+    // The key-based API has no resume, so a suspension that ends at an instant already reached is what lifts one.
+    assert.equal(command["action"], "suspend", "a resume is the same per-zone suspend");
+    assert.equal(command["relay_id"], ALPHA_RELAY_ID.toString(), "naming the zone");
+    assert.ok((custom >= before) && (custom <= after), "ending at the current whole second, with no one-year offset");
+    assert.equal(readsSuspended(h.accessory), false, "and the switch reads the zone resumed");
   });
 
-  test("N accepted flips send exactly N commands", async (t) => {
+  test("taps made while a command is in flight send only the latest choice behind it", async (t) => {
 
     const h = buildController({ hasV2Client: true,
       program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" }), signalAborted: false,
@@ -405,138 +404,108 @@ describe("HydrawiseController per-zone suspension commands", () => {
 
     const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
 
+    // The first command is held in flight, so every tap after it lands while it cannot be recalled.
+    const held = h.commands.hold();
+
     for(const value of [ true, false, true, false ]) {
 
       // eslint-disable-next-line no-await-in-loop
       await triggerSet(service.getCharacteristic(Characteristic.On), value);
     }
 
-    /* BOTH bounds, by strict equality. The upper bound catches a handler that retried or read back after commanding; the lower catches one that coalesced a burst
-     * into fewer commands than the user made, which is the queue-and-batch shape the design deliberately rejected.
+    held.release();
+    await h.controller.commandsIdle;
+
+    /* BOTH bounds, by strict equality. The upper bound catches a queue that sent each tap; the lower one that dropped the latest choice along with the taps it
+     * replaced. What reaches Hydrawise is the command already in flight, then the user's last word.
      */
-    assert.equal(h.suspensions.length, 4, "four taps are four commands, neither dropped nor doubled");
+    assert.equal(h.commands.calls.length, 2, "four taps behind a command in flight send two commands");
+    assert.ok(Number(h.commands.params[1]?.["custom"]) <= now(), "and the second is the resume the last tap asked for");
+    assert.equal(readsSuspended(h.accessory), false, "which the switch shows");
+  });
+
+  test("a zone resumed after a suspend-all is sent after it, in the order of the latest taps", async (t) => {
+
+    const h = buildController({ hasV2Client: true, program: (recorder) => {
+
+      recorder.programDefault("statusschedule.php", { body: schedule([ alphaZone(), betaZone() ]), kind: "response" });
+    }, signalAborted: false, userOptions: [ SUSPEND_ZONE_ON, SUSPEND_ALL_ON ] });
+
+    t.after(() => h.abort());
+
+    const all = await waitFor(() => suspendSwitch(h.accessory, SUSPEND_ALL_SUBTYPE), { description: "the suspend-all switch to appear" });
+    const alpha = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
+    const beta = await waitFor(() => suspendSwitch(h.accessory, BETA_SWITCH_SUBTYPE), { description: "Bravo's suspension switch to appear" });
+
+    applyFacts(h, { [ALPHA_RELAY_ID]: true, [BETA_RELAY_ID]: false }, now());
+
+    // Bravo's suspension holds the one command in flight. Alpha's resume is tapped ahead of the Suspend All and again after it, which moves it behind the Suspend
+    // All, so the account-wide suspend cannot land last and suspend the zone the user resumed.
+    const held = h.commands.hold();
+
+    await triggerSet(beta.getCharacteristic(Characteristic.On), true);
+    await held.reached;
+    await triggerSet(alpha.getCharacteristic(Characteristic.On), false);
+    await triggerSet(all.getCharacteristic(Characteristic.On), true);
+    await triggerSet(alpha.getCharacteristic(Characteristic.On), false);
+
+    held.release();
+    await h.controller.commandsIdle;
+
+    assert.deepEqual(h.commands.params.map(params => [ params["action"], params["relay_id"] ]),
+      [ [ "suspend", BETA_RELAY_ID.toString() ], [ "suspendall", undefined ], [ "suspend", ALPHA_RELAY_ID.toString() ] ],
+      "the zone's resume goes out after the Suspend All");
+    assert.equal(readsSuspended(h.accessory), false, "and the zone reads resumed");
   });
 
   test("a refused command reverts the switch and says why, exactly once", async (t) => {
 
     const h = buildController({ hasV2Client: true,
       program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" }), signalAborted: false,
-      suspensionResult: { reason: REFUSAL_SUMMARY, status: "failed" }, userOptions: [SUSPEND_ZONE_ON] });
+      userOptions: [SUSPEND_ZONE_ON] });
 
     t.after(() => h.abort());
 
     const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
 
+    h.commands.programDefault({ reason: REFUSAL_SUMMARY, status: "refused" });
+
     await triggerSet(service.getCharacteristic(Characteristic.On), true);
+    await h.controller.commandsIdle;
     await waitUntil(() => readsSuspended(h.accessory) === false, { description: "Alpha's suspension switch to read not suspended" });
 
-    assert.equal(readsSuspended(h.accessory), false, "a command the account refused puts the switch back where it was");
+    assert.equal(readsSuspended(h.accessory), false, "a command Hydrawise refused puts the switch back where it was");
     assert.ok(loggedAt(h.entries, "error", "Alpha [Zone 1]: Unable to suspend this zone. " + REFUSAL_SUMMARY),
-      "and the one sentence names the zone and what the account said");
-
-    /* The one-voice assertion. The layers below this one carry their outcome in a value rather than in a line, so a user reads exactly one sentence about a command they
-     * made - the one written by the layer that knows which zone they touched.
-     */
+      "and the one sentence names the zone and what Hydrawise said");
     assert.equal(h.entries.filter(line => line.level === "error").length, 1, "a refused command produces exactly one error line");
   });
 
-  test("a command the ceiling would not admit reverts with the pacing sentence rather than the account's", async (t) => {
+  test("a reached rate limit reverts the switch with the platform's reason and is not resent", async (t) => {
 
     const h = buildController({ hasV2Client: true,
       program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" }), signalAborted: false,
-      suspensionResult: { status: "rejected" }, userOptions: [SUSPEND_ZONE_ON] });
+      userOptions: [SUSPEND_ZONE_ON] });
 
     t.after(() => h.abort());
 
     const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
 
-    await triggerSet(service.getCharacteristic(Characteristic.On), true);
-    await waitUntil(() => readsSuspended(h.accessory) === false, { description: "Alpha's suspension switch to read not suspended" });
-
-    /* Reject-with-feedback, made legible. These two refusals ask the user for different things - wait a moment, against look at your account - so they must not
-     * share a sentence, and a user who sees the pacing one knows their command was never sent.
-     */
-    assert.ok(loggedAt(h.entries, "error", "Alpha [Zone 1]: Unable to suspend this zone. The Hydrawise account API is pacing requests"),
-      "a paced refusal says so, and asks for a moment rather than blaming the account");
-    assert.ok(!loggedAt(h.entries, "error", REFUSAL_SUMMARY), "and it carries no summary, because no command reached the account to produce one");
-    assert.equal(h.entries.filter(line => line.level === "error").length, 1, "a rejected command likewise produces exactly one error line");
-  });
-
-  test("a transport failure is narrated ONCE across every layer that saw it", async (t) => {
-
-    /* The combined-layers assertion, and the one a per-layer suite structurally cannot write. Below the controller sits a REAL account-credentialed client over a mocked
-     * transport, and every layer writes into one capture buffer, so what is counted here is every voice that could speak about one failed command.
-     *
-     * Both transport failure shapes are driven, because they classify in different places: a non-2xx status is read off the response, while a GraphQL errors array
-     * arrives inside a clean HTTP 200 that no status check can see. Either way one command that did not take is ONE sentence for the user, carrying the reason and
-     * naming the zone - and the switch goes back to where it was.
-     */
-    const shapes = [ { body: { message: "Bad Gateway" }, expected: "The Hydrawise API answered with status 502.", label: "a refused transport", status: 502 },
-      { body: { errors: [{ message: "Cannot query field" }] }, expected: "Cannot query field.", label: "a GraphQL errors array", status: 200 } ];
-
-    for(const shape of shapes) {
-
-      const signal = new AbortController();
-      const agent = Object.assign(new MockAgent(), { destroy: async (): Promise<void> => { await agent.close(); } });
-
-      agent.disableNetConnect();
-      agent.get(V2_ORIGIN).intercept({ method: "POST", path: TOKEN_PATH }).reply(200, (): object => TOKEN_BODY).persist();
-      agent.get(V2_ORIGIN).intercept({ method: "POST", path: GRAPH_PATH }).reply(shape.status, (): object => shape.body).persist();
-
-      const h = buildController({ hasV2Client: true,
-        program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" }), signalAborted: false,
-        suspensionClient: (log) => new HydrawiseV2Client({ budget: new RateBudget({ capacity: HYDRAWISE_V2_BUDGET_CALLS, signal: signal.signal,
-          window: HYDRAWISE_V2_BUDGET_WINDOW * 1000 }), dispatcherFactory: (): MockAgent => agent, log,
-        mutationBudget: new RateBudget({ capacity: HYDRAWISE_V2_MUTATION_BUDGET_CALLS, signal: signal.signal,
-          window: HYDRAWISE_V2_MUTATION_BUDGET_WINDOW * 1000 }), password: "test-password", signal: signal.signal,
-        username: "test-user" }), userOptions: [SUSPEND_ZONE_ON] });
-
-      t.after(async () => { await h.abort(); signal.abort("test-teardown"); });
-
-      // eslint-disable-next-line no-await-in-loop
-      const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
-
-      // eslint-disable-next-line no-await-in-loop
-      await triggerSet(service.getCharacteristic(Characteristic.On), true);
-
-      // eslint-disable-next-line no-await-in-loop
-      await waitUntil(() => readsSuspended(h.accessory) === false, { description: "Alpha's suspension switch to read not suspended" });
-
-      const errors = h.entries.filter(line => line.level === "error");
-
-      assert.equal(errors.length, 1, shape.label + " produces exactly one error line across the client and the controller");
-      assert.ok(loggedAt(h.entries, "error", "Alpha [Zone 1]: Unable to suspend this zone. " + shape.expected),
-        "and that line names the zone the user touched and the reason the command did not take");
-      assert.equal(readsSuspended(h.accessory), false, "with the switch put back where it was");
-    }
-  });
-
-  test("a command that finds no account client at all says what is missing", async (t) => {
-
-    /* The missing-client answer, which no LIVE switch can produce: the switches exist only where a client does, and that is fixed at construction. Its sentence is
-     * asserted here all the same, because the handler answers to every outcome the surface declares - and an unnamed one would compile into a switch reverting in
-     * silence.
-     */
-    const h = buildController({ hasV2Client: true,
-      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" }), signalAborted: false,
-      suspensionResult: { status: "unavailable" }, userOptions: [SUSPEND_ZONE_ON] });
-
-    t.after(() => h.abort());
-
-    const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
+    h.commands.programDefault({ reason: "Hydrawise API rate limit has been exceeded.", status: "failed" });
 
     await triggerSet(service.getCharacteristic(Characteristic.On), true);
+    await h.controller.commandsIdle;
     await waitUntil(() => readsSuspended(h.accessory) === false, { description: "Alpha's suspension switch to read not suspended" });
 
-    assert.ok(loggedAt(h.entries, "error", "Alpha [Zone 1]: Unable to suspend this zone. Enhanced features are not configured."),
-      "the sentence names the configuration the command needed rather than blaming the account");
+    assert.equal(h.commands.calls.length, 1, "a failure a resend would only meet again is sent once");
+    assert.ok(loggedAt(h.entries, "error", "Alpha [Zone 1]: Unable to suspend this zone. Hydrawise API rate limit has been exceeded."),
+      "and the zone's sentence gives the platform's reason");
   });
 
   test("a command torn down by shutdown reverts nothing and says nothing", async (t) => {
 
     const h = buildController({ hasV2Client: true,
       program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" }), signalAborted: false,
-      suspensionResult: { status: "rejected" }, userOptions: [SUSPEND_ZONE_ON] });
+      userOptions: [SUSPEND_ZONE_ON] });
 
     t.after(() => h.abort());
 
@@ -545,9 +514,11 @@ describe("HydrawiseController per-zone suspension commands", () => {
     await h.abort();
 
     await triggerSet(service.getCharacteristic(Characteristic.On), true);
+    await h.controller.commandsIdle;
 
     // Orderly teardown is not a refusal. A shutdown that narrated one would put an error in the log of every restart a user performs.
-    assert.equal(h.entries.filter(line => line.level === "error").length, 0, "a shutdown reaching a command in flight reports nothing");
+    assert.equal(h.commands.calls.length, 0, "a command made after shutdown is never sent");
+    assert.equal(h.entries.filter(line => line.level === "error").length, 0, "and nothing is reported");
   });
 });
 
@@ -568,6 +539,7 @@ describe("HydrawiseController per-zone suspension command guard", () => {
     t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
 
     await triggerSet(service.getCharacteristic(Characteristic.On), true);
+    await h.controller.commandsIdle;
 
     /* A fetch already in flight when the user tapped knows nothing about their command. Letting it answer would flip the switch straight back under their finger,
      * which is the whole reason the guard exists.
@@ -607,6 +579,7 @@ describe("HydrawiseController per-zone suspension command guard", () => {
     assert.equal(readsSuspended(h.accessory), true, "the zone starts out suspended");
 
     await triggerSet(service.getCharacteristic(Characteristic.On), false);
+    await h.controller.commandsIdle;
 
     applyFacts(h, { [ALPHA_RELAY_ID]: true }, now() - 5);
 
@@ -616,17 +589,20 @@ describe("HydrawiseController per-zone suspension command guard", () => {
     assert.equal(readsSuspended(h.accessory), false, "a resume renders unsuspended against an older snapshot that still says otherwise");
   });
 
-  test("a command the account refused stamps nothing", async (t) => {
+  test("a command Hydrawise refused stamps nothing", async (t) => {
 
     const h = buildController({ hasV2Client: true,
       program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" }), signalAborted: false,
-      suspensionResult: { reason: REFUSAL_SUMMARY, status: "failed" }, userOptions: [SUSPEND_ZONE_ON] });
+      userOptions: [SUSPEND_ZONE_ON] });
 
     t.after(() => h.abort());
 
     const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
 
+    h.commands.programDefault({ reason: REFUSAL_SUMMARY, status: "refused" });
+
     await triggerSet(service.getCharacteristic(Characteristic.On), true);
+    await h.controller.commandsIdle;
     await waitUntil(() => readsSuspended(h.accessory) === false, { description: "Alpha's suspension switch to read not suspended" });
 
     /* The snapshot below is OLDER than the tap, so a guard entry stamped by the failed command would stand and render the zone suspended. Nothing was commanded in
@@ -648,6 +624,7 @@ describe("HydrawiseController per-zone suspension command guard", () => {
     const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
 
     await triggerSet(service.getCharacteristic(Characteristic.On), true);
+    await h.controller.commandsIdle;
 
     /* No trustworthy snapshot at all - none ever arrived, the last aged out, or the refresh has stalled. Nothing newer has contradicted the user, so their own
      * command is the honest thing to display; treating "we cannot tell" as "not suspended" would silently undo a command the account accepted.
@@ -666,7 +643,6 @@ describe("HydrawiseController per-zone suspension command guard", () => {
     const h = buildController({ hasV2Client: true, program: (recorder) => {
 
       recorder.programDefault("statusschedule.php", { body: schedule([ alphaZone(), betaZone() ]), kind: "response" });
-      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
     }, signalAborted: false, userOptions: [ SUSPEND_ZONE_ON, SUSPEND_ALL_ON, BETA_DISABLED ] });
 
     t.after(() => h.abort());
@@ -679,6 +655,7 @@ describe("HydrawiseController per-zone suspension command guard", () => {
     assert.equal(suspendSwitch(h.accessory, BETA_SWITCH_SUBTYPE), undefined, "the disabled zone has no switch of its own to be stamped through");
 
     await triggerSet(all.getCharacteristic(Characteristic.On), true);
+    await h.controller.commandsIdle;
 
     // The snapshot predates the account-wide command, so without a per-zone stamp it would fight the account-wide switch's optimistic state zone by zone.
     applyFacts(h, { [ALPHA_RELAY_ID]: false, [BETA_RELAY_ID]: false }, now() - 5);
@@ -698,7 +675,6 @@ describe("HydrawiseController per-zone suspension command guard", () => {
     const h = buildController({ hasV2Client: true, program: (recorder) => {
 
       recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" });
-      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
     }, signalAborted: false, userOptions: [ SUSPEND_ZONE_ON, SUSPEND_ALL_ON ] });
 
     t.after(() => h.abort());
@@ -713,6 +689,7 @@ describe("HydrawiseController per-zone suspension command guard", () => {
     assert.equal(readsSuspended(h.accessory), true, "the zone starts out suspended");
 
     await triggerSet(all.getCharacteristic(Characteristic.On), false);
+    await h.controller.commandsIdle;
 
     applyFacts(h, { [ALPHA_RELAY_ID]: true }, now() - 5);
 
@@ -754,6 +731,7 @@ describe("HydrawiseController suspension commands composed into the projection",
     t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
 
     await triggerSet(service.getCharacteristic(Characteristic.On), true);
+    await h.controller.commandsIdle;
 
     const entry = entryOf(h);
 
@@ -791,6 +769,7 @@ describe("HydrawiseController suspension commands composed into the projection",
     h.accessory.clearObservations();
 
     await triggerSet(service.getCharacteristic(Characteristic.On), true);
+    await h.controller.commandsIdle;
 
     /* The claim is about what the re-derive INSIDE this handler wrote, which the cached value cannot answer: a set caches the value it was handed once the
      * handler resolves, so reading it back would report the user's own tap whatever the reader beneath it decided. The change record is what distinguishes them - a
@@ -823,10 +802,12 @@ describe("HydrawiseController suspension commands composed into the projection",
     const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
 
     await triggerSet(service.getCharacteristic(Characteristic.On), true);
+    await h.controller.commandsIdle;
 
     assert.equal(entryOf(h)?.state, "suspended", "the suspension composes first, outranking the sensor as the longer-lived fact");
 
     await triggerSet(service.getCharacteristic(Characteristic.On), false);
+    await h.controller.commandsIdle;
 
     assert.equal(entryOf(h)?.state, "sensor-stopped", "the resume clears the suspension and the sensor's own claim returns rather than a clean schedule");
   });
@@ -840,7 +821,6 @@ describe("HydrawiseController suspension commands composed into the projection",
     const h = buildController({ hasV2Client: true, program: (recorder) => {
 
       recorder.programDefault("statusschedule.php", { body: pacedSchedule([ scheduledZone(), scheduledBeta() ]), kind: "response" });
-      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
     }, signalAborted: false, userOptions: [ SUSPEND_ZONE_ON, SUSPEND_ALL_ON ] });
 
     t.after(() => h.abort());
@@ -850,6 +830,7 @@ describe("HydrawiseController suspension commands composed into the projection",
     await waitUntil(() => entryOf(h)?.state === "scheduled", { description: "Alpha to classify as scheduled" });
 
     await triggerSet(all.getCharacteristic(Characteristic.On), true);
+    await h.controller.commandsIdle;
 
     assert.equal(entryOf(h)?.state, "suspended", "every reported zone composes as suspended at once");
     assert.equal(entryOf(h, BETA_RELAY_ID)?.state, "suspended", "the sibling included");
@@ -864,6 +845,7 @@ describe("HydrawiseController suspension commands composed into the projection",
     assert.equal(await triggerGet(all.getCharacteristic(Characteristic.On)), true, "and the account-wide switch reads on after the re-derive its handler ran");
 
     await triggerSet(all.getCharacteristic(Characteristic.On), false);
+    await h.controller.commandsIdle;
 
     assert.equal(entryOf(h)?.state, "scheduled", "a resume-all returns every zone to what the wire reports");
     assert.equal(await triggerGet(all.getCharacteristic(Characteristic.On)), false, "and the switch follows it back off");
@@ -881,6 +863,7 @@ describe("HydrawiseController suspension commands composed into the projection",
     const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
 
     await triggerSet(service.getCharacteristic(Characteristic.On), true);
+    await h.controller.commandsIdle;
 
     assert.equal(entryOf(h)?.state, "suspended", "the command composes the suspension");
 
@@ -922,6 +905,7 @@ describe("HydrawiseController suspension commands composed into the projection",
     t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
 
     await triggerSet(service.getCharacteristic(Characteristic.On), true);
+    await h.controller.commandsIdle;
 
     assert.equal(h.flushes().length, flushesBefore + 1, "the command writes the accessory cache exactly once");
     assert.equal(h.mqtt?.published.length, publishesBefore + 1, "publishes exactly once");
@@ -929,6 +913,7 @@ describe("HydrawiseController suspension commands composed into the projection",
 
     // The same command again, against a classification that already reads suspended. Nothing moved, so nothing is written, published, or said.
     await triggerSet(service.getCharacteristic(Characteristic.On), true);
+    await h.controller.commandsIdle;
 
     assert.equal(h.flushes().length, flushesBefore + 1, "a command that moves no classification writes nothing");
     assert.equal(h.mqtt.published.length, publishesBefore + 1, "publishes nothing");
@@ -941,10 +926,7 @@ describe("HydrawiseController suspension commands composed into the projection",
      * refused with the communication failure before the handler runs: no command reaches the wire, no stamp is recorded for a later snapshot to be judged
      * against, and the refused write adds no save to the accessory cache.
      */
-    const h = buildController({ hasV2Client: true, program: (recorder) => {
-
-      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
-    }, signalAborted: true, userOptions: [ SUSPEND_ZONE_ON, SUSPEND_ALL_ON ] });
+    const h = buildController({ hasV2Client: true, signalAborted: true, userOptions: [ SUSPEND_ZONE_ON, SUSPEND_ALL_ON ] });
 
     t.after(() => h.abort());
 
@@ -957,7 +939,7 @@ describe("HydrawiseController suspension commands composed into the projection",
 
     await assert.rejects(() => triggerSet(all.getCharacteristic(Characteristic.On), !constructed), noResponse, "the write is refused with the communication failure");
 
-    assert.equal(h.retrieve.callsTo("setzone.php").length, 0, "no command reaches the wire");
+    assert.equal(h.commands.calls.length, 0, "no command reaches the wire");
     assert.equal(all.getCharacteristic(Characteristic.On).value, constructed, "the switch keeps the state it was constructed with");
     assert.deepEqual(projectionOf(h), [], "nothing is classified, because no poll has reported a zone to classify");
     assert.equal(constructionSaves, 1, "construction saves the accessory once");
@@ -982,6 +964,7 @@ describe("HydrawiseController suspension commands composed into the projection",
     const clockSeconds = (): number => Math.floor(clock.now() / 1000);
 
     await triggerSet(service.getCharacteristic(Characteristic.On), true);
+    await h.controller.commandsIdle;
 
     applyFacts(h, { [ALPHA_RELAY_ID]: false }, clockSeconds());
     assert.equal(readsSuspended(h.accessory), true, "a snapshot stamped in the command's own second leaves the command standing");
@@ -1101,6 +1084,7 @@ describe("HydrawiseController account-reported suspensions reaching their end", 
 
     // A standing command answers ahead of the facts, so the user's own suspend classifies the zone again and narrates it as a new suspension.
     await triggerSet(service.getCharacteristic(Characteristic.On), true);
+    await h.controller.commandsIdle;
 
     const entry = entryOf(h);
 
@@ -1110,6 +1094,7 @@ describe("HydrawiseController account-reported suspensions reaching their end", 
     assert.equal(logCount(h.entries, "info", "Suspended until"), 3, "and the new suspension is narrated beside the two the account reported");
 
     await triggerSet(service.getCharacteristic(Characteristic.On), false);
+    await h.controller.commandsIdle;
 
     assert.equal(entryOf(h)?.state, "unscheduled", "the user's resume returns the zone to what the wire reports");
     assert.equal(readsSuspended(h.accessory), false, "and the switch follows it off");
@@ -1145,7 +1130,6 @@ describe("HydrawiseController per-zone suspension hosting and sweeps", () => {
     const h = buildController({ hasV2Client: true, program: (recorder) => {
 
       recorder.programDefault("statusschedule.php", { body: schedule([alphaZone()]), kind: "response" });
-      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
     }, signalAborted: false, userOptions: [ SUSPEND_ZONE_ON, SUSPEND_ALL_ON ] });
 
     t.after(() => h.abort());
@@ -1175,6 +1159,7 @@ describe("HydrawiseController per-zone suspension hosting and sweeps", () => {
     const service = await waitFor(() => suspendSwitch(h.accessory), { description: "Alpha's suspension switch to appear" });
 
     await triggerSet(service.getCharacteristic(Characteristic.On), true);
+    await h.controller.commandsIdle;
 
     // The zone falls off the wire, which takes its switch with it - the sweep answers to the walk, not to what was published last time.
     await waitUntil(() => suspendSwitch(h.accessory) === undefined, { description: "Alpha's suspension switch to be removed" });

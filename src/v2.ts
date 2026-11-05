@@ -2,15 +2,13 @@
  *
  * v2.ts: Hydrawise v2 GraphQL API client.
  */
-import { HYDRAWISE_TRANSPORT_FAULT_SENTENCES, HYDRAWISE_V2_CLIENT_ID, HYDRAWISE_V2_CLIENT_SECRET, HYDRAWISE_V2_GRAPH_ENDPOINT,
-  HYDRAWISE_V2_MUTATION_ADMISSION_TIMEOUT, HYDRAWISE_V2_REFRESH_THRESHOLD, HYDRAWISE_V2_TIMEOUT, HYDRAWISE_V2_TOKEN_ENDPOINT,
-  PLUGIN_NAME } from "./settings.ts";
-import { HYDRAWISE_V2_MUTATION_OK, controllerV2Facts } from "./types.ts";
+import { HYDRAWISE_TRANSPORT_FAULT_SENTENCES, HYDRAWISE_V2_CLIENT_ID, HYDRAWISE_V2_CLIENT_SECRET, HYDRAWISE_V2_GRAPH_ENDPOINT, HYDRAWISE_V2_REFRESH_THRESHOLD,
+  HYDRAWISE_V2_TIMEOUT, HYDRAWISE_V2_TOKEN_ENDPOINT, PLUGIN_NAME } from "./settings.ts";
 import type { HomebridgePluginLogging, Nullable, RateBudget } from "homebridge-plugin-utils";
-import type { HydrawiseControllerV2Facts, HydrawiseV2Account, HydrawiseV2GraphResponse, HydrawiseV2MutationData, HydrawiseV2MutationResult,
-  HydrawiseV2TokenResponse, HydrawiseV2TokenState } from "./types.ts";
-import { classifyTransportError, composeSignals, createApiDispatcher, waitWithSignal } from "homebridge-plugin-utils";
+import type { HydrawiseControllerV2Facts, HydrawiseV2Account, HydrawiseV2GraphResponse, HydrawiseV2TokenResponse, HydrawiseV2TokenState } from "./types.ts";
+import { classifyTransportError, composeSignals, createApiDispatcher } from "homebridge-plugin-utils";
 import type { Dispatcher } from "undici";
+import { controllerV2Facts } from "./types.ts";
 import { request } from "undici";
 import util from "node:util";
 
@@ -35,30 +33,8 @@ const ACCOUNT_QUERY = "query { me { controllers { id name status { online } hard
 const READ_FAILURE_SENTENCE = "Unable to retrieve enhanced controller details";
 
 // The sentence a sign-in failure is reported under once it reaches classification as a thrown error; the response-shape failures acquireToken() checks directly
-// state their own sentences without drawing on this constant. A suspension command has no sentence of its own here: its failures travel back to the
-// controller, which is the layer that knows which zone the user just touched and speaks the one sentence naming it.
+// state their own sentences without drawing on this constant.
 const TOKEN_FAILURE_SENTENCE = "Unable to sign in to your Hydrawise account for enhanced features";
-
-/* The English abbreviations the mutation's date shape spells its weekday and month with, as fixed-stride tables. Reading a three-character slice is total by
- * construction, which is what a bounds-checked array read would not be.
- */
-const MUTATION_WEEKDAYS = "SunMonTueWedThuFriSat";
-
-const MUTATION_MONTHS = "JanFebMarAprMayJunJulAugSepOctNovDec";
-
-// The width of one entry in either table above, which is also the stride a weekday or month index is multiplied by.
-const MUTATION_ABBREVIATION_WIDTH = 3;
-
-/* The fixed timezone offset every suspension instant is rendered at, as the seconds an epoch instant is shifted by and as the label the wire string carries. The two
- * are spellings of one value and are stated together so they cannot drift apart.
- *
- * A FIXED offset rather than the host's own is what makes the rendering correct anywhere. The string carries its offset with it, so the account resolves the same
- * absolute instant from it whatever timezone either side sits in, and matching the account's zone would only make correctness depend on a fact this plugin cannot
- * see. A 2026-08-10 live probe recorded the account accepting exactly this shape.
- */
-const MUTATION_OFFSET_SECONDS = -5 * 60 * 60;
-
-const MUTATION_OFFSET_LABEL = "-0500";
 
 /* One transport failure, in the parts a caller needs in order to report it: the reason in the operator's own terms, and the punctuation that joins that reason
  * onto whatever sentence the caller states about what it was doing.
@@ -72,11 +48,10 @@ interface HydrawiseV2Failure {
   reason: string;
 }
 
-/* What the shared transport answers with: the data a successful call carried, or the failure a caller reports in its own voice.
+/* What the shared transport answers with: the data a successful call carried, or the failure its caller reports in its own voice.
  *
- * It is a discriminated union rather than a nullable value because each caller does different things with a failure. The read reports it under its own sentence,
- * while a command carries it back to the controller, which names the zone the user touched. Neither can do its job with a bare null, and a transport that logged on
- * their behalf is what made a failed command narrate itself twice - once in the transport's words and once in the controller's.
+ * It is a discriminated union rather than a nullable value because the caller reports a failure under its own sentence, which it cannot do with a bare null, and a
+ * transport that logged on the caller's behalf would narrate one failure twice - once in the transport's words and once in the caller's.
  *
  * The failure is itself nullable, for the cases that leave nothing to add: one already reported in its own words, such as a sign-in that failed, and one that
  * is simply teardown.
@@ -91,28 +66,26 @@ type HydrawiseV2TransportResult<T> =
  * running the same code in every context: a caller that supplies one owns what a re-arm answers with, and a caller that supplies none gets the keep-alive pool the
  * constructor builds.
  *
- * Each budget is likewise injected rather than built here, because pacing is an account-wide concern the platform owns. They arrive separately because the kinds
- * of traffic this client carries pace on ceilings of their own: `budget` is what a read and any token grant draw, and `mutationBudget` is what a per-zone
- * command's admission draws.
+ * The budget is likewise injected rather than built here, because pacing is an account-wide concern the platform owns. Every read and every token grant draw it.
  */
 export interface HydrawiseV2ClientOptions {
 
   budget: RateBudget;
   dispatcherFactory?: () => Dispatcher;
   log: HomebridgePluginLogging;
-  mutationBudget: RateBudget;
   password: string;
   signal: AbortSignal;
   username: string;
 }
 
-/* The Hydrawise v2 client: an OAuth2-authenticated GraphQL endpoint, kept separate from the v1 REST transport the platform owns.
+/* The Hydrawise v2 client: an OAuth2-authenticated GraphQL endpoint, kept separate from the v1 REST transport the platform owns. It is a read-only surface: every
+ * command the plugin sends goes through the v1 transport, and this client fetches the account facts the enhanced features show.
  *
  * A separate transport rather than another endpoint on the v1 path, because the two are unlike in every dimension a client cares about. They address different
  * hosts, authenticate differently (an account grant against an API key), and tolerate wildly different call rates. They also classify failure differently: this
- * transport checks a body-level errors array on every call it makes, mutations included, on top of the status code, where the v1 transport classifies uniformly
- * by status code alone and leaves any body-level failure field - the command endpoint's own message_type among them - for the caller to read for itself. One
- * shared path would mean one retry policy and one classification serving two contracts, which is how a change made for one silently breaks the other.
+ * transport checks a body-level errors array on every call it makes, on top of the status code, where the v1 transport classifies by status code and reads the
+ * command endpoint's own message_type for itself. One shared path would mean one retry policy and one classification serving two contracts, which is how a
+ * change made for one silently breaks the other.
  *
  * Everything here is optional at runtime. The platform builds this client only when the user has configured account credentials, so an install without them never
  * constructs it, never opens a connection, and never spends a call.
@@ -123,7 +96,6 @@ export class HydrawiseV2Client {
   private currentDispatcher: Dispatcher;
   private readonly dispatcherFactory: () => Dispatcher;
   private readonly log: HomebridgePluginLogging;
-  private readonly mutationBudget: RateBudget;
   private readonly password: string;
   private readonly signal: AbortSignal;
   private token: HydrawiseV2TokenState;
@@ -134,7 +106,6 @@ export class HydrawiseV2Client {
 
     this.budget = options.budget;
     this.log = options.log;
-    this.mutationBudget = options.mutationBudget;
     this.password = options.password;
     this.signal = options.signal;
     this.token = { state: "none" };
@@ -224,95 +195,6 @@ export class HydrawiseV2Client {
     return facts;
   }
 
-  /** Suspend a single zone until an absolute instant, or resume it, and answer what became of the command - the plugin's one WRITE against the account API.
-   *
-   * The shape is admission, then transport, and the split is the point. Everything that decides whether this command may be ATTEMPTED happens here, outside the
-   * transport method entirely, so a command the ceiling never admitted cannot be mistaken downstream for a request that reached the wire and failed. The admission
-   * steps share ONE window: a beat, composed with this client's own lifetime.
-   *
-   * Step one takes a slot on the COMMAND ceiling, with that window as its per-call signal. Commands pace on a ceiling of their own precisely so that a burst of them
-   * cannot be held up by the scheduled reads, and the bound is what handles the case that ceiling can still produce: the library's queue is first-in-first-out and
-   * blocking, so an unbounded wait would leave a command that lost a race for the last slot sitting behind the other commands for the length of that budget's own
-   * hour-wide window. Bounded, the loser answers within the beat, consumes no slot, and leaves every other waiter exactly where it stood.
-   *
-   * Step two waits for a usable token, and RACES the window rather than cancelling on it. The grant is shared - a scheduled read may be waiting on the very same
-   * promise - so threading this command's deadline into it would impose one caller's impatience on another's unbounded patience. Abandoning the race leaves the
-   * grant running untouched for everyone else, and a grant an abandoned admission started is kept rather than wasted: it primes the client for the next caller.
-   * Every outcome of that race has its own exit, so nothing falls through here to put a duplicate grant on the wire.
-   *
-   * A grant is shared infrastructure, so it draws the READ ceiling wherever it was triggered from, and that is what puts one corner of the command path outside the
-   * separation above: a command needing a token while the read ceiling is drained gives up inside its window even though its own ceiling had room. The reads renew
-   * the token perpetually at a cadence far inside its lifetime, so that corner is reachable in the seconds before the first read of a session completes, or once
-   * the refresh loop has stopped. Metering a grant on the ceiling it was not spent against would be the worse trade: one kind of traffic's meter would then be
-   * reading another's calls.
-   *
-   * @param options       - The command.
-   * @param options.until - The absolute instant, in epoch seconds, the suspension lifts, or null to resume the zone.
-   * @param options.zoneId - The zone to command, named by the id v1 and v2 agree about.
-   *
-   * @returns What became of the command: accepted, attempted and refused, or never admitted.
-   */
-  public async setZoneSuspension({ until, zoneId }: { until: Nullable<number>; zoneId: number }): Promise<HydrawiseV2MutationResult> {
-
-    const admission = composeSignals(AbortSignal.timeout(HYDRAWISE_V2_MUTATION_ADMISSION_TIMEOUT * 1000), this.signal);
-
-    try {
-
-      await this.mutationBudget.acquire({ signal: admission });
-    } catch {
-
-      /* A shutdown supersedes every other reading here, exactly as it does in the failure classification below: teardown is not a refusal, so it reports nothing.
-       * Only a genuine admission expiry is worth a line, and it is a debug one - what the user reads about their own command is the controller's business.
-       */
-      if(!this.signal.aborted) {
-
-        this.log.debug("The zone suspension command was not admitted: the command ceiling had no free slot inside the admission window.");
-      }
-
-      return { status: "rejected" };
-    }
-
-    let token: Nullable<string>;
-
-    try {
-
-      token = await waitWithSignal(this.ensureToken(), admission);
-    } catch {
-
-      // The window closed with the grant still in flight. It proceeds for whoever else is waiting on it, while this command gives up here rather than entering the
-      // transport, where its own token wait would be unbounded.
-      return { status: "rejected" };
-    }
-
-    // The grant itself failed inside the window. Entering the transport would run the token chokepoint again and spend a duplicate grant against an account that
-    // has just refused one, so the command answers here instead.
-    if(!token) {
-
-      return { reason: null, status: "failed" };
-    }
-
-    const result = await this.execute<HydrawiseV2MutationData>(this.suspensionMutation(zoneId, until));
-
-    /* A command's TRANSPORT failure travels back in the result rather than being logged here, exactly as its in-band refusal does. One command that did not take is
-     * one thing for the user to read about, and the controller is the layer that can name the zone they touched while saying it.
-     */
-    if(result.outcome === "failed") {
-
-      return { reason: result.failure?.reason ?? null, status: "failed" };
-    }
-
-    const answer = (until === null) ? result.data?.resumeZone : result.data?.suspendZone;
-
-    // A mutation reports its own refusal INSIDE a clean HTTP 200 that carries no errors array at all, so the status word is what decides, and whatever the account
-    // said about it travels back on the same field the transport reason does - one result shape, and one sentence at the far end of it.
-    if(answer?.status !== HYDRAWISE_V2_MUTATION_OK) {
-
-      return { reason: answer?.summary ?? null, status: "failed" };
-    }
-
-    return { status: "done" };
-  }
-
   /* Execute one GraphQL query and answer its data, or null on any failure. The ordering here is the contract: the rate budget is drawn FIRST, ahead of the token
    * chokepoint and ahead of the request, so a call the ceiling is not ready to admit waits rather than reaching the wire - the same shape the v1 transport uses.
    *
@@ -348,16 +230,15 @@ export class HydrawiseV2Client {
   }
 
   /* Present a token, post one GraphQL document, and classify what comes back - the transport every v2 call shares, and the whole of what a call does once it has
-   * been admitted. It draws NO budget of its own: pacing belongs to the caller, because a read and a command pace themselves on different terms, and a draw here
-   * would double-count whichever of them had already paid.
+   * been admitted. It draws NO budget of its own: pacing belongs to the caller, which has already drawn its slot, and a draw here would count that call twice.
    *
    * Failure classification reads BOTH halves of the answer. A non-2xx status is a failure, and so is an HTTP 200 whose body carries a GraphQL errors array: this
    * endpoint reports a failed query in the body under a success status, so trusting the status alone would hand a caller an absent data field as though it were an
    * answer.
    *
    * It LOGS nothing at all, and that absence is the contract. What comes back is the reason, never a line, because who speaks about a failure is the caller's
-   * business: the read says it under its own sentence, and a command hands the reason to the controller, which names the zone the user touched. A transport that
-   * reported on their behalf would leave a failed command narrated twice, in two voices, for one thing that went wrong.
+   * business: the read says it under its own sentence. A transport that reported on its behalf would leave one failure narrated twice, in two voices, for one
+   * thing that went wrong.
    */
   private async execute<T>(query: string): Promise<HydrawiseV2TransportResult<T>> {
 
@@ -406,39 +287,6 @@ export class HydrawiseV2Client {
     this.log.error(sentence + failure.joiner + " " + failure.reason);
   }
 
-  /* Compose the mutation document one suspension command sends. Both forms compose by concatenation, exactly as the account query above does: the only values
-   * interpolated are an integer and a string this class's own formatter produced, so no caller-supplied text ever reaches the document.
-   *
-   * A null instant composes the resume, which takes the zone alone. That is proven rather than assumed - a 2026-08-10 live probe suspended one zone, resumed it, and
-   * watched a sibling's standing suspension survive the cycle byte for byte.
-   */
-  private suspensionMutation(zoneId: number, until: Nullable<number>): string {
-
-    if(until === null) {
-
-      return "mutation { resumeZone(zoneId: " + zoneId.toString() + ") { status summary } }";
-    }
-
-    return "mutation { suspendZone(zoneId: " + zoneId.toString() + ", until: \"" + this.formatUntil(until) + "\") { status summary } }";
-  }
-
-  /* Render an absolute instant as the date string the suspension mutation's `until` argument takes: a two-digit year and an explicit offset, the shape the live
-   * probe recorded the account accepting.
-   *
-   * The instant is shifted by the fixed offset and then read in UTC, which is what makes the wall clock the string states the wall clock its offset claims. Reading
-   * the host's own components instead would render one machine's clock under another machine's offset.
-   */
-  private formatUntil(epochSeconds: number): string {
-
-    const when = new Date((epochSeconds + MUTATION_OFFSET_SECONDS) * 1000);
-    const abbreviation = (table: string, index: number): string => table.slice(index * MUTATION_ABBREVIATION_WIDTH, (index + 1) * MUTATION_ABBREVIATION_WIDTH);
-    const pad = (value: number): string => value.toString().padStart(2, "0");
-
-    return abbreviation(MUTATION_WEEKDAYS, when.getUTCDay()) + ", " + pad(when.getUTCDate()) + " " + abbreviation(MUTATION_MONTHS, when.getUTCMonth()) + " " +
-      pad(when.getUTCFullYear() % 100) + " " + pad(when.getUTCHours()) + ":" + pad(when.getUTCMinutes()) + ":" + pad(when.getUTCSeconds()) + " " +
-      MUTATION_OFFSET_LABEL;
-  }
-
   /* Acquire an access token, by renewal when a refresh token is in hand and by the account password grant otherwise. This is the only method that writes the token
    * state to anything but "refreshing", and it always writes exactly one terminal state: "valid" on success, "none" on failure.
    *
@@ -449,8 +297,7 @@ export class HydrawiseV2Client {
 
     try {
 
-      // A token grant draws the READ ceiling wherever it was triggered from, a command's admission included. It is one shared grant serving every caller, so the
-      // alternative would be metering it against whichever ceiling happened to ask for it first - one kind of traffic's meter reading another's calls.
+      // A token grant draws the read ceiling, the one ceiling this client paces on, so a grant and the read that needed it each cost a slot of it.
       await this.budget.acquire();
 
       const params = new URLSearchParams();

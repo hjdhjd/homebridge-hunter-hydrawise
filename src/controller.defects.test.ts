@@ -70,7 +70,6 @@ describe("HydrawiseController updateState defect assertions", () => {
       recorder.program("statusschedule.php", { body: schedule([scheduledZone()]), kind: "response" });
       recorder.program("statusschedule.php", { body: schedule([]), kind: "response" });
       recorder.programDefault("statusschedule.php", { body: schedule([runningZone()]), kind: "response" });
-      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
     }, signalAborted: false });
 
     t.after(() => h.abort());
@@ -82,6 +81,7 @@ describe("HydrawiseController updateState defect assertions", () => {
 
     assert.ok(firstValve, "the zone valve should exist after the first poll");
     await triggerSet(firstValve.getCharacteristic(Characteristic.Active), Characteristic.Active.ACTIVE);
+    await h.controller.commandsIdle;
 
     // Poll 2 drops the zone (valve pruned; the empty domain recomputes the program mode to no-program-scheduled), and the prune drops the zone's hint entry with
     // it. The default poll brings the zone back still running.
@@ -536,7 +536,6 @@ describe("HydrawiseController suspend switch with account facts", () => {
     const h = buildController({ hasV2Client: true, program: (recorder) => {
 
       recorder.programDefault("statusschedule.php", { body: fastPolling(allSuspended()), kind: "response" });
-      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
     }, signalAborted: false, userOptions: ["Enable.Device.Suspend.All.SN0A1B2C3D4"] });
 
     t.after(() => h.abort());
@@ -549,6 +548,7 @@ describe("HydrawiseController suspend switch with account facts", () => {
 
     // The user commands a suspend-all, which stamps the instant every later snapshot is judged against.
     await triggerSet(service.getCharacteristic(Characteristic.On), true);
+    await h.controller.commandsIdle;
 
     // A fetch that was already in flight when that command landed answers with facts that predate it, and so cannot know about it.
     h.controller.applyFacts({ facts: makeV2Facts({ zones: sentinelZoneMatrix.map(zone => [ zone.relay_id, makeZoneV2Facts() ]) }),

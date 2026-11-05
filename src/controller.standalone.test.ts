@@ -158,8 +158,8 @@ describe("HydrawiseController standalone zones", () => {
     assert.ok(valve, "the standalone valve should exist");
 
     // Program the command reply, then fire the handler the walk attached to the valve on its own accessory.
-    h.retrieve.programDefault("setzone.php", { body: { message: "Running zone", message_type: "info" }, kind: "response" });
     await triggerSet(valve.getCharacteristic(Characteristic.Active), Characteristic.Active.ACTIVE);
+    await h.controller.commandsIdle;
 
     assert.equal(h.accessory.getService(Service.IrrigationSystem)?.getCharacteristic(Characteristic.ProgramMode).value,
       Characteristic.ProgramMode.PROGRAM_SCHEDULED_MANUAL_MODE, "a manual run started from a standalone valve reaches the controller's program mode");
@@ -424,8 +424,8 @@ describe("HydrawiseController standalone zones", () => {
     assert.equal(restored.services.filter(service => service.UUID === Service.Valve.UUID).length, 1, "the restored valve is reused rather than duplicated");
     assert.ok(valve, "the restored valve should still be there");
 
-    h.retrieve.programDefault("setzone.php", { body: { message: "Running zone", message_type: "info" }, kind: "response" });
     await triggerSet(valve.getCharacteristic(Characteristic.Active), Characteristic.Active.ACTIVE);
+    await h.controller.commandsIdle;
 
     assert.equal(valve.getCharacteristic(Characteristic.InUse).value, Characteristic.InUse.IN_USE,
       "the first poll bound a handler to the restored valve, so firing it drives the zone");

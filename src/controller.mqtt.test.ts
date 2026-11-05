@@ -59,7 +59,6 @@ describe("HydrawiseController MQTT", () => {
     const h = buildController({ mqtt: true, program: (recorder) => {
 
       recorder.programDefault("statusschedule.php", { body: schedule([runningZone()]), kind: "response" });
-      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
     }, signalAborted: false });
 
     t.after(() => h.abort());
@@ -69,11 +68,12 @@ describe("HydrawiseController MQTT", () => {
 
     await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
     await mqtt.invokeSet("controller/set", "start 1 300");
+    await h.controller.commandsIdle;
 
-    const command = expectAt(h.retrieve.callsTo("setzone.php"), 0, "setzone call");
+    const command = expectAt(h.commands.params, 0, "setzone call");
 
-    assert.equal(command.params?.["action"], "run", "a start command should send the run action");
-    assert.equal(command.params["custom"], "300", "a start command should carry the requested duration");
+    assert.equal(command["action"], "run", "a start command should send the run action");
+    assert.equal(command["custom"], "300", "a start command should carry the requested duration");
   });
 
   test("the set handler stops a zone on a stop command", async (t) => {
@@ -81,7 +81,6 @@ describe("HydrawiseController MQTT", () => {
     const h = buildController({ mqtt: true, program: (recorder) => {
 
       recorder.programDefault("statusschedule.php", { body: schedule([runningZone()]), kind: "response" });
-      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
     }, signalAborted: false });
 
     t.after(() => h.abort());
@@ -91,10 +90,11 @@ describe("HydrawiseController MQTT", () => {
 
     await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
     await mqtt.invokeSet("controller/set", "stop 1");
+    await h.controller.commandsIdle;
 
-    const command = expectAt(h.retrieve.callsTo("setzone.php"), 0, "setzone call");
+    const command = expectAt(h.commands.params, 0, "setzone call");
 
-    assert.equal(command.params?.["action"], "stop", "a stop command should send the stop action");
+    assert.equal(command["action"], "stop", "a stop command should send the stop action");
   });
 
   test("a zero-duration start hits the guard and sends no wire command", async (t) => {
@@ -102,7 +102,6 @@ describe("HydrawiseController MQTT", () => {
     const h = buildController({ mqtt: true, program: (recorder) => {
 
       recorder.programDefault("statusschedule.php", { body: schedule([runningZone()]), kind: "response" });
-      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
     }, signalAborted: false });
 
     t.after(() => h.abort());
@@ -112,9 +111,11 @@ describe("HydrawiseController MQTT", () => {
 
     await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
     await mqtt.invokeSet("controller/set", "start 1 0");
+    await h.controller.commandsIdle;
 
-    // A run command with a non-positive duration returns null from sendCommand before it reaches the wire, so no setzone call is recorded.
-    assert.equal(h.retrieve.callsTo("setzone.php").length, 0, "a zero-duration start should send no setzone command");
+    // A run with a non-positive duration is declined before anything is queued, so no setzone call is recorded, and the set returns without a word.
+    assert.equal(h.commands.calls.length, 0, "a zero-duration start should send no setzone command");
+    assert.equal(h.entries.filter(line => line.level === "error").length, 0, "and nothing is reported as failing");
   });
 
   test("a start with no duration runs the zone for its own run value", async (t) => {
@@ -123,7 +124,6 @@ describe("HydrawiseController MQTT", () => {
     const h = buildController({ mqtt: true, program: (recorder) => {
 
       recorder.programDefault("statusschedule.php", { body: schedule([zone]), kind: "response" });
-      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
     }, signalAborted: false });
 
     t.after(() => h.abort());
@@ -133,11 +133,12 @@ describe("HydrawiseController MQTT", () => {
 
     await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
     await mqtt.invokeSet("controller/set", "start 1");
+    await h.controller.commandsIdle;
 
-    const command = expectAt(h.retrieve.callsTo("setzone.php"), 0, "setzone call");
+    const command = expectAt(h.commands.params, 0, "setzone call");
 
-    assert.equal(command.params?.["action"], "run", "a start with no duration should still send the run action");
-    assert.equal(command.params["custom"], zone.run.toString(), "and carry the zone's own run value as its duration");
+    assert.equal(command["action"], "run", "a start with no duration should still send the run action");
+    assert.equal(command["custom"], zone.run.toString(), "and carry the zone's own run value as its duration");
   });
 
   test("a start whose duration is not an integer is refused and sends no wire command", async (t) => {
@@ -145,7 +146,6 @@ describe("HydrawiseController MQTT", () => {
     const h = buildController({ mqtt: true, program: (recorder) => {
 
       recorder.programDefault("statusschedule.php", { body: schedule([runningZone()]), kind: "response" });
-      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
     }, signalAborted: false });
 
     t.after(() => h.abort());
@@ -157,7 +157,7 @@ describe("HydrawiseController MQTT", () => {
     await assert.rejects(() => mqtt.invokeSet("controller/set", "start 1 abc"), /^Error: MQTT: Invalid duration specified\.$/,
       "a duration that does not parse to an integer should throw");
 
-    assert.equal(h.retrieve.callsTo("setzone.php").length, 0, "and no setzone command should be sent");
+    assert.equal(h.commands.calls.length, 0, "and no setzone command should be sent");
   });
 
   test("a start with no duration on a zone with no scheduled run is refused and sends no wire command", async (t) => {
@@ -166,7 +166,6 @@ describe("HydrawiseController MQTT", () => {
 
       recorder.programDefault("statusschedule.php", { body: schedule([makeZone({ name: "Alpha", relay: 1, relay_id: 700001, run: 0,
         time: HYDRAWISE_UNSCHEDULED_SENTINEL, timestr: "" })]), kind: "response" });
-      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
     }, signalAborted: false });
 
     t.after(() => h.abort());
@@ -178,7 +177,7 @@ describe("HydrawiseController MQTT", () => {
     await assert.rejects(() => mqtt.invokeSet("controller/set", "start 1"), /^Error: MQTT: No duration given and the zone has no scheduled run\.$/,
       "a start with no duration has nothing to run for on a zone with no scheduled run");
 
-    assert.equal(h.retrieve.callsTo("setzone.php").length, 0, "and no setzone command should be sent");
+    assert.equal(h.commands.calls.length, 0, "and no setzone command should be sent");
   });
 
   test("the set handler throws on an unknown zone", async (t) => {
@@ -269,7 +268,6 @@ describe("HydrawiseController MQTT availability", () => {
     const h = buildController({ clock, mqtt: true, program: (recorder) => {
 
       recorder.program("statusschedule.php", { body: status, kind: "response" });
-      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
     }, signalAborted: false });
 
     t.after(() => h.abort());
@@ -285,7 +283,7 @@ describe("HydrawiseController MQTT availability", () => {
     await assert.rejects(() => mqtt.invokeSet("controller/set", "start 1 300"), /^Error: MQTT: The controller is not responding\.$/,
       "a command is refused while the controller is not responding");
 
-    assert.equal(h.retrieve.callsTo("setzone.php").length, 0, "and no setzone command is sent");
+    assert.equal(h.commands.calls.length, 0, "and no setzone command is sent");
   });
 
   test("a new broker session restates the current word, retained", async (t) => {

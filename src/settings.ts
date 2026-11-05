@@ -54,8 +54,14 @@ export const HYDRAWISE_COMMAND_BUDGET_CALLS = 3;
 // The trailing window, in seconds, the zone-command ceiling above is measured over.
 export const HYDRAWISE_COMMAND_BUDGET_WINDOW = 30;
 
+/* How many times a command Hydrawise did not answer in time is sent before the plugin stops waiting for it. An unanswered command may or may not have taken, and
+ * sending it again is how to find out, so a command that times out is resent for as long as it is still the user's latest choice for its control, up to this
+ * many sends in all. Every send draws the command ceiling above, so the count is kept small enough that one unanswered command cannot hold the ceiling for long.
+ */
+export const HYDRAWISE_COMMAND_ATTEMPTS = 3;
+
 // The one Hydrawise endpoint that carries a zone command, and therefore the one that draws against the stricter command ceiling as well as the account-wide one.
-// The platform's draw branch and the controller's command dispatch both read this constant, so the endpoint identity has a single home.
+// The platform's draw branch and its command path both read this constant, so the endpoint identity has a single home.
 export const HYDRAWISE_COMMAND_ENDPOINT: HydrawiseEndpoint = "setzone.php";
 
 // The base URL every key-based API request is assembled on. The platform derives its connection pool's origin from this one constant, so the host a request goes to
@@ -113,33 +119,6 @@ export const HYDRAWISE_V2_BUDGET_CALLS = 5;
 // The trailing window, in seconds, the v2 call ceiling above is measured over.
 export const HYDRAWISE_V2_BUDGET_WINDOW = 1800;
 
-/* The v2 COMMAND ceiling, as a COUNT OF CALLS inside the trailing window below. It paces the per-zone suspension commands, where the ceiling above paces the
- * scheduled reads and the token grants they carry. Each kind of traffic draws its own because they are unlike: a command is an event-shaped user action, someone
- * standing at a switch waiting for it to take, while the reads are a recurring cadence that runs whether anybody is watching or not. Separately, a burst of switch
- * flips neither starves the scheduled reads nor is starved by them.
- *
- * The value is deliberately observational, on the same terms the read ceiling is: generous enough that ordinary use never meets it, small enough that a runaway
- * automation cannot hammer a throttle Hydrawise does not publish. It is also the whole of the policy - what a burst of commands may spend is this constant and
- * nothing else.
- *
- * The arithmetic is worth stating plainly, because independent ceilings do add up: an hour in which commands and reads both run to their limits admits more v2
- * calls than the read ceiling alone ever could. That is the deliberate price of giving a user action headroom of its own, and the read ceiling's own conservatism
- * is untouched by it.
- */
-export const HYDRAWISE_V2_MUTATION_BUDGET_CALLS = 10;
-
-// The trailing window, in seconds, the v2 command ceiling above is measured over.
-export const HYDRAWISE_V2_MUTATION_BUDGET_WINDOW = 3600;
-
-/* How long, in seconds, a per-zone suspension command waits for the command ceiling to admit it before it gives up.
- *
- * A command is a person standing at their phone watching a switch, so it is bounded by a beat rather than by the budget's own window: that window is an hour wide,
- * and a command that queued for it would take effect long after the user had walked away. Giving up inside a second turns contention into a switch that flicks back
- * carrying a reason, which is the answer the user can act on. An abandoned wait consumes no slot and leaves every other waiter in place, so bounding a command this
- * tightly costs the scheduled reads nothing.
- */
-export const HYDRAWISE_V2_MUTATION_ADMISSION_TIMEOUT = 1;
-
 /* The v2 response timeout, in seconds. It is deliberately more generous than the v1 timeout: a v2 call can carry an OAuth round trip ahead of the query itself, and
  * the graph endpoint answers a whole account in one response where a v1 call answers one controller, so the same budget would cut off requests that were simply
  * doing more work.
@@ -167,9 +146,10 @@ export const HYDRAWISE_V2_FACTS_TTL = HYDRAWISE_V2_REFRESH_INTERVAL * 2;
 // Time until the next zone valve runtime, in seconds, that we should use to indicate that a zone should be marked as active.
 export const HYDRAWISE_ACTIVE_ZONE_INDICATOR = 3600;
 
-/* The beat, in MILLISECONDS - unlike this file's other durations, which are stated in seconds - between a command the Hydrawise API refused and the HomeKit
- * characteristic write that puts the optimistic state back. Every revert site schedules against this one constant, so the pause a user sees when a command fails
- * is the same wherever it failed.
+/* The beat, in MILLISECONDS - unlike this file's other durations, which are stated in seconds - between a HomeKit write the plugin does not keep, a command that
+ * did not take among them, and the characteristic write that puts back what the control reads. HAP stores a write only once its set handler has returned, so a
+ * write made before then would be overwritten by the very value it was answering. Every revert site schedules against this one constant, so the pause a user sees
+ * when a command fails is the same wherever it failed.
  */
 export const HYDRAWISE_REVERT_DELAY = 50;
 

@@ -4,20 +4,22 @@
  */
 import type { API, CharacteristicValue, HAP, Service } from "homebridge";
 import { HAP_DEFAULT_MODEL, HAP_DURATION_CEILING, HOMEBRIDGE_UNKNOWN_FIRMWARE, HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER,
-  HYDRAWISE_API_NEXTPOLL_MAX, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_COMMAND_ENDPOINT, HYDRAWISE_POLL_LOSS_THRESHOLD, HYDRAWISE_REVERT_DELAY,
+  HYDRAWISE_API_NEXTPOLL_MAX, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_COMMAND_ATTEMPTS, HYDRAWISE_POLL_LOSS_THRESHOLD, HYDRAWISE_REVERT_DELAY,
   HYDRAWISE_SUSPEND_DURATION, HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
 import { HYDRAWISE_UNSCHEDULED_SENTINEL, HydrawiseReservedNames, controllerDisplayName, controllerIdentity, isControllerIdentity, isFirmwareVersion,
   isScheduleStatus, isSuspendZoneSubtype, isZoneIdentity, isZoneStoppedBySensor, sameControllerIdentity, sameScheduleStatus, sameZoneIdentity, scheduleStatus,
   suspendZoneSubtype, zoneDisplayName, zoneIdentity, zoneScheduleStatus } from "./types.ts";
 import type { HomebridgePluginLogging, MqttAvailabilityPayload, Nullable, RepeatDemotedLog } from "homebridge-plugin-utils";
-import type { HydrawiseAccessory, HydrawiseComposedName, HydrawiseControllerAccessory, HydrawiseControllerConfig, HydrawiseControllerHardware,
-  HydrawiseControllerIdentity, HydrawiseControllerV2Facts, HydrawiseScheduleStatus, HydrawiseZoneConfig, HydrawiseZoneIdentity, HydrawiseZoneScheduleStatus,
-  HydrawiseZoneSuspensionResult, SetZoneResponse, StatusScheduleResponse } from "./types.ts";
+import type { HydrawiseAccessory, HydrawiseCommandOutcome, HydrawiseComposedName, HydrawiseControllerAccessory, HydrawiseControllerConfig,
+  HydrawiseControllerHardware, HydrawiseControllerIdentity, HydrawiseControllerV2Facts, HydrawiseScheduleStatus, HydrawiseZoneConfig, HydrawiseZoneIdentity,
+  HydrawiseZoneScheduleStatus, StatusScheduleResponse } from "./types.ts";
+import type { HydrawiseCommandIntent, HydrawiseCommandRecord, HydrawiseCommandTarget, HydrawiseCommandValue, HydrawisePreparedCommand,
+  HydrawiseUnconfirmedCommand } from "./commands.ts";
 import type { HydrawiseControllerOption, HydrawiseControllerValueOption, HydrawiseZoneOption, HydrawiseZoneValueOption } from "./options.ts";
 import { MQTT_AVAILABILITY_OFFLINE, MQTT_AVAILABILITY_ONLINE, acquireService, formatErrorMessage, getServiceName, loopFaultReporter, mqttTopic, notResponding,
   ownedName, prefixedLog, presenceChanged, repeatDemotedLog, retry, sameEntries, setAccessoryName, setServiceName, superviseLoop, validCharacteristic,
   validService, watchServiceName } from "homebridge-plugin-utils";
-import type { Dispatcher } from "undici";
+import { HydrawiseCommandQueue } from "./commands.ts";
 import type { HydrawisePlatform } from "./platform.ts";
 import { mqttTopics } from "./mqtt.ts";
 import util from "node:util";
@@ -198,17 +200,8 @@ interface HydrawiseControllerFactsSnapshot extends HydrawiseControllerV2Facts {
   fetchedAt: number;
 }
 
-/* One per-zone suspension command the account accepted, as the display needs it: the instant it was accepted, and WHICH WAY it went - the instant a suspension
- * lifts, or null for a resume.
- *
- * The direction is what a bare timestamp could not carry. A stamp alone says that the user commanded something, which is enough to know that an older snapshot is
- * uninformed, but not enough to know what to show in its place.
- */
-interface HydrawiseZoneSuspendCommand {
-
-  at: number;
-  commandedUntil: Nullable<number>;
-}
+// The account-wide suspend switch's command target, which carries nothing beyond its kind, so one value serves every reference to it.
+const SUSPEND_ALL_TARGET: HydrawiseCommandTarget = { kind: "suspend-all" };
 
 /* One Hydrawise irrigation controller as HomeKit sees it: the accessory or accessories this class projects onto, the endless polling loop that keeps their
  * characteristics current, and the commands a user's actions in the Home app turn into wire requests.
@@ -218,9 +211,9 @@ interface HydrawiseZoneSuspendCommand {
  * characteristics, and accessory context from it. The same class also owns a standalone zone accessory's valve, when the plugin is configured to promote one,
  * so a zone's state is projected consistently regardless of which accessory hosts it.
  *
- * Every command HomeKit issues - a zone run or stop, an account-wide suspend-all, a per-zone suspension - is sent from here through sendCommand(), and the
- * confirmed result is folded back into the same projection a poll would update, so a change made in the Home app and one made in the Hydrawise app converge on
- * the same displayed state.
+ * Every command a user issues - a zone run or stop from HomeKit or MQTT, an account-wide suspend-all, a per-zone suspension - goes through this controller's one
+ * command queue, which answers the control at once and sends the user's latest choice for it when its turn comes. What Hydrawise confirms is folded back into the
+ * same projection a poll would update, so a change made in the Home app and one made in the Hydrawise app converge on the same displayed state.
  */
 export class HydrawiseController {
 
@@ -245,6 +238,15 @@ export class HydrawiseController {
   // transition and restates the word.
   private contact: HydrawiseContact = "pending";
   public readonly controller: HydrawiseControllerConfig;
+
+  /* The one queue every command this controller sends goes through, and the one home for what those commands leave behind: each control's pending request, and
+   * the suspensions Hydrawise confirmed at both grains, the account-wide one and each zone's, which no fresher truth has yet superseded. A confirmed suspension
+   * carries WHICH WAY it went, because a bare timestamp would say that the user commanded something without saying what to show in place of a stale snapshot.
+   *
+   * It lives in memory and dies with the process by design. After a restart the projection's own carried suspensions own the display, which is the truth the
+   * account confirmed rather than one this process remembered commanding.
+   */
+  private readonly commands: HydrawiseCommandQueue;
 
   // This controller's MQTT topic tail, composed once from its serial and the catalog's tail, because neither changes for the life of the controller.
   private readonly controllerTopic: string;
@@ -278,15 +280,6 @@ export class HydrawiseController {
    */
   private nameWatches = new DisposableStack();
 
-  /* The account-wide suspension command this controller last issued and no fresher truth has superseded, or undefined where none stands. It is the account-grain
-   * twin of the per-zone map below, carrying the same shape for the same reason: a bare timestamp would say that the user commanded something without saying
-   * WHICH WAY, which is enough to know a stale snapshot is uninformed but not enough to know what to show instead.
-   *
-   * Undefined rather than null for "none", so the one standing judgment both grains ask can take them on identical terms - a map read answers undefined for a
-   * zone with no command, and this answers undefined for an account with none.
-   */
-  private suspendAllCommand: HydrawiseZoneSuspendCommand | undefined;
-
   public readonly log: HomebridgePluginLogging;
   private readonly platform: HydrawisePlatform;
 
@@ -316,14 +309,6 @@ export class HydrawiseController {
    * definitionally current, since hosting changes only when a walk changes it.
    */
   private readonly zoneHosts = new Map<number, HydrawiseAccessory>();
-
-  /* The per-zone suspension commands the account has accepted and no fresher truth has yet superseded, keyed by relay id. It is the zone-grain twin of the scalar
-   * stamp above, and the two live side by side because they answer different questions: one guards the account-wide switch, the other guards a single zone's.
-   *
-   * It dies with the process by design. After a restart the projection's own carried suspensions own the display, which is the truth the account confirmed rather
-   * than one this process remembered commanding.
-   */
-  private readonly zoneSuspendCommands = new Map<number, HydrawiseZoneSuspendCommand>();
 
   // The constructor initializes key variables and calls configureDevice(). The platform passes the denormalized account roster - every account controller's identity,
   // enabled or not - so this controller can seed it into its own accessory context, giving any one accessory knowledge of all its siblings.
@@ -355,6 +340,12 @@ export class HydrawiseController {
 
     // The status log is built over the prefixed logger, so a demoted repeat carries the controller's name and meets the user's debug setting as every debug line does.
     this.statusFailures = repeatDemotedLog<HydrawiseStatusFailure>(this.log);
+
+    // The command queue is built over the prefixed logger too, so a fault it contains names the controller it happened on.
+    this.commands = new HydrawiseCommandQueue({ handlers: { available: (target, intent): boolean => this.commandAvailable(target, intent),
+      prepare: (target, intent): HydrawisePreparedCommand => this.prepareCommand(target, intent), read: (target): HydrawiseCommandValue => this.readControl(target),
+      render: (target): void => this.renderControl(target), unconfirmed: (target, intent, outcome): void => this.reportUnconfirmed(target, intent, outcome) },
+    log: this.log, name: this.controller.controller_id.toString(), signal: platform.signal, timers: platform.timers });
 
     this.configureDevice(roster);
   }
@@ -446,8 +437,8 @@ export class HydrawiseController {
     this.platform.featureOptions.logFeature({ controller: { id: this.controller.serial_number, log: this.log }, label: "Name synchronization", log: this.platform.log,
       option: "Device.SyncName" });
 
-    // Surface the per-zone suspension switches on the same terms, and only where the account credentials that can command a suspension are configured: without them
-    // these switches are never created, so naming them would advertise a feature this install does not have.
+    // Surface the per-zone suspension switches on the same terms, and only where the account credentials the switches read their zones from are configured: without
+    // them these switches are never created, so naming them would advertise a feature this install does not have.
     if(this.platform.hasV2Client) {
 
       this.platform.featureOptions.logFeature({ controller: { id: this.controller.serial_number, log: this.log }, label: "Per-zone suspension switches",
@@ -813,22 +804,15 @@ export class HydrawiseController {
   /* Drop every per-zone suspension command this pass supersedes, so that what remains is exactly the set that still speaks for its zone.
    *
    * A command retires when facts postdate it, which is the freshness rule's other face, or when its zone leaves the wire report, which leaves nothing for the
-   * command to speak for.
+   * command to speak for. A zone that leaves the wire takes every request still pending for it along too, its valve's and its switch's, since no control is left
+   * for them to be sent on behalf of.
    *
    * This runs at the head of a pass rather than beside any one consumer, because the surviving set is what the classifier is handed: a stale entry reaching
    * composition would resurrect a command the account has already answered, and it would do so in the persisted projection where every surface would read it.
    */
   private retireSupersededCommands(facts: Nullable<HydrawiseControllerFactsSnapshot>): void {
 
-    const reported = new Set(this.status.relays.map(zone => zone.relay_id));
-
-    for(const [ relayId, command ] of this.zoneSuspendCommands) {
-
-      if(!this.commandStands(command, facts) || !reported.has(relayId)) {
-
-        this.zoneSuspendCommands.delete(relayId);
-      }
-    }
+    this.commands.sweep({ reported: new Set(this.status.relays.map(zone => zone.relay_id)), stands: (record): boolean => this.commandStands(record, facts) });
   }
 
   /* Show every companion switch what its zone now reads as.
@@ -839,12 +823,14 @@ export class HydrawiseController {
    */
   private refreshZoneSuspendSwitches(facts: Nullable<HydrawiseControllerFactsSnapshot>): void {
 
-    for(const entry of this.accessory.context.schedule?.zones ?? []) {
+    const classified = new Map((this.accessory.context.schedule?.zones ?? []).map(entry => [ entry.relayId, entry ]));
+
+    for(const zone of this.status.relays) {
 
       // The switch speaks its own name's language: On means SUSPENDED, matching the account-wide suspend switch's convention. A zone's active state already lives
       // on its valve, so a switch that read the other way would put two answers to one question in front of the user.
-      this.zoneHosts.get(entry.relayId)?.getServiceById(this.hap.Service.Switch, suspendZoneSubtype(entry.relayId))
-        ?.updateCharacteristic(this.hap.Characteristic.On, this.isZoneSuspended(entry.relayId, entry, facts));
+      this.zoneHosts.get(zone.relay_id)?.getServiceById(this.hap.Service.Switch, suspendZoneSubtype(zone.relay_id))
+        ?.updateCharacteristic(this.hap.Characteristic.On, this.isZoneSuspended(zone, classified.get(zone.relay_id), facts));
     }
   }
 
@@ -1029,23 +1015,31 @@ export class HydrawiseController {
    * A null snapshot KEEPS a standing command standing. None ever arrived, the last one aged out, or the refresh has stalled: in every case nothing newer has
    * contradicted the user, so their own command is the honest thing to display until facts that postdate it land.
    */
-  private commandStands(command: HydrawiseZoneSuspendCommand | undefined, facts: Nullable<HydrawiseControllerFactsSnapshot>):
-    command is HydrawiseZoneSuspendCommand {
+  private commandStands(command: HydrawiseCommandRecord | undefined, facts: Nullable<HydrawiseControllerFactsSnapshot>): command is HydrawiseCommandRecord {
 
     return (command !== undefined) && (!facts || (facts.fetchedAt <= command.at));
   }
 
-  /* Whether a zone reads as suspended right now. A standing command answers first and the classified projection answers otherwise, so the switch and the zone
-   * list are one reading rather than two derivations that can drift.
+  /* Whether a zone reads as suspended right now. The user's own request still waiting to be settled answers first, so the switch holds their choice whatever a
+   * poll or a refresh lands meanwhile, a standing command answers next, and the classified projection answers otherwise, so the switch and the zone list are one
+   * reading rather than two derivations that can drift.
    *
    * The command arm is asked DIRECTLY rather than read off the composition, and the running window is why it cannot be collapsed into it. A zone suspended while
    * it is watering keeps its switch on - the user's command was accepted - while the projection honestly reads running until the water stops, because flowing
    * water is the one thing no command overrules. Those are two different questions, and both are answered from the one standing judgment above rather than from
    * two sources that could drift.
    */
-  private isZoneSuspended(relayId: number, state: HydrawiseZoneScheduleStatus | undefined, facts: Nullable<HydrawiseControllerFactsSnapshot>): boolean {
+  private isZoneSuspended(zone: HydrawiseZoneConfig, state: HydrawiseZoneScheduleStatus | undefined, facts: Nullable<HydrawiseControllerFactsSnapshot>): boolean {
 
-    const command = this.zoneSuspendCommands.get(relayId);
+    const target: HydrawiseCommandTarget = { kind: "zone-suspend", zone };
+    const pending = this.commands.pending(target);
+
+    if(pending) {
+
+      return pending.on;
+    }
+
+    const command = this.commands.record(target);
 
     if(this.commandStands(command, facts)) {
 
@@ -1093,8 +1087,9 @@ export class HydrawiseController {
     // Return our irrigation controller state.
     this.platform.mqtt?.subscribeGet(this.controllerTopic, mqttTopics.controller.label, (): string => this.statusJson(this.currentFacts));
 
-    // Set the state of a given irrigation zone.
-    this.platform.mqtt?.subscribeSet(this.controllerTopic, mqttTopics.controller.label, async (value: string): Promise<void> => {
+    // Set the state of a given irrigation zone. The command goes through the controller's queue on the same terms a tap on the zone's valve does, so the handler
+    // returns as soon as the command is queued, and only a set it cannot read throws.
+    this.platform.mqtt?.subscribeSet(this.controllerTopic, mqttTopics.controller.label, (value: string): void => {
 
       // A controller that is not responding takes no command, on the same terms its HomeKit handlers refuse one. We throw so the library logs the refusal, before
       // the command is even parsed.
@@ -1132,7 +1127,7 @@ export class HydrawiseController {
               throw new Error("MQTT: No duration given and the zone has no scheduled run.");
             }
 
-            await this.sendCommand(zone, "run", zone.run);
+            this.commandValve({ duration: zone.run, on: true, origin: "mqtt", zone });
 
             return;
           }
@@ -1144,14 +1139,14 @@ export class HydrawiseController {
             throw new Error("MQTT: Invalid duration specified.");
           }
 
-          await this.sendCommand(zone, "run", parsed);
+          this.commandValve({ duration: parsed, on: true, origin: "mqtt", zone });
 
           return;
         }
 
         case "stop":
 
-          await this.sendCommand(zone, "stop");
+          this.commandValve({ on: false, origin: "mqtt", zone });
 
           return;
 
@@ -1251,72 +1246,15 @@ export class HydrawiseController {
       return;
     }
 
-    // Suspend or resume the irrigation schedule. Its handlers go through the controller's Not Responding rule, so a suspend-all is never sent, and never read
-    // back, while the controller cannot be reached.
+    /* Suspend or resume the irrigation schedule. Its handlers go through the controller's Not Responding rule, so a suspend-all is never queued, and never read
+     * back, while the controller cannot be reached. A write queues the user's choice and returns at once, and the switch reads that choice back for as long as it
+     * waits to be settled.
+     */
     service.getCharacteristic(this.hap.Characteristic.On).onGet(this.answering(() => this.isAllSuspended(this.currentFacts)));
 
-    service.getCharacteristic(this.hap.Characteristic.On).onSet(this.answering(async (value: CharacteristicValue): Promise<void> => {
+    service.getCharacteristic(this.hap.Characteristic.On).onSet(this.answering((value: CharacteristicValue): void => {
 
-      // We either set the timestamp to the current time, to resume irrigation, or to a year from now to suspend irrigation. Both floor to a whole second so the
-      // command carries the integer seconds the API expects rather than a fractional millisecond remainder. The instant is sent to Hydrawise, which reads it as
-      // wall-clock time, so it comes from the host's own clock rather than the platform's.
-      const timestamp = Math.floor(Date.now() / 1000) + (value ? HYDRAWISE_SUSPEND_DURATION : 0);
-
-      const response = await this.sendCommand("suspendall", timestamp);
-
-      let status;
-
-      try {
-
-        status = await response?.body.json() as SetZoneResponse;
-      } catch {
-
-        // A shutdown abort mid-read is orderly teardown, not a failure - exit the whole handler quietly, skipping both the error log and the revert timer.
-        if(this.platform.signal.aborted) {
-
-          return;
-        }
-
-        this.log.error("Unable to retrieve the result of the %s request.", value ? "suspend" : "resume");
-      }
-
-      if(status?.message_type === "error") {
-
-        this.log.error("Unable to complete the %s request.", value ? "suspend" : "resume");
-      }
-
-      if(!status || (status.message_type === "error")) {
-
-        // Put the switch back where it was after a brief beat. The write is scheduled through the platform's registry, which ties it to the plugin's lifetime: a
-        // revert still pending when Homebridge shuts down drains with the registry, and one scheduled after shutdown never fires.
-        this.platform.timers.schedule(() => service.updateCharacteristic(this.hap.Characteristic.On, !value), HYDRAWISE_REVERT_DELAY);
-
-        return;
-      }
-
-      /* Record this command with the instant it succeeded and the direction it went. A facts snapshot fetched before it cannot know about it, so every reader
-       * ignores such a snapshot in this command's favor until a refresh that postdates it lands - which is what stops a fetch already in flight when the user
-       * pressed the switch from flipping it straight back. A resume records too, for the same reason in the other direction.
-       */
-      const at = Math.floor(this.platform.clock.now() / 1000);
-
-      this.suspendAllCommand = { at, commandedUntil: value ? timestamp : null };
-
-      /* An account-wide command is also a fact about every zone beneath it, so it stamps each one's own guard with the direction it went. The population is every
-       * zone the WIRE has reported rather than the enabled projection, which is empty until the first poll completes and which silently omits any zone a feature
-       * option has turned off; without this, the next refresh's pre-command facts would fight the account-wide switch's optimistic state zone by zone. A command
-       * issued before any poll at all stamps nothing, and the scalar above carries the account-wide answer alone until the first poll seeds the walk.
-       */
-      for(const zone of this.status.relays) {
-
-        this.zoneSuspendCommands.set(zone.relay_id, { at, commandedUntil: value ? timestamp : null });
-      }
-
-      this.log.info("%s scheduled watering for all zones.", value ? "Suspending" : "Resuming");
-
-      // Re-derive on the account-wide command's own terms, exactly as a per-zone command does. It runs after the sentence above so the account-wide statement
-      // reads ahead of the per-zone transitions the re-derive narrates beneath it.
-      this.rederiveProjection();
+      this.commands.enqueue(SUSPEND_ALL_TARGET, { on: Boolean(value), origin: "homekit" });
     }));
 
     service.updateCharacteristic(this.hap.Characteristic.On, this.isAllSuspended(this.currentFacts));
@@ -1667,68 +1605,17 @@ export class HydrawiseController {
           valveService.getCharacteristic(this.hap.Characteristic.Active).onGet(answering(() => valveService.getCharacteristic(this.hap.Characteristic.Active).value));
         }
 
-        // Manually control the zone valve.
-        valveService.getCharacteristic(this.hap.Characteristic.Active).onSet(answering(async (value: CharacteristicValue): Promise<void> => {
+        // Manually control the zone valve. A write queues the run or the stop and returns at once, and the run carries the duration the valve shows right now.
+        valveService.getCharacteristic(this.hap.Characteristic.Active).onSet(answering((value: CharacteristicValue): void => {
 
-          const setOn = value === this.hap.Characteristic.Active.ACTIVE;
-          const duration = Number(valveService.getCharacteristic(this.hap.Characteristic.SetDuration).value ?? 0);
-          let response;
+          if(value !== this.hap.Characteristic.Active.ACTIVE) {
 
-          // Request the change in zone state.
-          if(setOn) {
-
-            response = await this.sendCommand(zone, "run", duration);
-          } else {
-
-            response = await this.sendCommand(zone, "stop");
-          }
-
-          // Something went wrong in communicating with the Hydrawise API.
-          if(!response) {
-
-            // Revert our state for this zone. The write is scheduled through the platform's registry, which ties it to the plugin's lifetime: a revert still
-            // pending when Homebridge shuts down drains with the registry, and one scheduled after shutdown never fires.
-            this.platform.timers.schedule(() => valveService.updateCharacteristic(this.hap.Characteristic.Active,
-              setOn ? this.hap.Characteristic.Active.INACTIVE : this.hap.Characteristic.Active.ACTIVE), HYDRAWISE_REVERT_DELAY);
+            this.commandValve({ on: false, origin: "homekit", zone });
 
             return;
           }
 
-          // Update our valve state accordingly.
-          if(setOn) {
-
-            valveService.updateCharacteristic(this.hap.Characteristic.InUse, this.hap.Characteristic.InUse.IN_USE);
-            valveService.updateCharacteristic(this.hap.Characteristic.RemainingDuration, duration);
-            irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.ProgramMode, this.hap.Characteristic.ProgramMode.PROGRAM_SCHEDULED_MANUAL_MODE);
-            irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.InUse, this.hap.Characteristic.InUse.IN_USE);
-
-            // Mark this zone as manually activated. The ledger is addressed by relay id at invocation time rather than through an entry captured when this
-            // handler was registered, so it always acts on the current entry, and a zone with no entry is the no-op the ledger states.
-            this.zoneHints.markManual(zone.relay_id);
-          } else {
-
-            valveService.updateCharacteristic(this.hap.Characteristic.RemainingDuration, 0);
-            valveService.updateCharacteristic(this.hap.Characteristic.InUse, this.hap.Characteristic.InUse.NOT_IN_USE);
-
-            // Clear out the manual activation for this zone, addressed by relay id at invocation time for the same reason the mark above is.
-            this.zoneHints.clearManual(zone.relay_id);
-
-            // No more manually activated zones among the enabled set, we can resume our schedule. We consult the instance state at invocation time so this
-            // handler always acts on the current poll's enabled zones.
-            if(!this.enabledZones.some(x => this.zoneHints.get(x.relay_id)?.isManual)) {
-
-              irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.ProgramMode, this.hap.Characteristic.ProgramMode.PROGRAM_SCHEDULED);
-            }
-
-            // If this was the only enabled zone currently running on the irrigation controller, let's set the system state to no longer in use.
-            if(!this.enabledZones.some(x => (x.time === 1) && (x.relay_id !== zone.relay_id))) {
-
-              irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.InUse, this.hap.Characteristic.InUse.NOT_IN_USE);
-            }
-          }
-
-          this.log.info("%s: Manually %s%s.", this.zoneLabel(zone, valveService), setOn ? "started" : "stopped",
-            setOn ? " (duration: " + this.getMinutes(duration) + ")" : "");
+          this.commandValve({ duration: Number(valveService.getCharacteristic(this.hap.Characteristic.SetDuration).value ?? 0), on: true, origin: "homekit", zone });
         }));
 
         this.bound.add(valveService);
@@ -1759,8 +1646,9 @@ export class HydrawiseController {
         valveService.updateCharacteristic(this.hap.Characteristic.SetDuration, Math.min(duration, HAP_DURATION_CEILING));
       }
 
-      // Active represents whether the zone is ready to be activated - meaning it's queued to turn on imminently or is currently on.
-      if((zone.time > 0) && (zone.time <= HYDRAWISE_ACTIVE_ZONE_INDICATOR)) {
+      // Active represents whether the zone is ready to be activated - meaning it's queued to turn on imminently or is currently on - unless the user's own run or
+      // stop for it is still waiting to be settled, which the valve shows instead.
+      if(this.isValveActive(zone)) {
 
         valveService.updateCharacteristic(this.hap.Characteristic.Active, this.hap.Characteristic.Active.ACTIVE);
         this.log.debug("Setting %s as active.", this.zoneLabel(zone, valveService));
@@ -1843,8 +1731,9 @@ export class HydrawiseController {
 
   /* Establish, name, and bind one zone's companion suspension switch on whichever accessory now hosts that zone.
    *
-   * The switch exists only where the account credentials do, because the key-based API has no per-zone suspend to offer: its one suspend command carries no zone
-   * parameter at all and acts on the whole controller, so a switch built on it would render and resolve while doing something else entirely.
+   * The switch exists only where the account credentials do, because only the account API can say what it shows. Its command goes through the key-based API like
+   * every other, but on that wire a suspended zone is byte for byte a zone with nothing scheduled, so without the account's facts a switch could suspend its zone
+   * and never show it suspended, nor ever learn that the suspension ended.
    *
    * @param options               - This zone's pass.
    * @param options.effectiveName - The zone's effective display name, always one HomeKit can carry, which a new switch's name is composed from.
@@ -1902,11 +1791,11 @@ export class HydrawiseController {
      */
     if(!this.bound.has(service)) {
 
-      service.updateCharacteristic(this.hap.Characteristic.On, this.isZoneSuspended(zone.relay_id, state, facts));
+      service.updateCharacteristic(this.hap.Characteristic.On, this.isZoneSuspended(zone, state, facts));
 
-      service.getCharacteristic(this.hap.Characteristic.On).onSet(this.answeringFor(host)(async (value: CharacteristicValue): Promise<void> => {
+      service.getCharacteristic(this.hap.Characteristic.On).onSet(this.answeringFor(host)((value: CharacteristicValue): void => {
 
-        await this.commandZoneSuspension(zone, service, value);
+        this.commands.enqueue({ kind: "zone-suspend", zone }, { on: Boolean(value), origin: "homekit" });
       }));
 
       this.bound.add(service);
@@ -1915,162 +1804,327 @@ export class HydrawiseController {
     return subtype;
   }
 
-  /* Command one zone's suspension from its companion switch and answer for it: the optimistic state the user is already looking at stands when the account accepts
-   * the command, and goes back after a beat when it does not.
+  /** A promise that resolves once none of this controller's commands is queued or in flight. A confirmed suspension standing is no work, so it never holds the
+   * promise open.
+   *
+   * @returns The promise.
+   */
+  public get commandsIdle(): Promise<void> {
+
+    return this.commands.idle;
+  }
+
+  /* Queue a run or a stop for one zone's valve, from a tap on it in HomeKit or from MQTT, which take one path so a command means the same thing whichever way it
+   * arrived. A run with no positive duration is no command at all, whichever caller handed it over: nothing is queued, and the valve is put back to what it reads
+   * on the same terms a command that did not take is.
+   *
+   * A command from MQTT moves the valve at once, as a tap does. HomeKit stores a tap's value itself, while a command that arrived over MQTT reaches the valve only
+   * through a write, which shows the request the valve now reads first.
+   *
+   * @param options          - The command.
+   * @param options.duration - How long a run lasts, in seconds. A stop carries none.
+   * @param options.on       - Whether to run the zone, or stop it.
+   * @param options.origin   - Where the command came from.
+   * @param options.zone     - The wire zone the command is for.
+   */
+  private commandValve({ duration, on, origin, zone }: { duration?: number; on: boolean; origin: HydrawiseCommandIntent["origin"];
+    zone: HydrawiseZoneConfig; }): void {
+
+    const target: HydrawiseCommandTarget = { kind: "valve", zone };
+
+    if(on && ((duration === undefined) || !Number.isFinite(duration) || (duration <= 0))) {
+
+      this.commands.render(target);
+
+      return;
+    }
+
+    this.commands.enqueue(target, on ? { duration, on, origin } : { on, origin });
+
+    if(origin === "mqtt") {
+
+      this.renderControl(target);
+    }
+  }
+
+  /* Whether a command's control can still answer for it as its turn comes, judged on the terms its request met when it arrived: a request made in HomeKit by the
+   * accessory hosting its control, and one made over MQTT by the controller. A zone that no poll now hosts has no accessory left to answer for its control.
+   */
+  private commandAvailable(target: HydrawiseCommandTarget, intent: HydrawiseCommandIntent): boolean {
+
+    if(intent.origin === "mqtt") {
+
+      return !this.unavailable;
+    }
+
+    const host = (target.kind === "suspend-all") ? this.accessory : this.zoneHosts.get(target.zone.relay_id);
+
+    return (host !== undefined) && !this.unavailableFor(host);
+  }
+
+  /* Make one command ready to send as its turn comes: the setzone parameters it carries, and what Hydrawise's confirmation of it sets in motion. Every command
+   * names its controller, and a zone's command names its relay.
+   *
+   * The instants a suspension carries are sent to Hydrawise, which reads them as wall-clock time, so they come from the host's own clock rather than the
+   * platform's, and they are taken as the command's turn comes rather than at the tap, so a command that waited behind others still runs to the whole horizon it
+   * asked for. Each floors to a whole second, the integer seconds the API expects rather than a fractional millisecond remainder. A suspension runs to a one-year
+   * horizon at both grains, through the same constant, because an open-ended suspension is what both commands mean and Hydrawise expresses that as a distant
+   * instant. The key-based API has no resume of its own, so a resume at either grain is a suspension until the current second, which has already passed.
+   */
+  private prepareCommand(target: HydrawiseCommandTarget, intent: HydrawiseCommandIntent): HydrawisePreparedCommand {
+
+    const now = Math.floor(Date.now() / 1000);
+    const params: Record<string, string> = {};
+    const send = async (signal: AbortSignal): Promise<HydrawiseCommandOutcome> => this.platform.command({ params, signal });
+
+    params["controller_id"] = this.controller.controller_id.toString();
+
+    switch(target.kind) {
+
+      case "suspend-all": {
+
+        const until = now + (intent.on ? HYDRAWISE_SUSPEND_DURATION : 0);
+
+        params["action"] = "suspendall";
+        params["custom"] = until.toString();
+        params["period_id"] = "999";
+
+        return { confirmed: (): void => this.suspendAllConfirmed(intent.on ? until : null), send };
+      }
+
+      case "valve": {
+
+        params["relay_id"] = target.zone.relay_id.toString();
+        params["action"] = intent.on ? "run" : "stop";
+
+        if(intent.on) {
+
+          params["custom"] = (intent.duration ?? 0).toString();
+          params["period_id"] = "999";
+        }
+
+        return { confirmed: (): void => this.valveConfirmed(target.zone, intent), send };
+      }
+
+      case "zone-suspend": {
+
+        const until = now + (intent.on ? HYDRAWISE_SUSPEND_DURATION : 0);
+
+        params["relay_id"] = target.zone.relay_id.toString();
+        params["action"] = "suspend";
+        params["custom"] = until.toString();
+        params["period_id"] = "999";
+
+        return { confirmed: (): void => this.zoneSuspensionConfirmed(target.zone, intent.on ? until : null), send };
+      }
+    }
+  }
+
+  /* Take Hydrawise's confirmation of an account-wide suspend or resume.
+   *
+   * The confirmation is recorded with the instant it arrived and the direction it went. A facts snapshot fetched before it cannot know about it, so every reader
+   * ignores such a snapshot in this command's favor until a refresh that postdates it lands - which is what stops a fetch already in flight when the user pressed
+   * the switch from flipping it straight back. A resume records too, for the same reason in the other direction.
+   *
+   * An account-wide command is also a fact about every zone beneath it, so it stamps each one's own record with the direction it went. The population is every
+   * zone the WIRE has reported rather than the enabled projection, which is empty until the first poll completes and which silently omits any zone a feature
+   * option has turned off; without this, the next refresh's pre-command facts would fight the account-wide switch zone by zone. A command confirmed before any
+   * poll at all stamps nothing beneath it, and the account-wide record carries the answer alone until the first poll seeds the walk.
+   */
+  private suspendAllConfirmed(commandedUntil: Nullable<number>): void {
+
+    const record: HydrawiseCommandRecord = { at: Math.floor(this.platform.clock.now() / 1000), commandedUntil };
+
+    this.commands.stamp(SUSPEND_ALL_TARGET, record);
+
+    for(const zone of this.status.relays) {
+
+      this.commands.stamp({ kind: "zone-suspend", zone }, record);
+    }
+
+    this.log.info("%s scheduled watering for all zones.", (commandedUntil !== null) ? "Suspending" : "Resuming");
+
+    // Re-derive on the account-wide command's own terms, exactly as a per-zone command does. It runs after the sentence above so the account-wide statement
+    // reads ahead of the per-zone transitions the re-derive narrates beneath it.
+    this.rederiveProjection();
+  }
+
+  /* Take Hydrawise's confirmation of one zone's suspension or resume, commanded from its companion switch.
    *
    * The switch speaks its own name's language: turning it ON is what SUSPENDS the zone, which is the account-wide suspend switch's convention at the zone grain. A
    * zone's active state already lives on its valve, so a switch that commanded the other way would leave the user two controls disagreeing about one thing.
    *
-   * A suspension runs to the same one-year horizon the account-wide suspend uses, through the same constant, because an open-ended suspension is what both commands
-   * mean and Hydrawise expresses that as a distant instant.
+   * The confirmation is recorded so a snapshot fetched before it cannot answer for this zone, on exactly the terms the account-wide record works on, and the
+   * direction is stored with the instant, because while the record stands it is the record itself that says what to show. The projection is re-derived right
+   * here, so the webUI, the MQTT payload and the log sentence, which all answer to it, carry the command at once rather than contradicting the switch the user
+   * just pressed until the next refresh.
    *
-   * Nothing is read back afterward. The recurring refresh reconciles the optimistic state on its own cadence, and spending a call to confirm what the account has
-   * just acknowledged would cost a slot the next command may need.
+   * Nothing is read back afterward. The recurring refresh of the account's facts reconciles the record on its own cadence, and spending a call to confirm what
+   * Hydrawise has just acknowledged would cost a slot the next command may need.
    */
-  private async commandZoneSuspension(zone: HydrawiseZoneConfig, service: Service, value: CharacteristicValue): Promise<void> {
+  private zoneSuspensionConfirmed(zone: HydrawiseZoneConfig, commandedUntil: Nullable<number>): void {
 
-    // The instant the suspension lifts is sent to the account API, which reads it as wall-clock time, so it comes from the host's own clock rather than the
-    // platform's.
-    const until = value ? (Math.floor(Date.now() / 1000) + HYDRAWISE_SUSPEND_DURATION) : null;
-    const result = await this.platform.setZoneSuspension({ until, zoneId: zone.relay_id });
-
-    if(result.status === "done") {
-
-      /* Stamp the command so a snapshot fetched before it cannot answer for this zone, on exactly the terms the account-wide stamp above works on. The direction
-       * is stored with the instant, because while the command stands it is the command itself that says what to show.
-       */
-      this.zoneSuspendCommands.set(zone.relay_id, { at: Math.floor(this.platform.clock.now() / 1000), commandedUntil: until });
-
-      /* Re-derive right here, so the projection every other surface reads carries this command at once rather than waiting on the next account refresh. The
-       * webUI, the MQTT payload, and the log sentence all answer to that projection, and a quarter of an hour of them contradicting the switch the user just
-       * pressed is the whole reason this call is here rather than at the next tick.
-       */
-      this.rederiveProjection();
-
-      return;
-    }
-
-    // A shutdown reaching us mid-command is orderly teardown rather than a refusal, so the handler exits here, skipping both the sentence and the revert.
-    if(this.platform.signal.aborted) {
-
-      return;
-    }
-
-    this.log.error("%s: Unable to %s this zone. %s", this.zoneLabel(zone), until ? "suspend" : "resume", this.suspensionRefusal(result));
-
-    // Put the switch back where it was after a brief beat, scheduled through the platform's registry exactly as every other revert on this controller is.
-    this.platform.timers.schedule(() => service.updateCharacteristic(this.hap.Characteristic.On, !value), HYDRAWISE_REVERT_DELAY);
+    this.commands.stamp({ kind: "zone-suspend", zone }, { at: Math.floor(this.platform.clock.now() / 1000), commandedUntil });
+    this.rederiveProjection();
   }
 
-  /* The sentence a refused per-zone suspension gives the operator, one per answer the platform can give, because they ask the user for different things: a paced
-   * ceiling asks for a moment's patience, a refusal from Hydrawise asks them to look at the account, and a missing client says the enhanced features this switch
-   * runs on are not configured at all.
+  /* Take Hydrawise's confirmation of a zone's run or stop, from HomeKit or MQTT alike: show the water the command set flowing or stopped, and say so. The valve
+   * and the irrigation system are looked up as the confirmation arrives rather than captured when the command was made, because a poll in between can move the
+   * zone onto another accessory. A zone with no valve - one a feature option keeps out of HomeKit, which MQTT can still command - has nothing to show.
    *
-   * The failed arm serves BOTH ways a command can fail, because the reason it reads carries either - the account's own words when it refused in band, and the
-   * transport's when the request did not land. Telling them apart here would be this layer knowing something it has no use for: what the user wants is the reason,
-   * and the fallback covers only a failure already reported in its own words elsewhere.
-   *
-   * Every answer is named with no default arm, so an answer added to the union surfaces as a compile error rather than as a command silently reporting someone
-   * else's reason.
+   * The valve's own Active is left as it stands. It already shows the command the user made, and the next poll's walk writes it from the wire.
    */
-  private suspensionRefusal(result: Exclude<HydrawiseZoneSuspensionResult, { status: "done" }>): string {
+  private valveConfirmed(zone: HydrawiseZoneConfig, intent: HydrawiseCommandIntent): void {
 
-    switch(result.status) {
+    const valveService = this.valveOf(zone.relay_id);
 
-      case "failed":
+    if(!valveService) {
 
-        return result.reason ?? "Hydrawise did not accept the command.";
+      return;
+    }
 
-      case "rejected":
+    const irrigationSystemService = this.accessory.getService(this.hap.Service.IrrigationSystem);
+    const duration = intent.duration ?? 0;
 
-        return "The Hydrawise account API is pacing requests right now, so the command was not sent. Please try again in a moment.";
+    if(intent.on) {
+
+      valveService.updateCharacteristic(this.hap.Characteristic.InUse, this.hap.Characteristic.InUse.IN_USE);
+      valveService.updateCharacteristic(this.hap.Characteristic.RemainingDuration, duration);
+      irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.ProgramMode, this.hap.Characteristic.ProgramMode.PROGRAM_SCHEDULED_MANUAL_MODE);
+      irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.InUse, this.hap.Characteristic.InUse.IN_USE);
+
+      // Mark this zone as manually activated. The ledger is addressed by relay id as the confirmation arrives, so it always acts on the current entry, and a zone
+      // with no entry is the no-op the ledger states.
+      this.zoneHints.markManual(zone.relay_id);
+    } else {
+
+      valveService.updateCharacteristic(this.hap.Characteristic.RemainingDuration, 0);
+      valveService.updateCharacteristic(this.hap.Characteristic.InUse, this.hap.Characteristic.InUse.NOT_IN_USE);
+
+      // Clear out the manual activation for this zone, addressed by relay id as the confirmation arrives for the same reason the mark above is.
+      this.zoneHints.clearManual(zone.relay_id);
+
+      // No more manually activated zones among the enabled set, we can resume our schedule. We consult the instance state as the confirmation arrives so this
+      // always acts on the current poll's enabled zones.
+      if(!this.enabledZones.some(x => this.zoneHints.get(x.relay_id)?.isManual)) {
+
+        irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.ProgramMode, this.hap.Characteristic.ProgramMode.PROGRAM_SCHEDULED);
+      }
+
+      // If this was the only enabled zone currently running on the irrigation controller, let's set the system state to no longer in use.
+      if(!this.enabledZones.some(x => (x.time === 1) && (x.relay_id !== zone.relay_id))) {
+
+        irrigationSystemService?.updateCharacteristic(this.hap.Characteristic.InUse, this.hap.Characteristic.InUse.NOT_IN_USE);
+      }
+    }
+
+    this.log.info("%s: Manually %s%s.", this.zoneLabel(zone, valveService), intent.on ? "started" : "stopped",
+      intent.on ? " (duration: " + this.getMinutes(duration) + ")" : "");
+  }
+
+  /* What a control reads, the one reader each control answers HomeKit with: the user's own request while it waits to be settled, and otherwise the account-wide
+   * switch's reading, the zone's suspension, or the valve's walk. A zone's reading is taken from the zone as the wire reports it now, since a control's command
+   * carries the zone as it was when the request arrived.
+   */
+  private readControl(target: HydrawiseCommandTarget): HydrawiseCommandValue {
+
+    if(target.kind === "suspend-all") {
+
+      return { on: this.isAllSuspended(this.currentFacts) };
+    }
+
+    const zone = this.status.relays.find(candidate => candidate.relay_id === target.zone.relay_id) ?? target.zone;
+
+    if(target.kind === "valve") {
+
+      return { on: this.isValveActive(zone) };
+    }
+
+    return { on: this.isZoneSuspended(zone, this.accessory.context.schedule?.zones.find(entry => entry.relayId === zone.relay_id), this.currentFacts) };
+  }
+
+  // Write what a control reads onto it, wherever it is hosted now. A zone that no poll now hosts has nowhere for its controls to be written.
+  private renderControl(target: HydrawiseCommandTarget): void {
+
+    const { on } = this.readControl(target);
+
+    switch(target.kind) {
+
+      case "suspend-all":
+
+        this.accessory.getServiceById(this.hap.Service.Switch, HydrawiseReservedNames.SWITCH_SUSPEND_ALL)?.updateCharacteristic(this.hap.Characteristic.On, on);
+
+        return;
+
+      case "valve":
+
+        this.valveOf(target.zone.relay_id)?.updateCharacteristic(this.hap.Characteristic.Active,
+          on ? this.hap.Characteristic.Active.ACTIVE : this.hap.Characteristic.Active.INACTIVE);
+
+        return;
+
+      case "zone-suspend":
+
+        this.zoneHosts.get(target.zone.relay_id)?.getServiceById(this.hap.Service.Switch, suspendZoneSubtype(target.zone.relay_id))
+          ?.updateCharacteristic(this.hap.Characteristic.On, on);
+    }
+  }
+
+  /* Say why a control's latest request did not take. The account-wide switch names no zone and says a request that did not complete and a reply that could not be
+   * read each in a sentence of its own, while a zone's valve or switch names the zone, what it was asked to do, and the reason the outcome gives. A command no
+   * attempt of which was answered, and one whose control could no longer answer when its turn came, are each a warning rather than an error, because neither is a
+   * failure the user has to act on.
+   */
+  private reportUnconfirmed(target: HydrawiseCommandTarget, intent: HydrawiseCommandIntent, outcome: HydrawiseUnconfirmedCommand): void {
+
+    const verb = (target.kind === "valve") ? (intent.on ? "start" : "stop") : (intent.on ? "suspend" : "resume");
+    let label = "All zones";
+
+    if(target.kind !== "suspend-all") {
+
+      label = this.zoneLabel(target.zone, (target.kind === "valve") ? this.valveOf(target.zone.relay_id) : undefined);
+    }
+
+    switch(outcome.status) {
+
+      case "exhausted":
+
+        this.log.warn("%s: Hydrawise did not answer the %s command after %s attempts, so it shows its last confirmed state.", label, verb, HYDRAWISE_COMMAND_ATTEMPTS);
+
+        return;
 
       case "unavailable":
 
-        return "Enhanced features are not configured.";
+        this.log.warn("%s: The %s command was not sent because the controller is not responding.", label, verb);
+
+        return;
+
+      case "failed":
+      case "refused":
+      case "unreadable":
+
+        if(target.kind === "suspend-all") {
+
+          this.log.error((outcome.status === "unreadable") ? "Unable to retrieve the result of the %s request." : "Unable to complete the %s request.", verb);
+
+          return;
+        }
+
+        this.log.error("%s: Unable to %s this zone. %s", label, verb, outcome.reason);
     }
   }
 
-  // Send a command to the Hydrawise API.
-  private async sendCommand(zone: HydrawiseZoneConfig, command: "run", duration: number): Promise<Nullable<Dispatcher.ResponseData<unknown>>>;
-  private async sendCommand(zone: HydrawiseZoneConfig, command: "stop"): Promise<Nullable<Dispatcher.ResponseData<unknown>>>;
-  private async sendCommand(command: "suspendall", duration: number): Promise<Nullable<Dispatcher.ResponseData<unknown>>>;
-  private async sendCommand(zoneOrCmd: HydrawiseZoneConfig | "suspendall", cmdOrDur: (number | "run" | "stop"), duration?: number):
-  Promise<Nullable<Dispatcher.ResponseData<unknown>>> {
+  // Whether a zone's valve reads active: the user's own run or stop while it waits to be settled, and otherwise whether the zone is queued to turn on imminently
+  // or is currently on.
+  private isValveActive(zone: HydrawiseZoneConfig): boolean {
 
-    let command, zone;
+    return this.commands.pending({ kind: "valve", zone })?.on ?? ((zone.time > 0) && (zone.time <= HYDRAWISE_ACTIVE_ZONE_INDICATOR));
+  }
 
-    // We've been called as sendCommand("suspendall", duration).
-    if(typeof zoneOrCmd === "string") {
+  // The valve a zone has on whichever accessory now hosts it, or undefined where no poll hosts the zone.
+  private valveOf(relayId: number): Service | undefined {
 
-      command = zoneOrCmd;
-      duration = cmdOrDur as number;
-    } else {
-
-      // We've been called as sendCommand(zone, "run" | "stop", [duration]).
-      zone = zoneOrCmd;
-      command = cmdOrDur as "run" | "stop";
-    }
-
-    // User has queued us up...send the command to Hydrawise.
-    const params: Record<string, string> = {};
-
-    params["controller_id"] = this.controller.controller_id.toString();
-
-    // If we've specified the zone, add it to our parameters.
-    if(zone?.relay_id) {
-
-      params["relay_id"] = zone.relay_id.toString();
-    }
-
-    switch(command) {
-
-      case "run":
-
-        params["action"] = "run";
-
-        // A duration that is absent, not a finite number, or not positive is no command at all, whichever caller handed it over.
-        if((typeof duration !== "number") || !Number.isFinite(duration) || (duration <= 0)) {
-
-          return null;
-        }
-
-        params["custom"] = duration.toString();
-        params["period_id"] = "999";
-
-        break;
-
-      case "stop":
-
-        params["action"] = "stop";
-
-        break;
-
-      case "suspendall":
-
-        params["action"] = "suspendall";
-
-        if((typeof duration !== "number") || !Number.isFinite(duration) || (duration <= 0)) {
-
-          return null;
-        }
-
-        params["custom"] = duration.toString();
-        params["period_id"] = "999";
-
-        // The current overload set never reaches this branch with a zone in hand - a suspendall call is always the zoneOrCmd-is-a-string branch above, so
-        // params["relay_id"] was never set - but the delete stays as a safety net should a future signature change ever let one through.
-        delete params["relay_id"];
-
-        break;
-
-      default:
-
-        return null;
-    }
-
-    // Request the change in zone state.
-    return this.platform.retrieve(HYDRAWISE_COMMAND_ENDPOINT, params);
+    return this.zoneHosts.get(relayId)?.getServiceById(this.hap.Service.Valve, relayId.toString());
   }
 
   /* Utility to return the status of a zone to a user. The sentence comes from the schedule classifier's own reading of this poll, which is the same reading the
@@ -2280,7 +2334,7 @@ export class HydrawiseController {
   private persistScheduleStatus(facts: Nullable<HydrawiseControllerFactsSnapshot>): boolean {
 
     const previous = this.accessory.context.schedule;
-    const commands = new Map<number, Nullable<number>>([...this.zoneSuspendCommands].map(([ relayId, command ]) => [ relayId, command.commandedUntil ]));
+    const commands = new Map<number, Nullable<number>>([...this.commands.zoneRecords()].map(([ relayId, command ]) => [ relayId, command.commandedUntil ]));
     const schedule = scheduleStatus(this.status, HYDRAWISE_ACTIVE_ZONE_INDICATOR, { commands, facts: facts ?? undefined,
       priorSuspended: this.priorSuspended(previous) });
 
@@ -2396,9 +2450,11 @@ export class HydrawiseController {
   /* Whether the account reads as fully suspended, which is what drives the suspend-all switch's state. Answers in precedence, the account-grain twin of the
    * per-zone reader above and deliberately the same shape: one reader pattern at both grains, both consulting the one standing judgment.
    *
-   * A STANDING COMMAND answers first, and its direction is the answer. This is the arm that cannot be replaced by reading composed state, for the same reason the
-   * zone reader's cannot: the projection is re-derived inside the command's own handler, from a poll snapshot taken before the account accepted anything, so a
-   * reader that consulted only that composition would flip the switch straight back off under the user's finger.
+   * The user's own suspend or resume answers first while it waits to be settled, so the switch holds their choice whatever a poll or a refresh lands meanwhile.
+   *
+   * A STANDING COMMAND answers next, and its direction is the answer. This is the arm that cannot be replaced by reading composed state, for the same reason the
+   * zone reader's cannot: the projection is re-derived the moment Hydrawise confirms the command, from a poll snapshot taken before the account accepted anything,
+   * so a reader that consulted only that composition would flip the switch straight back off under the user's finger.
    *
    * With trustworthy facts and no command standing, the answer comes from the classified states: the account is suspended when every reported zone classifies
    * suspended. Reading the classification rather than the raw suspension facts keeps this the projection's single truth, and it is also the behaviorally right
@@ -2413,7 +2469,14 @@ export class HydrawiseController {
    */
   private isAllSuspended(facts: Nullable<HydrawiseControllerFactsSnapshot>): boolean {
 
-    const command = this.suspendAllCommand;
+    const pending = this.commands.pending(SUSPEND_ALL_TARGET);
+
+    if(pending) {
+
+      return pending.on;
+    }
+
+    const command = this.commands.record(SUSPEND_ALL_TARGET);
 
     if(this.commandStands(command, facts)) {
 

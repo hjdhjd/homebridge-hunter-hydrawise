@@ -140,7 +140,6 @@ describe("HydrawiseController polling loop structure", () => {
     const h = buildController({ program: (recorder) => {
 
       recorder.programDefault("statusschedule.php", { body: schedule([scheduledZone()]), kind: "response" });
-      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
     }, seedContext: seedCachedValve, signalAborted: false });
 
     t.after(() => h.abort());
@@ -155,11 +154,12 @@ describe("HydrawiseController polling loop structure", () => {
     // that attaches the handler has actually been through.
     await waitUntil(() => logCount(h.entries, "info", "Next run will be") >= 1, { description: "an info line containing \"Next run will be\"" });
     await triggerSet(valve.getCharacteristic(Characteristic.Active), Characteristic.Active.ACTIVE);
+    await h.controller.commandsIdle;
 
-    const command = expectAt(h.retrieve.callsTo("setzone.php"), 0, "setzone call");
+    const command = expectAt(h.commands.params, 0, "setzone call");
 
-    assert.equal(command.params?.["action"], "run", "the set handler attached to the restored valve dispatches the run command");
-    assert.equal(command.params["relay_id"], ZONE_SUBTYPE, "the dispatched command targets the restored valve's own zone");
+    assert.equal(command["action"], "run", "the set handler attached to the restored valve dispatches the run command");
+    assert.equal(command["relay_id"], ZONE_SUBTYPE, "the dispatched command targets the restored valve's own zone");
   });
 
   test("the wire half never runs a poll ahead of the projection", async (t) => {

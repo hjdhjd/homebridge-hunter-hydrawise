@@ -1,9 +1,9 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
  * platform.helpers.ts: The plugin-specific test harness - the Homebridge runtime every suite runs on, the platform double for controller tests, real-platform
- * construction over HBPU's Homebridge API double, the recording MQTT client, the programmable retrieve recorder, the undici MockAgent installer, and the
- * buildController / buildPlatform construction workhorses. Every cast that bridges a double to a production constructor's parameter type is confined to a
- * workhorse, so test bodies stay cast-free.
+ * construction over HBPU's Homebridge API double, the recording MQTT client, the programmable retrieve recorder and command double, the undici MockAgent
+ * installer and the body failure it can serve, and the buildController / buildPlatform construction workhorses. Every cast that bridges a double to a production
+ * constructor's parameter type is confined to a workhorse, so test bodies stay cast-free.
  *
  * Every accessory a suite reads is Homebridge's own PlatformAccessory over the hap-nodejs copy Homebridge loads, made through HBPU's Homebridge test double, so
  * HAP's own defaults, UUID validation, bridge and read and write paths apply to every row. Each accessory the harness builds reaches the double's bridge the way
@@ -11,8 +11,9 @@
  * registered. Every view of the accessory calls a suite reads is derived from the double's one record of them.
  *
  * The wire boundaries are by design. Controller tests never touch undici: the platform double's retrieve is a programmable recorder that records every call and
- * returns fixture-programmed response shapes. Platform tests construct a REAL HydrawisePlatform and drive its retrieve() through a MockAgent installed as the
- * global dispatcher after construction, so the real status-code classification and error taxonomy run unchanged.
+ * returns fixture-programmed response shapes, and its command is a double that records every command and answers a programmed outcome. Platform tests construct
+ * a REAL HydrawisePlatform and drive its retrieve() through a MockAgent installed as the global dispatcher after construction, so the real status-code
+ * classification and error taxonomy run unchanged.
  */
 // The entry point's polyfill gesture, mirrored for the suites that construct a platform without ever loading src/index.ts. Every platform and controller test
 // reaches production through this module, so installing here is what keeps the explicit-resource-management globals present for a contributor running the suite on
@@ -23,8 +24,8 @@ import type { API, PlatformAccessory } from "homebridge";
 import { AccessoryPersistence, FeatureOptions, TimerRegistry, acquireService, sanitizeName, setAccessoryName, systemClock } from "homebridge-plugin-utils";
 import type { Clock, HomebridgePluginLogging, Nullable, RateBudget } from "homebridge-plugin-utils";
 import { HYDRAWISE_API_BASE_URL, PLATFORM_NAME, PLUGIN_NAME } from "../settings.ts";
-import type { HydrawiseAccessory, HydrawiseControllerConfig, HydrawiseControllerHardware, HydrawiseControllerIdentity, HydrawiseControllerV2Facts,
-  HydrawiseV2MutationResult, HydrawiseZoneConfig, HydrawiseZoneSuspensionResult, HydrawiseZoneV2Facts } from "../types.ts";
+import type { HydrawiseAccessory, HydrawiseCommandOutcome, HydrawiseControllerConfig, HydrawiseControllerHardware, HydrawiseControllerIdentity,
+  HydrawiseControllerV2Facts, HydrawiseZoneConfig, HydrawiseZoneV2Facts } from "../types.ts";
 import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
 import { TestClock, TestMqttClient, capturingLog, loadHomebridge, present, waitUntil, watchServerWarnings } from "homebridge-plugin-utils/testing";
 import type { TestHomebridgeApi, TestHomebridgeApiCall, TestLogEntry, TestPlatformAccessory } from "homebridge-plugin-utils/testing";
@@ -138,6 +139,99 @@ export class RetrieveRecorder {
   }
 }
 
+// One recorded command the controller sent: the setzone parameters it carried, and the signal it handed over to withdraw the command while it waits for admission.
+export interface RecordedCommandCall {
+
+  params: Record<string, string>;
+  signal: AbortSignal | undefined;
+}
+
+/* One command the double holds in flight until a test releases it, which is how a row puts a command between being sent and being answered. A hold stands either
+ * on the wire, where a withdrawal reaches nothing, or in the admission wait, where a withdrawal ends it as aborted the moment the command's signal fires, which is
+ * what the platform's command does with a withdrawn wait.
+ */
+export class HeldCommand {
+
+  // Resolves once a command has reached this hold, so a row can wait for the command to be in flight before it acts.
+  public readonly reached: Promise<void>;
+  private readonly admission: boolean;
+  private readonly answer = Promise.withResolvers<HydrawiseCommandOutcome>();
+  private readonly arrival: PromiseWithResolvers<void> = Promise.withResolvers();
+
+  constructor({ admission = false }: { admission?: boolean } = {}) {
+
+    this.admission = admission;
+    this.reached = this.arrival.promise;
+  }
+
+  // Answer the held command, confirming it unless the row says otherwise.
+  public release(outcome: HydrawiseCommandOutcome = { status: "confirmed" }): void {
+
+    this.answer.resolve(outcome);
+  }
+
+  // Take the command this hold stands for, and answer it once it is released or, for a hold in the admission wait, once it is withdrawn.
+  public async take(signal: AbortSignal | undefined): Promise<HydrawiseCommandOutcome> {
+
+    if(this.admission) {
+
+      signal?.addEventListener("abort", () => this.answer.resolve({ status: "aborted" }), { once: true });
+    }
+
+    this.arrival.resolve();
+
+    return this.answer.promise;
+  }
+}
+
+/* The command double that stands in for the platform's command(). It records every command and answers each with the next programmed answer in order, an outcome
+ * at once or a hold a test releases, and with the steady default once the program runs out, which confirms every command unless a row says otherwise.
+ */
+export class CommandRecorder {
+
+  public readonly calls: RecordedCommandCall[] = [];
+  private fallback: HydrawiseCommandOutcome = { status: "confirmed" };
+  private readonly queue: (HeldCommand | HydrawiseCommandOutcome)[] = [];
+
+  // The parameters of every recorded command, in call order.
+  public get params(): Record<string, string>[] {
+
+    return this.calls.map(call => call.params);
+  }
+
+  // Queue one-shot answers for the next commands, in order.
+  public program(...answers: (HeldCommand | HydrawiseCommandOutcome)[]): void {
+
+    this.queue.push(...answers);
+  }
+
+  // Set the answer every command takes once the one-shot answers run out.
+  public programDefault(outcome: HydrawiseCommandOutcome): void {
+
+    this.fallback = outcome;
+  }
+
+  // Queue a hold for the next unanswered command, and hand it back for the row to release.
+  public hold(options?: { admission?: boolean }): HeldCommand {
+
+    const held = new HeldCommand(options);
+
+    this.queue.push(held);
+
+    return held;
+  }
+
+  // The command replacement handed to the platform double. Records the command, then answers it.
+  public readonly command: HydrawisePlatform["command"] = async ({ params, signal }) => {
+
+    this.calls.push({ params: { ...params }, signal });
+
+    const answer = this.queue.shift() ?? this.fallback;
+
+    return (answer instanceof HeldCommand) ? answer.take(signal) : answer;
+  };
+}
+
 // The accessories each of an API double's calls of one kind carried, one list per call in arrival order. Every call view a workhorse returns reads through here
 // at the moment it is asked, so the double's record is the one source a view answers from, and a view reads a call made after the result holding it was copied.
 function callsOf(api: TestHomebridgeApi, kind: TestHomebridgeApiCall["kind"]): (readonly PlatformAccessory[])[] {
@@ -160,6 +254,7 @@ export interface TestPlatform {
   // The time source every wait and stamp a controller takes reads, standing in for the production platform's own clock. Typed as the production Clock because that is
   // the whole of what a controller consumes; a test that drives time holds its own TestClock handle.
   clock: Clock;
+  command: CommandRecorder["command"];
   config: HydrawiseOptions;
   featureOptions: FeatureOptions;
   hasV2Client: boolean;
@@ -170,14 +265,9 @@ export interface TestPlatform {
   persistence: AccessoryPersistence;
   reconcileZoneAccessories: HydrawisePlatform["reconcileZoneAccessories"];
   retrieve: RetrieveRecorder["retrieve"];
-  setZoneSuspension: HydrawisePlatform["setZoneSuspension"];
   signal: AbortSignal;
   timers: TimerRegistry;
 }
-
-// One recorded per-zone suspension command the controller issued: the whole argument object it passed. Typed by indexed access against the real method, so a
-// signature drift is a compile error here rather than a silent mismatch.
-export type RecordedSuspensionCall = Parameters<HydrawisePlatform["setZoneSuspension"]>[0];
 
 // Options for makeTestPlatform: the platform config overrides, whether the account-credentialed client is present (the gate a controller reads to decide whether
 // cached hardware facts are still worth honoring), whether to attach a recording MQTT double, whether the platform signal starts pre-aborted (the default, which
@@ -194,17 +284,6 @@ export interface MakeTestPlatformOptions {
   mqtt?: boolean;
   signalAborted?: boolean;
 
-  /* A REAL account-credentialed client for the suspension surface to delegate to, built by the test from the platform double's own log so every layer's lines land
-   * in one capture buffer. That shared buffer is the point: an assertion about how many voices narrate one failure can only be written where all of them are recorded.
-   *
-   * It is a factory rather than a client because the log does not exist until this double is built, and answering the question this option exists for means the
-   * client must write into that same log rather than one of its own.
-   */
-  suspensionClient?: (log: HomebridgePluginLogging) => Pick<TestV2Client, "setZoneSuspension">;
-
-  // The answer the per-zone suspension surface gives when no client is supplied above, or a function of the one-based command number so a test can answer
-  // differently command by command. Defaults to accepting every command, which is what a test asserting anything other than a refusal wants.
-  suspensionResult?: HydrawiseZoneSuspensionResult | ((command: number) => HydrawiseZoneSuspensionResult);
   userOptions?: string[];
 }
 
@@ -215,6 +294,9 @@ export interface MakeTestPlatformResult {
 
   // The clock the platform double publishes: the caller's own when it passed one, and the system clock otherwise.
   clock: Clock;
+
+  // The command double, which records every command the controller sent and answers what a row programmed.
+  commands: CommandRecorder;
 
   // Every line the platform double logged, read live: the array grows as the code under test logs, so a read always sees everything logged so far.
   entries: readonly TestLogEntry[];
@@ -229,9 +311,6 @@ export interface MakeTestPlatformResult {
   reconciles: RecordedReconcileCall[];
   retrieve: RetrieveRecorder;
   signalController: AbortController;
-
-  // Every per-zone suspension command the controller issued, in order.
-  suspensions: RecordedSuspensionCall[];
 
   // The zone accessories the reconcile stub owns, keyed by relay id. It is both the stub's own store and the seeding hook a warm-restart test pre-populates, so a
   // test can hand the first poll an accessory that already carries a cache-restored valve.
@@ -273,6 +352,7 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
    */
   const persistence = new AccessoryPersistence({ api, clock: new TestClock(), platformName: PLATFORM_NAME, pluginIdentifier: PLUGIN_NAME });
   const retrieve = new RetrieveRecorder();
+  const commands = new CommandRecorder();
 
   /* The retrieve the platform double hands the controller: the recorder's, closing the save window before it answers each status fetch. Production's poll interval
    * is far longer than the window, so each poll's marks reach the cache as one save before the next poll fetches, and closing the window at that fetch holds the
@@ -290,29 +370,6 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
   const reconciles: RecordedReconcileCall[] = [];
   const zoneAccessories = new Map<number, TestPlatformAccessory>();
   const featureOpts = new FeatureOptions(featureOptionCategories, featureOptions, options.userOptions);
-  const suspensions: RecordedSuspensionCall[] = [];
-
-  /* A recording stand-in for the platform's per-zone suspension surface. It is a DOUBLE rather than a thin executor because what it stands in for is the network:
-   * the real method reaches the account-credentialed client, which no controller test may ever touch. The programmed answer is what drives the controller's own
-   * success, revert, and refusal paths.
-   */
-  const suspensionClient = options.suspensionClient?.(log);
-
-  const setZoneSuspension: HydrawisePlatform["setZoneSuspension"] = async (request) => {
-
-    suspensions.push(request);
-
-    // With a real client supplied, this stands in only for the platform's mapping - which passes the client's answer through untouched - so the command runs the
-    // whole production path beneath it. The platform's own outcome mapping is asserted in its own suite.
-    if(suspensionClient) {
-
-      return suspensionClient.setZoneSuspension(request);
-    }
-
-    const programmed = options.suspensionResult ?? { status: "done" };
-
-    return (typeof programmed === "function") ? programmed(suspensions.length) : programmed;
-  };
 
   /* A THIN EXECUTOR standing in for the platform's zone-accessory reconcile, not a second copy of its policy. It records the call, keeps one accessory per
    * requested zone (reusing a stored one, whether the stub made it or a test seeded it), and answers a zone the request does not name as production's demotion
@@ -379,6 +436,7 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
 
     api,
     clock,
+    command: commands.command,
     config,
     featureOptions: featureOpts,
     hasV2Client: options.hasV2Client ?? false,
@@ -387,7 +445,6 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
     persistence,
     reconcileZoneAccessories,
     retrieve: retrieveClosingWindow,
-    setZoneSuspension,
     signal: signalController.signal,
     timers
   };
@@ -414,7 +471,7 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
     return callsOf(api, "update");
   };
 
-  return { abort, clock, entries: log.entries, flushes, mqtt, platform, reconciles, retrieve, signalController, suspensions, zoneAccessories };
+  return { abort, clock, commands, entries: log.entries, flushes, mqtt, platform, reconciles, retrieve, signalController, zoneAccessories };
 }
 
 // Options for buildController: the controller-config overrides, an optional program hook, and everything makeTestPlatform accepts.
@@ -610,19 +667,6 @@ export function v2BudgetOf(platform: HydrawisePlatform): RateBudget {
 }
 
 /**
- * Read the platform's account-credentialed COMMAND budget through its private field, the twin of v2BudgetOf and confined here on the same terms. This is the
- * ceiling a per-zone suspension's admission draws, and the one the platform's zero-cost pre-check reads.
- *
- * @param platform - The constructed HydrawisePlatform.
- *
- * @returns The v2 mutation budget.
- */
-export function v2MutationBudgetOf(platform: HydrawisePlatform): RateBudget {
-
-  return (platform as unknown as { v2MutationBudget: RateBudget }).v2MutationBudget;
-}
-
-/**
  * Read the account-credentialed client's dispatcher through the platform's private field, exposing the destroyed flag a teardown test asserts on - the v2 twin of
  * dispatcherOf, and confined here for the same reason. The read goes through the client's public getter rather than a captured reference, which is exactly how the
  * platform's own teardown reads it, so this observes what that registration observes.
@@ -636,18 +680,14 @@ export function v2DispatcherOf(platform: HydrawisePlatform): { destroyed: boolea
   return (platform as unknown as { v2Client?: { dispatcher: { destroyed: boolean } } }).v2Client?.dispatcher;
 }
 
-/* The account-credentialed client surface the platform actually consumes: the dispatcher its teardown destroys, the whole-account facts fetch its refresh loop
- * drives, and the per-zone suspension its write surface delegates to. A distribution test supplies this shape rather than a real client, so no test ever reaches
- * the live account API.
- *
- * A REAL client satisfies this shape too, which is deliberate: a test that wants the client's own admission phase in the picture installs one built over a
- * MockAgent, and the whole path from the platform's pre-check down runs production code with nothing on the wire.
+/* The account-credentialed client surface the platform actually consumes: the dispatcher its teardown destroys, and the whole-account facts fetch its refresh loop
+ * drives. A distribution test supplies this shape rather than a real client, so no test ever reaches the live account API. A REAL client satisfies this shape too,
+ * so a test can install one built over a MockAgent and run the whole path in production code with nothing on the wire.
  */
 export interface TestV2Client {
 
   dispatcher: { destroy: () => Promise<void> };
   fetchAccountFacts: () => Promise<Nullable<Map<number, HydrawiseControllerV2Facts>>>;
-  setZoneSuspension: (options: { until: Nullable<number>; zoneId: number }) => Promise<HydrawiseV2MutationResult>;
 }
 
 /**
@@ -714,11 +754,7 @@ export function makeTestV2Client(facts: Nullable<Map<number, HydrawiseController
       fetches++;
 
       return (typeof facts === "function") ? facts(fetches) : facts;
-    },
-
-    // The facts double answers every command, because a test that programs facts is asserting distribution rather than commands; a test asserting commands installs a
-    // real client over a MockAgent instead.
-    setZoneSuspension: async (): Promise<HydrawiseV2MutationResult> => ({ status: "done" }) }, fetches: (): number => fetches };
+    } }, fetches: (): number => fetches };
 }
 
 /**
@@ -858,18 +894,36 @@ export interface MockDispatcherHandle extends AsyncDisposable {
   agent: MockAgent;
 }
 
+/* An interceptor that ends every reply the MockAgent serves with an error in place of its end, once the reply's start and its bytes have arrived, so the reply's
+ * body fails partway through its read. The MockAgent writes a reply's start, data and end in one pass, so no reply it serves can meet a deadline during the body
+ * read without this.
+ */
+function failingBodies(error: Error): Dispatcher.DispatcherComposeInterceptor {
+
+  return (dispatch) => (options, handler): boolean => dispatch(options, {
+
+    onRequestStart: (controller, context: unknown): void => handler.onRequestStart?.(controller, context),
+    onResponseData: (controller, chunk): void => handler.onResponseData?.(controller, chunk),
+    onResponseEnd: (controller): void => handler.onResponseError?.(controller, error),
+    onResponseError: (controller, cause): void => handler.onResponseError?.(controller, cause),
+    onResponseStart: (controller, statusCode, headers, statusMessage): void => handler.onResponseStart?.(controller, statusCode, headers, statusMessage)
+  });
+}
+
 /* Install a MockAgent as undici's global dispatcher, snapshotting the dispatcher in place so dispose restores it exactly. undici's request() reads the global
  * dispatcher fresh per call, so a MockAgent installed after the platform's constructor already armed a real Pool intercepts every retrieve() from that point.
  * The returned handle is an AsyncDisposable bound with `await using`, so the prior dispatcher is restored and the agent closed at scope exit regardless of throw.
+ *
+ * A body error makes every reply fail partway through its body with that error, which is how a row stands up a deadline met while a reply is being read.
  */
-export function installMockDispatcher(): MockDispatcherHandle {
+export function installMockDispatcher({ bodyError }: { bodyError?: Error } = {}): MockDispatcherHandle {
 
   const prior = getGlobalDispatcher();
   const agent = new MockAgent();
 
   // Disable net connect so any unintercepted request fails loudly rather than reaching the real Hydrawise API.
   agent.disableNetConnect();
-  setGlobalDispatcher(agent);
+  setGlobalDispatcher(bodyError ? agent.compose(failingBodies(bodyError)) : agent);
 
   return {
 

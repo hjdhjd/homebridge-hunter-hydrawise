@@ -437,7 +437,6 @@ describe("HydrawiseController controller availability", () => {
     return buildController({ ...options, clock, mqtt: true, program: (recorder) => {
 
       recorder.programDefault("statusschedule.php", { body: status, kind: "response" });
-      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
     }, signalAborted: false });
   }
 
@@ -506,14 +505,12 @@ describe("HydrawiseController controller availability", () => {
 
     h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: seconds(clock) });
 
-    const commandsBefore = h.retrieve.callsTo("setzone.php").length;
-    const suspensionsBefore = h.suspensions.length;
+    const commandsBefore = h.commands.calls.length;
 
     // Every write on the zone's accessory refuses, the manual run and the suspension alike, and neither reaches the wire.
     await assert.rejects(() => triggerSet(standaloneValve(h), Characteristic.Active.ACTIVE), noResponse, "the manual run refuses while the cloud says offline");
     await assert.rejects(() => triggerSet(zoneSwitch, true), noResponse, "and so does the suspension switch");
-    assert.equal(h.retrieve.callsTo("setzone.php").length, commandsBefore, "no command reached the API");
-    assert.equal(h.suspensions.length, suspensionsBefore, "and no suspension reached the account API");
+    assert.equal(h.commands.calls.length, commandsBefore, "no command reached the API, the run's or the suspension's");
   });
 
   test("facts aged exactly their lifetime still refuse, a second older refuse nothing, and the word follows on the next poll", async (t) => {
@@ -587,7 +584,6 @@ describe("HydrawiseController controller availability", () => {
       recorder.program("statusschedule.php", { body: { ...status, relays: [sibling] }, kind: "response" });
       recorder.program("statusschedule.php", { body: { ...status, relays: [ zone, sibling ] }, kind: "response" });
       recorder.programDefault("statusschedule.php", { body: { ...status, relays: [sibling] }, kind: "response" });
-      recorder.programDefault("setzone.php", { body: { message: "", message_type: "info" }, kind: "response" });
     }, signalAborted: false, userOptions: [STANDALONE_ON] });
 
     t.after(() => h.abort());
@@ -610,8 +606,9 @@ describe("HydrawiseController controller availability", () => {
     assert.equal(await triggerGet(valve), Characteristic.Active.ACTIVE, "the cached valve answers the value the poll that hosts it projected");
 
     await triggerSet(valve, Characteristic.Active.INACTIVE);
+    await h.controller.commandsIdle;
 
-    assert.equal(h.retrieve.callsTo("setzone.php").length, 1, "a stop reaches the wire, so the valve was bound when a poll first hosted it");
+    assert.equal(h.commands.calls.length, 1, "a stop reaches the wire, so the valve was bound when a poll first hosted it");
 
     // The zone drops off the wire again, and the accessory is held through its grace with nothing describing it.
     await advanceThroughSchedule(clock, [sleep]);
