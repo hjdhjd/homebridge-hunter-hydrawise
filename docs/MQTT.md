@@ -65,7 +65,7 @@ The topics and messages that `homebridge-hunter-hydrawise` publishes are:
 
 | Topic           | Message Published
 |-----------------|----------------------------------
-| `availability`  | `online` when the plugin can reach Hydrawise for this controller, `offline` when it cannot. Retained, so a subscriber attaching later reads the last statement. A controller is available only when this topic and the plugin-level `availability` topic both read `online`.
+| `availability`  | `online` when the plugin can vouch for the state it reports, `offline` when it cannot. Retained, so a subscriber attaching later reads the last statement. A controller is available only when this topic and the plugin-level `availability` topic both read `online`.
 | `controller`    | A JSON array with one entry per zone, in the order Hydrawise reports them, carrying each zone's `name`, `relay`, `run`, `time`, and `timestr`. While the enhanced-features data from your Hydrawise account login is current, each entry also carries `state`, and a suspended zone carries `suspendedUntil`.
 | `rainsensors`   | A JSON array with one entry per rain sensor Hydrawise lists for the controller, carrying each sensor's `id`, `name`, and `tripped`. It is empty while the enhanced-features data from your Hydrawise account login is not current, or cannot say which rain sensors exist.
 

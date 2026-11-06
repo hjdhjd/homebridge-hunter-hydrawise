@@ -9,8 +9,8 @@ import { mqttAvailabilityEntryFor, mqttTopicCatalog } from "homebridge-plugin-ut
  * docs/MQTT.md, so what the document prints cannot disagree with what the plugin puts on the wire. The presence of `publish`, `get`, and `set` on an entry is the
  * declaration that the plugin performs each verb.
  *
- * The availability entry is the family's own, composed for this plugin's nouns: what the plugin reaches is the Hydrawise cloud, and what it declares available is a
- * controller, so the library's sentence carries those words while the library keeps the sentence itself.
+ * The availability entry is the family's own, composed for this plugin's subject: what it declares available is a controller, so HBPU's sentence carries that word
+ * while HBPU keeps the sentence itself.
  *
  * The library's builder validates the declaration the moment this module is evaluated, so a malformed catalog fails the plugin's own import rather than reaching a
  * broker. The export carries no type annotation because the builder types it: annotating it would widen the topic to `string` and silence the compile-time check
@@ -21,7 +21,7 @@ import { mqttAvailabilityEntryFor, mqttTopicCatalog } from "homebridge-plugin-ut
  */
 export const mqttTopics = mqttTopicCatalog({
 
-  availability: mqttAvailabilityEntryFor({ reaches: "Hydrawise for this controller", subject: "A controller" }),
+  availability: mqttAvailabilityEntryFor({ subject: "A controller" }),
   controller: {
 
     get: "`true` requests a publish of the controller's current status on the `controller` topic.",
