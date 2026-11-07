@@ -5,8 +5,9 @@
  * SyncName, whose default the suite holds off, else the user - the renames that keep an owned name current, the exact-compare that keeps a matching name from
  * being rewritten on every poll, the creation-only behavior a name the user owns keeps, the watches that put an owned name back the moment the Home app renames
  * it and the lifetime each pass and each removal gives them, the same contract applied to the controller's own surfaces - its irrigation system service, its
- * accessory, and its suspend-all switch - the scopes the framework enforces for the Name option at either grain, the kind's word a name HomeKit cannot carry
- * falls back to, with the warning it draws, and the log prefix, which names the controller as its tile does.
+ * accessory, and its suspend-all switch - the accessory's display name, which follows the composed name from construction on whoever owns the HomeKit names,
+ * the scopes the framework enforces for the Name option at either grain, the kind's word a name HomeKit cannot carry falls back to, with the warning it draws,
+ * and the log labels, which name the controller and each zone by the Name option or the Hydrawise name, never by a rename made in the Home app.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
@@ -56,6 +57,9 @@ const WIRE_UNRELATED = "Side Yard Beds";
 // A second account name for the same zone, so a scenario can show a real facts answer REPLACING a carried one rather than merely coinciding with it.
 const ACCOUNT_RENAMED = "Front Lawn South Border Drip";
 
+// An account name for the zone that does not extend its wire name, so the carry never offers it and only the current facts can name the zone by it.
+const ACCOUNT_UNRELATED = "Vegetable Garden Beds";
+
 /* The controller's own names, one per source and each on different terms: what the key-based wire reports (the synthetic controller's own), what the account
  * API calls it, and what a user configures. The suffix the suspend-all switch composes is stated once here rather than at each assertion.
  */
@@ -68,6 +72,9 @@ const CONTROLLER_ACCOUNT_NAME = "Backyard Irrigation System";
 const CONTROLLER_ACCOUNT_EXTENDED = CONTROLLER_WIRE_NAME + " North Wing";
 
 const CONTROLLER_OVERRIDE_NAME = "Garden Controller";
+
+// A name a previous session left on a restored accessory that the controller does not compose, standing for a cleared Name or a rename across a restart.
+const STALE_CONTROLLER_NAME = "Former Controller Name";
 
 // A controller override carrying characters HomeKit's rules rewrite, so the name on the service can never equal the configured value and only a comparison that
 // sanitizes both sides settles.
@@ -772,6 +779,29 @@ describe("the name carry across a restart", () => {
     assert.equal(identityOf(malformed)?.name, CONTROLLER_WIRE_NAME, "a malformed prior degrades to the wire's own projection rather than being trusted");
   });
 
+  test("a restored, credentialed controller whose cache lacks its irrigation system creates it under the full name its self-identity carries", async (t) => {
+
+    /* The irrigation system is created through the controller's own composer, which reads the carry the restored self-identity offers, so a cache that came back
+     * without the service is not handed the wire's cut form before the account answers. With neither a Name nor SyncName set the user owns the name from then on,
+     * so the name the service is created under is the one it keeps.
+     */
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }),
+      seedContext: (seed) => { seed.context = { controller: { controllerId: 500001, name: CONTROLLER_ACCOUNT_EXTENDED, serialNumber: CONTROLLER_SERIAL } }; },
+      signalAborted: false });
+
+    t.after(() => h.abort());
+
+    // Read before any poll can land: the first status fetch is still in flight when construction returns, so the service here is the one construction created.
+    const created = nameOf(irrigationOf(h));
+
+    await pollPast(h);
+    await h.abort();
+
+    assert.equal(created, CONTROLLER_ACCOUNT_EXTENDED, "the irrigation system is created under the full name the restored self-identity carries");
+    assert.equal(nameOf(irrigationOf(h)), CONTROLLER_ACCOUNT_EXTENDED, "and keeps it across a poll, since the user owns the name");
+  });
+
   test("a facts entry with no usable name HOLDS the carry, while a real one replaces it", async (t) => {
 
     /* The null asymmetry, which differs from the suspension carry's on purpose. The projection normalizes an empty or whitespace-only account name to null, so a
@@ -871,7 +901,7 @@ describe("controller naming", () => {
     assert.equal(nameOf(suspendSwitchOf(h)), CONTROLLER_ACCOUNT_NAME + SUSPEND_ALL_SUFFIX, "and the suspend-all switch recomposes its own name from it");
   });
 
-  test("renames nothing when synchronization is disabled at the controller, and still records the account's name as its identity", async (t) => {
+  test("renames no HomeKit name when synchronization is disabled at the controller, and still records the account's name as its identity", async (t) => {
 
     const h = buildController({ hasV2Client: true,
       program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }), signalAborted: false,
@@ -889,10 +919,99 @@ describe("controller naming", () => {
     await pollPast(h);
     await h.abort();
 
-    assert.equal(nameOf(irrigation), CONTROLLER_WIRE_NAME, "no poll re-asserts a name while synchronization is disabled");
-    assert.equal(h.accessory.displayName, CONTROLLER_WIRE_NAME, "the accessory keeps the name it had");
-    assert.equal(nameOf(suspendSwitchOf(h)), CONTROLLER_WIRE_NAME + SUSPEND_ALL_SUFFIX, "and so does the switch composed from it");
-    assert.equal(identityOf(h)?.name, CONTROLLER_ACCOUNT_NAME, "while the persisted identity still carries what the account calls this controller");
+    assert.equal(nameOf(irrigation), CONTROLLER_WIRE_NAME, "no poll re-asserts a HomeKit name while synchronization is disabled");
+    assert.equal(nameOf(suspendSwitchOf(h)), CONTROLLER_WIRE_NAME + SUSPEND_ALL_SUFFIX, "and so the switch keeps the name it was created with");
+    assert.equal(h.accessory.displayName, CONTROLLER_ACCOUNT_NAME, "while the accessory's display name, which HomeKit never reads, follows the account's name");
+    assert.equal(identityOf(h)?.name, CONTROLLER_ACCOUNT_NAME, "and the persisted identity still carries what the account calls this controller");
+  });
+
+  test("with neither a Name nor SyncName set, a rename on the Hydrawise side moves the accessory's display name and leaves its information service's names",
+    async (t) => {
+
+      /* The display name is Homebridge's own label, which the accessory cache and the settings page list the controller by, so it follows the name the plugin
+       * composes whoever owns the HomeKit names. The accessory is seeded as an earlier session that owned its name left it, so its information service carries the
+       * ConfiguredName the Home app writes beside its Name, and each is read against the account's name.
+       */
+      const h = buildController({ hasV2Client: true,
+        program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }),
+        seedContext: (seed) => setAccessoryName(seed, CONTROLLER_WIRE_NAME), signalAborted: false });
+
+      t.after(() => h.abort());
+
+      const information = informationOf(h);
+
+      h.controller.applyFacts({ facts: controllerV2Facts(CONTROLLER_ACCOUNT_NAME), fetchedAt: seconds(h.clock) });
+
+      await settleUntil(() => h.accessory.displayName === CONTROLLER_ACCOUNT_NAME, { description: "the display name to take the account's name" });
+      await pollPast(h);
+      await h.abort();
+
+      assert.equal(h.accessory.displayName, CONTROLLER_ACCOUNT_NAME, "the accessory's display name follows the account's name");
+      assert.equal(information.getCharacteristic(Characteristic.ConfiguredName).value, CONTROLLER_WIRE_NAME,
+        "while the information service keeps its ConfiguredName, since the user owns it");
+      assert.equal(information.getCharacteristic(Characteristic.Name).value, CONTROLLER_WIRE_NAME, "and its Name");
+    });
+
+  test("with SyncName off, a Name cleared mid-run moves the accessory's display name back to the controller's own name with one save, and the next pass saves none",
+    async (t) => {
+
+      /* While the Name is set it owns every name the controller shows. Clearing it with SyncName off hands the HomeKit names to the user, who keeps the ones the
+       * Name left, while the display name follows the composed name back to the name Hydrawise reports. That move is a write of the accessory cache, so it costs
+       * one save, and a pass that finds the display name already in place costs none.
+       */
+      const h = buildController({ accessoryName: CONTROLLER_OVERRIDE_NAME,
+        program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }), signalAborted: false,
+        userOptions: ["Enable.Device.Name." + CONTROLLER_SERIAL + "=" + CONTROLLER_OVERRIDE_NAME] });
+
+      t.after(() => h.abort());
+
+      await settleUntil(() => h.flushes().length >= 2, { description: "the first poll's accessory flush, after construction's" });
+      await pollPast(h);
+
+      const settled = h.flushes().length;
+
+      h.platform.featureOptions.configuredOptions = [];
+
+      await advanceUntil(h.clock, () => h.accessory.displayName === CONTROLLER_WIRE_NAME, { description: "the display name to return to the controller's own name" });
+
+      const afterClear = h.flushes().length;
+
+      await pollPast(h);
+      await h.abort();
+
+      assert.equal(h.accessory.displayName, CONTROLLER_WIRE_NAME, "the display name returns to the name Hydrawise reports");
+      assert.equal(afterClear, settled + 1, "and the move costs exactly one cache write");
+      assert.equal(h.flushes().length, afterClear, "which the pass after it does not repeat");
+      assert.equal(nameOf(informationOf(h)), CONTROLLER_OVERRIDE_NAME, "while the information service keeps the name the Name left, which the user owns");
+      assert.equal(nameOf(irrigationOf(h)), CONTROLLER_OVERRIDE_NAME, "and so does the irrigation system");
+    });
+
+  test("a restored accessory carrying a stale display name, with SyncName off and Suspend All newly on, creates its switch under the composed name and opens its " +
+    "first line with it", async (t) => {
+
+    /* A previous session left the accessory under a name the controller does not compose, its information service carrying it too. Construction aligns the
+     * display name before any configure step runs, and leaves the information service's names to the poll's ownership decision. The log prefix and the switch's
+     * created name read the aligned display name, so the switch is born under the composed name and the line the switch's setup writes opens with it.
+     */
+    const h = buildController({ accessoryName: STALE_CONTROLLER_NAME,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }),
+      seedContext: (seed) => setAccessoryName(seed, STALE_CONTROLLER_NAME), signalAborted: false, userOptions: ["Enable.Device.Suspend.All"] });
+
+    t.after(() => h.abort());
+
+    // Read before any poll can land: the first status fetch is still in flight when construction returns, so what the accessory carries here is construction's.
+    const displayName = h.accessory.displayName;
+    const informationName = nameOf(informationOf(h));
+    const switchName = nameOf(suspendSwitchOf(h));
+    const switchLine = ": Without your Hydrawise account login, the Suspend All switch shows an estimate";
+
+    await h.abort();
+
+    assert.equal(displayName, CONTROLLER_WIRE_NAME, "construction aligns the display name with the name the controller composes");
+    assert.equal(informationName, STALE_CONTROLLER_NAME, "while the information service keeps its names until a poll decides who owns them");
+    assert.equal(switchName, CONTROLLER_WIRE_NAME + SUSPEND_ALL_SUFFIX, "the switch is created under the composed name");
+    assert.equal(logCount(h.entries, "info", CONTROLLER_WIRE_NAME + switchLine), 1, "and the first line before any poll opens with it");
+    assert.equal(logCount(h.entries, "info", STALE_CONTROLLER_NAME + ":"), 0, "and no line opens with the stale name");
   });
 
   test("shows the user's own name while the identity keeps the account's", async (t) => {
@@ -1404,12 +1523,11 @@ describe("the naming rule", () => {
     assert.equal(irrigationOf(h).getCharacteristic(Characteristic.Name).value, CONTROLLER_WIRE_NAME, "while the irrigation system keeps the name it was created with");
   });
 
-  test("with neither a Name nor SyncName set, a controller's log line names it as its tile does after a rename made in the Home app", async (t) => {
+  test("with neither a Name nor SyncName set, a controller's log line names it by its Hydrawise name after a rename made in the Home app", async (t) => {
 
-    /* The log prefix reads the controller accessory's information service, the tile the Home app renames, rather than the irrigation system, which carries Name
-     * alone and keeps the name it was created with, so a line the controller writes names the controller as the Home app shows it. The user owns the name, so the
-     * rename stands, and the accessory is seeded as an earlier synced session left it, so its information service carries the ConfiguredName the Home app writes,
-     * and the controller's setup keeps it as it stands.
+    /* The log prefix reads the accessory's display name, which follows the name the plugin composes, so a line the controller writes names it as the settings page
+     * does rather than as the Home app shows it. The user owns the name, so the rename stands on the tile, and the accessory is seeded as an earlier synced session
+     * left it, so its information service carries the ConfiguredName the Home app writes, and the controller's setup keeps it as it stands.
      */
     const h = buildController({ hasV2Client: true,
       program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }),
@@ -1428,7 +1546,65 @@ describe("the naming rule", () => {
 
     assert.equal(nameOf(informationOf(h)), HOME_APP_NAME, "the tile carries the Home app's name");
     assert.equal(irrigationOf(h).getCharacteristic(Characteristic.Name).value, CONTROLLER_WIRE_NAME, "while the irrigation system keeps the name it was created with");
-    assert.equal(logCount(h.entries, "info", HOME_APP_NAME + ": The controller is offline."), 1, "and the controller's line opens with the tile's name");
+    assert.equal(logCount(h.entries, "info", CONTROLLER_WIRE_NAME + ": The controller is offline."), 1, "and the controller's line opens with its Hydrawise name");
+    assert.equal(logCount(h.entries, "info", HOME_APP_NAME + ":"), 0, "and no line opens with the tile's name");
+  });
+
+  test("with neither a Name nor SyncName set, a zone whose valve the Home app renamed logs under its Hydrawise name", async (t) => {
+
+    // The cache restores the valve under a rename made in the Home app, which stands while the user owns the name, and the zone's first line still names it as
+    // the plugin composes it.
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }),
+      seedContext: seedNamedValve(HOME_APP_NAME), signalAborted: false });
+
+    t.after(() => h.abort());
+
+    const valve = await valveOf(h);
+
+    await pollPast(h);
+    await h.abort();
+
+    assert.equal(nameOf(valve), HOME_APP_NAME, "the valve keeps the Home app's name");
+    assert.equal(logCount(h.entries, "info", WIRE_NAME + " [Zone 1]: "), 1, "while the zone's line opens with its Hydrawise name");
+    assert.equal(logCount(h.entries, "info", HOME_APP_NAME), 0, "and no line names the zone as the Home app does");
+  });
+
+  test("a zone whose Name HomeKit's rules rewrite logs under the name HomeKit carries", async (t) => {
+
+    // The label is sanitized as the valve's name is, so the log, the valve and the settings page name the zone alike.
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }),
+      signalAborted: false, userOptions: ["Enable.Device.Name." + ZONE_SUBTYPE + "=" + FREE_FORM_OVERRIDE] });
+
+    t.after(() => h.abort());
+
+    const valve = await valveOf(h);
+
+    await pollPast(h);
+    await h.abort();
+
+    assert.equal(nameOf(valve), FREE_FORM_SANITIZED, "the valve carries the Name as HomeKit's rules leave it");
+    assert.equal(logCount(h.entries, "info", FREE_FORM_SANITIZED + " [Zone 1]: "), 1, "and the zone's line opens with that same name");
+    assert.equal(logCount(h.entries, "info", FREE_FORM_OVERRIDE), 0, "and never with the Name as it was typed");
+  });
+
+  test("a manual start under account facts naming a zone apart from its wire name opens its line with the account's name", async (t) => {
+
+    // A line outside the poll's walk composes its zone's label from the current facts, so the account's name reaches it even where the carry could never offer it.
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }), signalAborted: false });
+
+    t.after(() => h.abort());
+
+    const valve = await valveOf(h);
+
+    h.controller.applyFacts({ facts: v2Facts(ACCOUNT_UNRELATED), fetchedAt: seconds(h.clock) });
+
+    await triggerSet(valve.getCharacteristic(Characteristic.Active), Characteristic.Active.ACTIVE);
+    await h.controller.commandsIdle;
+    await h.abort();
+
+    assert.equal(logCount(h.entries, "info", ACCOUNT_UNRELATED + " [Zone 1]: Manually started"), 1, "the manual start's line opens with the account's name");
+    assert.equal(logCount(h.entries, "info", WIRE_NAME + " [Zone 1]: Manually started"), 0, "and not with the wire's");
   });
 });
 

@@ -801,9 +801,10 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
     /* The name a FRESH accessory is created under, the controller composer's answer: the user's Name option where HomeKit can carry it, the name Hydrawise reports
      * where HomeKit can carry that, and the controller word otherwise, so the mint never meets HAP's refusal of an empty name and discovery goes on to every later
-     * controller. The mint says nothing about a fallback, because the controller's own services decide that warning once it is built. A cached accessory keeps
-     * whatever display name it came back with, because discovery leaves a cached name to the poll's rename step, where the naming rule decides: a set Name applies
-     * there, with none synchronization applies the name Hydrawise reports, and with neither the user's name stands.
+     * controller. The mint says nothing about a fallback, because the controller's own services decide that warning once it is built. A cached accessory comes back
+     * with whatever display name it carried, and the controller aligns it with the name it composes as it constructs, so the save below carries that write. Its
+     * HomeKit names are left to the poll's rename step, where the naming rule decides: a set Name applies there, with none synchronization applies the name
+     * Hydrawise reports, and with neither the user's names stand.
      *
      * The read presents the serial and nothing else, which is the single-id rule every runtime reader of this option keeps: the option resolves at the controller
      * and the zone alike, so a read carrying a second id would answer with something written for another scope.
@@ -876,8 +877,8 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
    * HomeKit identity the user placed in a room.
    *
    * Every arm's cache write is strictly on-change. A demotion unregisters its accessory, which has Homebridge write its cache, while a creation or a context
-   * refresh marks just its accessory for the platform's save window. A poll on which a zone is renamed on the wire marks the same accessory here and, where the
-   * plugin owns the zone's name, again for the controller's own accessory-name write, and the window carries the marks as one save.
+   * refresh marks just its accessory for the platform's save window. A poll on which a zone is renamed on the wire marks the same accessory here and again for the
+   * controller's own write of the accessory's names, which moves its display name whoever owns the zone's name, and the window carries the marks as one save.
    *
    * This method never touches a service: what lands on a hosted accessory is the controller's business.
    *
@@ -970,20 +971,23 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   private establishZoneAccessory({ controller, log, uuid, zone }: { controller: HydrawiseControllerConfig; log: HomebridgePluginLogging; uuid: string;
     zone: { displayName: string; identity: HydrawiseZoneIdentity }; }): HydrawiseZoneSetupOutcome {
 
+    // The request carries the zone's name as the controller composed it, unsanitized as every composed name travels, so it is sanitized once here, as HomeKit
+    // carries it: the accessory is minted under it, and each line below names the zone as the controller's own log label does.
+    const displayName = sanitizeName(zone.displayName);
     let accessory = this.accessories.find(entry => entry.UUID === uuid);
 
     try {
 
       if(!accessory) {
 
-        accessory = this.addAccessory(sanitizeName(zone.displayName), uuid, HYDRAWISE_ZONE_ACCESSORY_CATEGORY);
+        accessory = this.addAccessory(displayName, uuid, HYDRAWISE_ZONE_ACCESSORY_CATEGORY);
 
         // A fresh accessory starts with a fresh grace window even when an earlier accessory at this UUID was removed for sustained absence, so an inherited
         // count can never truncate the new one.
         this.zoneAccessoryGrace.delete(uuid);
 
         log.info("%s: Added a standalone HomeKit accessory for this zone so it can be assigned to a room. Automations, scenes, and room assignments " +
-          "that referenced this zone on the controller accessory must be set up again in the Home app.", zone.displayName);
+          "that referenced this zone on the controller accessory must be set up again in the Home app.", displayName);
       }
 
       /* Seed or refresh the persisted identity pair. The comparison is field-wise because both halves are freshly built projections, so a reference check would
@@ -1006,7 +1010,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       return { accessory, status: "established" };
     } catch(error) {
 
-      log.error("%s: Unable to establish a standalone accessory for this zone: %s.", zone.displayName, formatErrorMessage(error));
+      log.error("%s: Unable to establish a standalone accessory for this zone: %s.", displayName, formatErrorMessage(error));
 
       return { status: "failed" };
     }

@@ -6,8 +6,8 @@
 
 import { API_KEY_LENGTH, makeHydrawiseConfig, makeHydrawiseNames, makeLegacyHydrawiseConfig } from "./lib/webui/config.js";
 import { FeatureOptions, buildCatalogIndex, enumerateConfiguredEntries, expandOption } from "homebridge-plugin-utils/featureOptions.js";
-import { ZONE_STATE_LABELS, cachedAccessoryName, cachedControllerHardware, cachedValveName, deriveControllerDisplay, deriveControllerStrip, deriveZoneDisplay,
-  deriveZoneStrip, formatRunTime, zoneScheduleState } from "./lib/webui/display.js";
+import { ZONE_STATE_LABELS, cachedControllerHardware, deriveControllerDisplay, deriveControllerStrip, deriveZoneDisplay, deriveZoneStrip, formatRunTime,
+  zoneScheduleState } from "./lib/webui/display.js";
 import { createActionGuard, withDeadline } from "homebridge-plugin-utils/webUi-liveness.mjs";
 import { displayedName, sanitizeName } from "homebridge-plugin-utils/homekit-name.js";
 import { PluginConfigSession } from "homebridge-plugin-utils/pluginConfigSession.mjs";
@@ -130,13 +130,14 @@ let hydrawiseConfig = makeLegacyHydrawiseConfig({ FeatureOptions, readOptionsSet
  */
 const hydrawiseNames = makeHydrawiseNames({ displayedName, sanitizeName });
 
-/* The page's one rule for a controller's label, which every place this page names a controller reads: the user's configured override where HomeKit can carry it,
- * then the name HomeKit last showed on the controller's own cached accessory, then the identity name for a controller with no accessory cached. The tile's name
- * comes before the identity because it is what HomeKit shows, which the identity is not wherever the user owns the name: a rename they made in the Home app
- * stands on the tile, and a rename on the Hydrawise side reaches the identity alone. The identity is the name the session roster holds rather than a listing's
- * label, which carries sidebar decoration such as the pending-restart suffix.
+/* The page's one rule for a controller's label, which every place this page names a controller reads, and the name the plugin logs the controller under: the
+ * user's configured override where HomeKit can carry it, then the controller's own Hydrawise name. That name is the self-identity its cached accessory persists,
+ * which carries the account's full name, and the session roster's name for a controller with no accessory of its own. The self-identity comes first because the
+ * roster every construction writes holds the name the key-based wire reports, cut short, until an account refresh restores it. A rename made in the Home app
+ * stays in HomeKit and never names a row. The roster's name is the one the session holds rather than a listing's label, which carries sidebar decoration such
+ * as the pending-restart suffix.
  */
-const controllerLabel = ({ accessory, identity, override }) => hydrawiseNames.controllerName({ override, reported: cachedAccessoryName(accessory) ?? identity });
+const controllerLabel = ({ accessory, identity, override }) => hydrawiseNames.controllerName({ override, reported: accessory?.context?.controller?.name ?? identity });
 
 // Build the feature-option engine over the cached catalog and the user's configured options, read through HBPU's reader as every read of the setting here is. The
 // engine is rebuilt per call because the configured options change underneath us as the user edits them, so an edit the user just saved is reflected the next
@@ -476,7 +477,7 @@ const getControllers = async ({ config }) => {
   let cached;
 
   // (a) The union of every validated cached accessory's denormalized controller roster, plus the zone ids those accessories own so a zone-scope floor entry is not
-  // mistaken for a disabled controller below. The cache read is kept for the names below, which read each controller's own accessory from it.
+  // mistaken for a disabled controller below. The cache read is kept for the names below, which read each controller's self-identity from its own accessory.
   try {
 
     cached = await homebridge.getCachedAccessories();
@@ -570,9 +571,9 @@ const getControllers = async ({ config }) => {
     overrides.clear();
   }
 
-  /* (c) Resolve the session roster to the framework's controller shape, each name composed by controllerLabel, the rule the controller's panel entry reads too.
-   * A session entry with no current backing whose serial was in the floor earlier this session is a re-enable awaiting a restart, so we mark it after composing;
-   * the entry stays listed either way.
+  /* (c) Resolve the session roster to the framework's controller shape, each name composed by controllerLabel, the rule the controller's panel entry reads too,
+   * from the controller's own accessory where one is cached and from the roster entry otherwise. A session entry with no current backing whose serial was in the
+   * floor earlier this session is a re-enable awaiting a restart, so we mark it after composing; the entry stays listed either way.
    */
   const resolved = [];
 
@@ -738,33 +739,20 @@ const getDevices = async (controller, { config } = {}) => {
    * selects on load, hidden from the zone list and reporting the zone count.
    *
    * A zone's sidebar label is its relay number and its effective name: the user's configured override where HomeKit can carry it - so a just-saved edit reads
-   * back immediately - then the name HomeKit last showed, then the name Hydrawise reported. The sidebar number is an affordance only; it is part of a HomeKit name
-   * only where the zone's word names it, and the controller pseudo-entry carries no number at all.
+   * back immediately - then the zone's own Hydrawise name, the name the plugin logs the zone under. A rename made in the Home app stays in HomeKit and never names
+   * a row. The sidebar number is an affordance only; it is part of a HomeKit name only where the zone's word names it, and the controller pseudo-entry carries no
+   * number at all.
    *
    * A zone row carries the bare name and its published state alongside that composed label, which is what the sidebar's own row renderer lays the number and the
    * name out in aligned columns from. The composed name stays the row's identity surface and the fallback whenever that renderer declines a row.
    */
-  /* The cached standalone accessories hosting this controller's zones, keyed by relay id. A zone the user has given its own accessory carries its last-flushed
-   * HomeKit name on that accessory rather than on the controller accessory, so the label arm below has to read the accessory the valve actually lives on.
-   * Ownership is matched on the folded serial, exactly as the controller match above matches its own.
-   */
-  const zoneHosts = new Map();
-
-  for(const accessory of cached) {
-
-    if(isZoneAccessoryLike(accessory?.context) && (foldSerial(accessory.context.ownerController.serialNumber) === targetSerial)) {
-
-      zoneHosts.set(accessory.context.zone.relayId, accessory);
-    }
-  }
-
   /* Each zone's effective display name, resolved once and read by every consumer below - the sidebar label and the controller entry's name map - so a zone reads
-   * as the same name wherever it is named. The arms and their order are the listing's own: the configured override, then the name HomeKit last showed on whichever
-   * accessory hosts the valve, then the name Hydrawise reported, composed through the page's naming rule, so an override HomeKit cannot carry yields to the arms
-   * after it and a zone HomeKit can carry no name for reads as its word and number, each name shown as HomeKit carries it.
+   * as the same name wherever it is named. The arms and their order are the listing's own: the configured override, then the zone's Hydrawise name as the zone
+   * roster this listing resolved holds it, composed through the page's naming rule, so an override HomeKit cannot carry yields to the roster's name and a zone
+   * HomeKit can carry no name for reads as its word and number, each name shown as HomeKit carries it.
    */
   const displayNames = new Map(zones.map((zone) => [ zone.relayId, hydrawiseNames.zoneName({ override: overrides.get(zone.relayId), relay: zone.relay,
-    reported: cachedValveName(zoneHosts.get(zone.relayId) ?? matched, zone.relayId) ?? zone.name }) ]));
+    reported: zone.name }) ]));
 
   /* The controller's persisted schedule projection, resolved once from the same matched accessory the zones came from and shape-checked before any consumer reads
    * it. A context-less controller, a legacy cache written before this projection existed, and a corrupt entry all resolve to null, and every renderer treats that

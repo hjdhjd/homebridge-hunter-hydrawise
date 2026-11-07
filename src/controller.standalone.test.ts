@@ -402,7 +402,7 @@ describe("HydrawiseController standalone zones", () => {
     assert.equal(h.flushes().filter(batch => batch.includes(zoneAccessory)).length, settled, "neither the restore nor the poll after it saves the zone accessory");
   });
 
-  test("leaves the zone accessory's name alone when synchronization is off", async (t) => {
+  test("with synchronization off, a Hydrawise rename moves the zone accessory's display name alone, saving it once for the rename", async (t) => {
 
     const h = buildController({ program: (recorder) => {
 
@@ -414,10 +414,16 @@ describe("HydrawiseController standalone zones", () => {
     await advanceThroughPolls(h,3);
     await h.abort();
 
-    // The accessory was created under the first poll's name and is never re-touched, so the rename does not reach it, and only its establishment saves it.
-    assert.equal(h.zoneAccessories.get(STANDALONE_RELAY_ID)?.displayName, WIRE_NAME_SANITIZED, "an opted-out zone keeps the name its accessory was created with");
-    assert.equal(h.flushes().filter(batch => batch.includes(present(h.zoneAccessories.get(STANDALONE_RELAY_ID), "the zone's accessory"))).length, 1,
-      "and the accessory is saved once, when it is established, with the rename saving nothing on it");
+    /* The accessory was created under the first poll's name. Its display name follows the zone's effective name on every poll whoever owns the zone's HomeKit
+     * names, while the user owns its information service's name, so the rename moves the display name alone. The accessory is saved once when it is established
+     * and once for the display rename.
+     */
+    const zoneAccessory = present(h.zoneAccessories.get(STANDALONE_RELAY_ID), "the zone's accessory");
+
+    assert.equal(zoneAccessory.displayName, WIRE_RENAMED_SANITIZED, "an opted-out zone's accessory takes the Hydrawise rename as its display name, sanitized");
+    assert.equal(getServiceName(zoneAccessory.getService(Service.AccessoryInformation)), WIRE_NAME_SANITIZED,
+      "while its information service keeps the name it was created with");
+    assert.equal(h.flushes().filter(batch => batch.includes(zoneAccessory)).length, 2, "and the accessory is saved twice: when it is established, and for the rename");
   });
 
   test("attaches the manual-run handler to a cache-restored valve on a warm restart", async (t) => {

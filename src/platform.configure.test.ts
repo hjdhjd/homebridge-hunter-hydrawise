@@ -153,10 +153,11 @@ describe("HydrawisePlatform configure", () => {
     assert.equal(logCount(entries, "error", "stopped unexpectedly"), 0, "and nothing ends it early");
   });
 
-  test("leaves a cached accessory's display name alone at discovery, whatever the Name option says", async (t) => {
+  test("reuses a cached accessory at discovery and aligns its display name, while its HomeKit names wait for the poll", async (t) => {
 
-    /* Discovery establishes a name, it never corrects one. A cached accessory comes back under the name it was saved with, and bringing it into line is the
-     * rename step's job on the poll cadence, which holds a set Name whatever synchronization says.
+    /* Discovery sets a cached accessory's display name, Homebridge's own label, to the name the controller composes as it constructs, the Name option here. The
+     * HomeKit names move only on the poll's ownership decision, where the rename step holds a set Name whatever synchronization says, so discovery leaves the
+     * information service with the name the accessory came back with.
      *
      * No status reply is programmed, so no poll lands and discovery's own behavior is the only thing the assertions can be reading. A poll landing mid-assertion
      * would rename the accessory for an entirely legitimate reason, and the assertion would be reading the clock.
@@ -173,8 +174,11 @@ describe("HydrawisePlatform configure", () => {
     emit(DID_FINISH_LAUNCHING);
     await settleUntil(() => cached.getService(Service.IrrigationSystem) !== undefined, { description: "the cached accessory's irrigation system to appear" });
 
+    const information = present(cached.getService(Service.AccessoryInformation), "the cached accessory's information service");
+
     assert.equal(registered().length, 0, "the cached accessory is reused rather than registered anew");
-    assert.equal(cached.displayName, "Test Controller", "and discovery does not rename it");
+    assert.equal(cached.displayName, "Garden Controller", "its display name takes the Name option as the controller constructs");
+    assert.equal(information.getCharacteristic(Characteristic.ConfiguredName).value, "Test Controller", "while its information service keeps the name it came back with");
   });
 
   test("short-circuits a second discovery pass without re-registering the controller", async (t) => {

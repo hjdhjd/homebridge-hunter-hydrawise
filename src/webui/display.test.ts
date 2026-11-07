@@ -1,18 +1,17 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
  * webui/display.test.ts: The webUI's pure schedule-display derivations, exercised against the very module ui.mjs renders from. Covers the zone classification
- * and the imminent-run window it splits on, the zone and controller row folds with their staleness verdicts and the status precedence, the formatters, the
- * device panel's stat strips with the cached-hardware gate that decides whether the hardware cells appear, and the cached names the page labels a controller and
- * a zone with.
+ * and the imminent-run window it splits on, the zone and controller row folds with their staleness verdicts and the status precedence, the formatters, and the
+ * device panel's stat strips with the cached-hardware gate that decides whether the hardware cells appear.
  *
  * This suite holds to disciplines that keep it deterministic: every instant is derived from one fixed anchor rather than a live clock, so a run of this suite
  * means the same thing at any hour, and every expected string a formatter produces is computed through the identical Intl call the formatter itself makes, so a
  * host whose locale or timezone differs moves both sides together rather than reddening a correct implementation.
  */
-import type { HydrawiseCachedAccessory, HydrawiseCachedService, HydrawiseScheduleMeta } from "./display.ts";
+import type { HydrawiseCachedAccessory, HydrawiseScheduleMeta } from "./display.ts";
 import type { HydrawiseScheduleStatus, HydrawiseZoneScheduleStatus } from "../types.ts";
-import { STALE_GRACE, ZONE_STATE_LABELS, cachedAccessoryName, cachedControllerHardware, cachedValveName, deriveControllerDisplay, deriveControllerStrip,
-  deriveZoneDisplay, deriveZoneStrip, formatMinutes, formatRunTime, zoneScheduleState } from "./display.ts";
+import { STALE_GRACE, ZONE_STATE_LABELS, cachedControllerHardware, deriveControllerDisplay, deriveControllerStrip, deriveZoneDisplay, deriveZoneStrip,
+  formatMinutes, formatRunTime, zoneScheduleState } from "./display.ts";
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 
@@ -421,56 +420,5 @@ describe("hydrawise webUI stat strips", () => {
       { label: "Relay ID", monospace: true, value: "700001" } ], "the zone's identity, as the panel shows it");
     assert.deepEqual(deriveZoneStrip({ relay: undefined, relayId: undefined }).map((row) => row.value), [ "", "" ],
       "a row carrying no identity renders empty cells rather than a word");
-  });
-});
-
-describe("hydrawise webUI cached names", () => {
-
-  // The names a cached service can carry, each distinct, so a reader that took the wrong characteristic or the wrong service cannot pass by coincidence.
-  const HOME_APP_NAME = "Patio Sprinklers";
-  const HOMEKIT_NAME = "Front Lawn";
-  const OTHER_NAME = "Back Beds";
-
-  // A serialized cached service of the named kind and subtype, carrying whichever name characteristics a scenario names.
-  function cachedService(constructorName: string, names: Record<string, string>, subtype?: string): HydrawiseCachedService {
-
-    return { characteristics: Object.entries(names).map(([ characteristic, value ]) => ({ constructorName: characteristic, value })), constructorName, subtype };
-  }
-
-  test("an accessory's tile reads its information service's ConfiguredName first and its Name second", () => {
-
-    assert.equal(cachedAccessoryName({ services: [cachedService("AccessoryInformation", { ConfiguredName: HOME_APP_NAME, Name: HOMEKIT_NAME })] }), HOME_APP_NAME,
-      "the ConfiguredName a rename in the Home app writes is the name HomeKit shows");
-    assert.equal(cachedAccessoryName({ services: [cachedService("AccessoryInformation", { Name: HOMEKIT_NAME })] }), HOMEKIT_NAME,
-      "an information service carrying Name alone reads that");
-    assert.equal(cachedAccessoryName({ services: [cachedService("AccessoryInformation", { ConfiguredName: "", Name: HOMEKIT_NAME })] }), HOMEKIT_NAME,
-      "and so does one whose ConfiguredName is empty");
-  });
-
-  test("an accessory's tile reads nothing where no information service, or no accessory, is cached", () => {
-
-    assert.equal(cachedAccessoryName({ services: [cachedService("Valve", { ConfiguredName: HOME_APP_NAME }, "700001")] }), undefined,
-      "a name on another kind of service is no tile's name");
-    assert.equal(cachedAccessoryName({}), undefined, "an accessory carrying no services reads nothing");
-    assert.equal(cachedAccessoryName(undefined), undefined, "and so does no accessory at all");
-  });
-
-  test("a zone's valve reads its ConfiguredName first and its Name second", () => {
-
-    assert.equal(cachedValveName({ services: [cachedService("Valve", { ConfiguredName: HOME_APP_NAME, Name: HOMEKIT_NAME }, "700001")] }, 700001), HOME_APP_NAME,
-      "the ConfiguredName a rename in the Home app writes is the name HomeKit shows");
-    assert.equal(cachedValveName({ services: [cachedService("Valve", { Name: HOMEKIT_NAME }, "700001")] }, 700001), HOMEKIT_NAME,
-      "a valve carrying Name alone reads that");
-  });
-
-  test("a zone's valve is found by its kind and its relay, past a service of another kind and a valve of another relay", () => {
-
-    const accessory = { services: [ cachedService("Switch", { ConfiguredName: OTHER_NAME }, "700001"), cachedService("Valve", { ConfiguredName: OTHER_NAME }, "700002"),
-      cachedService("Valve", { ConfiguredName: HOMEKIT_NAME }, "700001") ] };
-
-    assert.equal(cachedValveName(accessory, 700001), HOMEKIT_NAME, "the zone's own valve answers, not the switch sharing its subtype or another zone's valve");
-    assert.equal(cachedValveName(accessory, 700003), undefined, "a zone with no cached valve reads nothing");
-    assert.equal(cachedValveName({}, 700001), undefined, "an accessory carrying no services reads nothing");
-    assert.equal(cachedValveName(undefined, 700001), undefined, "and so does no accessory at all");
   });
 });

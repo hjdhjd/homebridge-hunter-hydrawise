@@ -622,7 +622,7 @@ function chooseName(override: Nullable<string> | undefined, reported: string): N
  *
  * @param options          - The controller's names.
  * @param options.override - The raw value of the controller's Name option, as the option engine answers it.
- * @param options.reported - The name the controller is known by: Hydrawise's own, or the name HomeKit already carries for it.
+ * @param options.reported - The name the controller is known by, as Hydrawise reports it.
  *
  * @returns The composed name and the source it came from.
  */

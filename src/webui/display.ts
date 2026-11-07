@@ -1,7 +1,7 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * webui/display.ts: Pure derivations of the Hydrawise schedule display and the device panel's stat strips, and the accessory-cache readers that recover the names
- * and the hardware HomeKit last showed.
+ * webui/display.ts: Pure derivations of the Hydrawise schedule display and the device panel's stat strips, and the accessory-cache reader that recovers the
+ * hardware HomeKit last showed.
  */
 import type { HydrawiseControllerHardware, HydrawiseScheduleStatus, HydrawiseZoneScheduleState, HydrawiseZoneScheduleStatus } from "../types.ts";
 import type { HOMEBRIDGE_UNKNOWN_FIRMWARE } from "../settings.ts";
@@ -46,7 +46,6 @@ export interface HydrawiseCachedService {
 
   characteristics?: { constructorName?: string; value?: unknown }[];
   constructorName?: string;
-  subtype?: string;
 }
 
 /**
@@ -383,18 +382,10 @@ export const cachedCharacteristic = (service: HydrawiseCachedService | undefined
   return ((typeof value === "string") && value.length) ? value : undefined;
 };
 
-// The cached AccessoryInformation service, located by the constructor name Homebridge serializes alongside it. Every reader of a tile's cached facts, its name and
-// a controller's hardware among them, reads the service through here, so the lookup lives once.
+// The cached AccessoryInformation service, located by the constructor name Homebridge serializes alongside it, which a controller's cached hardware is read from.
 const cachedInformationService = (accessory: HydrawiseCachedAccessory | undefined): HydrawiseCachedService | undefined => {
 
   return accessory?.services?.find((entry) => entry.constructorName === "AccessoryInformation");
-};
-
-// The name a cached service shows the user. ConfiguredName is the name a rename in the Home app writes and the one HomeKit shows, so it takes precedence over
-// Name, matching how the plugin's own service helpers read a service's name.
-const cachedServiceName = (service: HydrawiseCachedService | undefined): string | undefined => {
-
-  return cachedCharacteristic(service, "ConfiguredName") ?? cachedCharacteristic(service, "Name");
 };
 
 /* The firmware value Homebridge stamps on an accessory whose real version nothing has ever written. The runtime writes this same marker back whenever the account
@@ -427,40 +418,6 @@ export const cachedControllerHardware = (accessory: HydrawiseCachedAccessory | u
   }
 
   return { firmware, model };
-};
-
-/**
- * The name HomeKit last showed for a zone's valve, read from the cached accessory hosting it. The valve is located the way the framework's own cache reader
- * locates a service - by the constructor name Homebridge serializes alongside it - narrowed by the subtype the runtime keys each valve on, which is the zone's
- * relay id.
- *
- * This is the LAST-FLUSHED name, not a live mirror: Homebridge rewrites the accessory cache when an accessory is registered, updated, or unregistered, never on a
- * bare characteristic write. Where a Name option is set, or name synchronization is enabled, the plugin keeps each valve at its effective name, saving each
- * rename a poll makes and putting a rename made in the Home app back before any write of the cache could carry it, a restore being a rename the plugin does not
- * save, so this tracks that name closely. Where neither holds, a rename made in the Home app can sit here unsaved until the next write of the cache.
- *
- * @param accessory - The cached accessory hosting the valve, or `undefined` when none is cached.
- * @param relayId   - The zone's relay id.
- *
- * @returns The name, or `undefined` when no valve for the zone, or neither of its name characteristics, is cached.
- */
-export const cachedValveName = (accessory: HydrawiseCachedAccessory | undefined, relayId: number): string | undefined => {
-
-  return cachedServiceName(accessory?.services?.find((entry) => (entry.constructorName === "Valve") && (entry.subtype === relayId.toString())));
-};
-
-/**
- * The name HomeKit last showed for an accessory's tile, read from its cached AccessoryInformation service on the same last-flushed terms a valve's name is read.
- * The controller's setup gives every information service it configures the ConfiguredName a rename in the Home app writes, so where the user owns the name,
- * their rename reaches here with the next write of the cache; an accessory whose information service carries Name alone reads that.
- *
- * @param accessory - The cached accessory, or `undefined` when none is cached.
- *
- * @returns The name, or `undefined` when no information service, or neither of its name characteristics, is cached.
- */
-export const cachedAccessoryName = (accessory: HydrawiseCachedAccessory | undefined): string | undefined => {
-
-  return cachedServiceName(cachedInformationService(accessory));
 };
 
 /**

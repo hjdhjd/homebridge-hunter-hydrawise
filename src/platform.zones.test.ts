@@ -70,9 +70,9 @@ describe("HydrawisePlatform zone accessories (reconcile)", () => {
   test("promotes a requested zone onto an accessory seeded with the compound identity", () => {
 
     const zone = zoneFixture();
-    const { platform, registered, updated } = buildPlatform();
+    const { entries, platform, registered, updated } = buildPlatform();
 
-    assert.notEqual(sanitizeName(RAW_ZONE_NAME), RAW_ZONE_NAME, "the fixture name must differ from its sanitized form for the name assertion below to mean anything");
+    assert.notEqual(sanitizeName(RAW_ZONE_NAME), RAW_ZONE_NAME, "the fixture name must differ from its sanitized form for the name assertions below to mean anything");
 
     const hosts = platform.reconcileZoneAccessories({ controller: syntheticController, presentRelayIds: new Set([ZONE_RELAY_ID]),
       zones: [zoneRequest(zone)] });
@@ -84,6 +84,8 @@ describe("HydrawisePlatform zone accessories (reconcile)", () => {
     // The UUID is HAP's hash of the seed string, so a relay-only or controller-only seed hashes to another UUID and fails here.
     assert.equal(promoted?.UUID, zoneUuid(platform, 500001, 700001), "the accessory UUID is seeded from the controller id and the relay id");
     assert.equal(promoted.displayName, sanitizeName(RAW_ZONE_NAME), "the accessory carries the sanitized display name");
+    assert.equal(logCount(entries, "info", sanitizeName(RAW_ZONE_NAME) + ": Added a standalone HomeKit accessory"), 1,
+      "and the line announcing it opens with that same sanitized name");
     assert.equal(promoted.category, HYDRAWISE_ZONE_ACCESSORY_CATEGORY, "the accessory declares the sprinkler category");
     assert.deepEqual(Object.keys(promoted.context).toSorted(), [ "ownerController", "zone" ],
       "the zone context carries exactly the zone-accessory pair and no controller-accessory field");
@@ -298,7 +300,8 @@ describe("HydrawisePlatform zone accessories (reconcile)", () => {
     assert.equal(hosts.get(SECOND_RELAY_ID)?.UUID, zoneUuid(platform, 500001, 700002), "the other zone's accessory still lands");
     assert.equal(registered().length, 1, "only the healthy zone is registered");
     assert.equal(unregistered().length, 0, "the throw preceded the registration, so there is nothing to undo");
-    assert.ok(loggedAt(entries, "error", "Unable to establish a standalone accessory"), "the fault is reported against the zone it belongs to");
+    assert.ok(loggedAt(entries, "error", sanitizeName(RAW_ZONE_NAME) + ": Unable to establish a standalone accessory"),
+      "the fault is reported against the zone it belongs to");
 
     const failure = entries.find(entry => (entry.level === "error") && formatLogEntry(entry).includes("Unable to establish a standalone accessory"));
 
