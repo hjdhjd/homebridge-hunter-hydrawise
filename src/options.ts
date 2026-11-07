@@ -78,9 +78,9 @@ const mqtt = mqttFeatureOptions({ defaultTopic: HYDRAWISE_MQTT_TOPIC });
 // Feature option categories.
 export const featureOptionCategories = [
 
-  { description: "Account feature options.", name: "Account" },
-  { description: "Device feature options.", name: "Device" },
-  { description: "Logging feature options.", name: "Log" },
+  { description: "Hydrawise Account", name: "Account" },
+  { description: "Device", name: "Device" },
+  { description: "Logging", name: "Log" },
   mqtt.category
 ];
 

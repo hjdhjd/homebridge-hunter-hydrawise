@@ -56,7 +56,7 @@ const CREDENTIAL_SETTINGS = {
  */
 const ACCOUNT_CATALOG: HydrawiseConfigCatalog = {
 
-  categories: [{ description: "Account feature options.", name: "Account" }],
+  categories: [{ description: "Hydrawise Account", name: "Account" }],
   options: {
 
     Account: [ CONSOLIDATED_SETTINGS.apiKey, CREDENTIAL_SETTINGS.password, CREDENTIAL_SETTINGS.username ].map((option): HydrawiseFeatureOption => ({ default: false,
