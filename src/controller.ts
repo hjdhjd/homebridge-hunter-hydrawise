@@ -2123,15 +2123,16 @@ export class HydrawiseController {
   /* Make one command ready to send as its turn comes: the setzone parameters it carries, and what Hydrawise's confirmation of it sets in motion. Every command
    * names its controller, and a zone's command names its relay.
    *
-   * The instants a suspension carries are sent to Hydrawise, which reads them as wall-clock time, so they come from the host's own clock rather than the
-   * platform's, and they are taken as the command's turn comes rather than at the tap, so a command that waited behind others still runs to the whole horizon it
-   * asked for. Each floors to a whole second, the integer seconds the API expects rather than a fractional millisecond remainder. A suspension runs to a one-year
-   * horizon at both grains, through the same constant, because an open-ended suspension is what both commands mean and Hydrawise expresses that as a distant
-   * instant. The key-based API has no resume of its own, so a resume at either grain is a suspension until the current second, which has already passed.
+   * The instants a suspension carries are sent to Hydrawise, which reads them as wall-clock time. They come from the platform's clock, the system clock in the
+   * field, so the wire carries wall-clock seconds while the command record and a suite's clock read the same timeline, and they are taken as the command's turn
+   * comes rather than at the tap, so a command that waited behind others still runs to the whole horizon it asked for. Each floors to a whole second, the integer
+   * seconds the API expects rather than a fractional millisecond remainder. A suspension runs to a one-year horizon at both grains, through the same constant,
+   * because an open-ended suspension is what both commands mean and Hydrawise expresses that as a distant instant. The key-based API has no resume of its own, so a
+   * resume at either grain is a suspension until the current second, which has already passed.
    */
   private prepareCommand(target: HydrawiseCommandTarget, intent: HydrawiseCommandIntent): HydrawisePreparedCommand {
 
-    const now = Math.floor(Date.now() / 1000);
+    const now = Math.floor(this.platform.clock.now() / 1000);
     const params: Record<string, string> = {};
     const send = async (signal: AbortSignal): Promise<HydrawiseCommandOutcome> => this.platform.command({ params, signal });
 
@@ -2424,26 +2425,26 @@ export class HydrawiseController {
   private formatInstant(epochSeconds: number): string {
 
     const when = new Date(epochSeconds * 1000);
-    const now = new Date();
-    const clock = when.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+    const now = new Date(this.platform.clock.now());
+    const timeOfDay = when.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
 
     if(when.toDateString() === now.toDateString()) {
 
-      return clock;
+      return timeOfDay;
     }
 
     if(Math.abs(epochSeconds - Math.floor(now.getTime() / 1000)) < (7 * 24 * 60 * 60)) {
 
-      return when.toLocaleDateString(undefined, { weekday: "short" }) + " " + clock;
+      return when.toLocaleDateString(undefined, { weekday: "short" }) + " " + timeOfDay;
     }
 
     return when.toLocaleDateString();
   }
 
-  /* Retrieve the current status from the Hydrawise API. The fetch, the parse and the shape check run as one attempt of the status log, which classifies what the
-   * fetch came to before it releases the fetch's lines, and the failure is thrown after the attempt rather than inside it, because a throw inside an attempt leaves
-   * it unclassified and its lines at their own levels on every repeat. What is thrown is the error every failed poll throws, so pollOnce counts it and the retry
-   * waits and re-polls on the same terms; the stale status is never republished as fresh.
+  /* Retrieve the current status from the Hydrawise API. The fetch, whose body the platform reads inside the request's deadline, and the shape check run as one
+   * attempt of the status log, which classifies what the fetch came to before it releases the fetch's lines, and the failure is thrown after the attempt rather
+   * than inside it, because a throw inside an attempt leaves it unclassified and its lines at their own levels on every repeat. What is thrown is the error every
+   * failed poll throws, so pollOnce counts it and the retry waits and re-polls on the same terms; the stale status is never republished as fresh.
    */
   private async getStatus(): Promise<void> {
 
@@ -2474,8 +2475,9 @@ export class HydrawiseController {
     }
   }
 
-  /* One status fetch, as the status log runs it: the request, the parse, and the shape check, answering what the fetch came to. Every line it writes goes through
-   * the logger the attempt hands in, and the body becomes the controller's status here only once it has passed the check.
+  /* One status fetch, as the status log runs it: the request, whose body the platform reads inside the request's deadline, and the shape check of what that read
+   * came to, answering what the fetch came to. Every line it writes goes through the logger the attempt hands in, and the body becomes the controller's status
+   * here only once it has passed the check.
    */
   private async attemptStatus(log: HomebridgePluginLogging): Promise<HydrawiseStatusOutcome> {
 
@@ -2485,26 +2487,24 @@ export class HydrawiseController {
     params["controller_id"] = this.controller.controller_id.toString();
 
     const fetchedAt = Math.floor(this.platform.clock.now() / 1000);
-    const response = await this.platform.retrieve("statusschedule.php", params);
+    const answer = await this.platform.retrieve("statusschedule.php", params);
 
-    // A null response is a recoverable API error, or a shutdown abort, that retrieve() already classified and reported through its own request log, so nothing is
+    // A null answer is a recoverable API error, or a shutdown abort, that retrieve() already classified and reported through its own request log, so nothing is
     // said about it here.
-    if(!response) {
+    if(!answer) {
 
       return { status: "unanswered" };
     }
 
-    // Parse the body into a local and validate its shape before adopting it as our status. A valid-JSON body with the wrong shape would otherwise pass the cast
-    // and crash applyStatus outside every try/catch, tripping superviseLoop's terminal fault and stopping this controller's polling until a restart.
-    let parsed: unknown;
+    // A body the platform could not read is refused with the error its read met, the request's own deadline among them, which the request log left unsaid.
+    if(answer.status === "unreadable") {
 
-    try {
-
-      parsed = await response.body.json();
-    } catch(error) {
-
-      return this.refuseStatus({ error, log, status: "unreadable" });
+      return this.refuseStatus({ error: answer.error, log, status: "unreadable" });
     }
+
+    // Validate the parsed body's shape before adopting it as our status. A valid-JSON body with the wrong shape would otherwise pass the cast and crash applyStatus
+    // outside every try/catch, tripping superviseLoop's terminal fault and stopping this controller's polling until a restart.
+    const parsed = answer.body;
 
     if(!this.isStatusSchedule(parsed)) {
 

@@ -9,11 +9,11 @@
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
 import type { HydrawiseAccessoryContext, HydrawiseControllerIdentity, HydrawiseZoneConfig, HydrawiseZoneIdentity, StatusScheduleResponse } from "./types.ts";
-import { Service, buildController, makeV2Facts, seedEstablished } from "./testing/platform.helpers.ts";
+import { Service, advanceThroughPolls, buildController, makeV2Facts, seedEstablished } from "./testing/platform.helpers.ts";
 import { bareSensors, normalZoneMatrix } from "./api.fixtures.ts";
 import { describe, test } from "node:test";
-import { expectAt, waitUntil } from "homebridge-plugin-utils/testing";
-import { fastPolling, makeStatusSchedule, makeZone, normalSchedule } from "./api.helpers.ts";
+import { expectAt, settleUntil } from "homebridge-plugin-utils/testing";
+import { makeStatusSchedule, makeZone, normalSchedule } from "./api.helpers.ts";
 import { HYDRAWISE_ACTIVE_ZONE_INDICATOR } from "./settings.ts";
 import assert from "node:assert/strict";
 import { assertSameShape } from "./testing.helpers.ts";
@@ -25,10 +25,10 @@ import { scheduleStatus } from "./types.ts";
 const SELF_IDENTITY: HydrawiseControllerIdentity = { controllerId: 500001, name: "Test Controller", serialNumber: "SN0A1B2C3D4" };
 const SIBLING_IDENTITY: HydrawiseControllerIdentity = { controllerId: 500002, name: "Second Controller", serialNumber: "SN0E5F6G7H8" };
 
-// Compose a fast-cadence schedule around a zone list with a bare sensor block, so a live-loop test cycles in roughly 250ms.
+// Compose a wire-realistic schedule around a zone list with a bare sensor block, so a live-loop test steps the controller's clock across the sleep the wire asks for.
 function schedule(zones: HydrawiseZoneConfig[]): StatusScheduleResponse {
 
-  return fastPolling(makeStatusSchedule({ relays: zones, sensors: bareSensors }));
+  return makeStatusSchedule({ relays: zones, sensors: bareSensors });
 }
 
 // The identity-only projection the runtime persists for a reported zone list - the exact shape the webUI reads back from cache. This helper preserves
@@ -83,13 +83,14 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
 
   test("the first poll persists the full reported zone roster, feature-disabled zones included, identity fields only", async (t) => {
 
-    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: fastPolling(normalSchedule()), kind: "response" }),
-      signalAborted: false, userOptions: ["Disable.Device.700002"] });
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: normalSchedule(),
+      kind: "response" }), signalAborted: false, userOptions: ["Disable.Device.700002"] });
 
     t.after(() => h.abort());
 
-    // Construction saves the ConfiguredName the controller's setup adds before any poll, so the first poll's save is the second.
-    await waitUntil(() => h.flushes().length >= 2, { description: "the first poll's accessory flush, after construction's" });
+    // Construction saves the ConfiguredName the controller's setup adds before any poll, so the first poll's save is the second. The first poll goes out as the
+    // controller is built and lands within turns.
+    await settleUntil(() => h.flushes().length >= 2, { description: "the first poll's accessory flush, after construction's" });
 
     const zones = contextOf(h.accessory).zones;
 
@@ -103,17 +104,18 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
 
   test("an unchanged second poll does not re-flush", async (t) => {
 
-    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: fastPolling(normalSchedule()), kind: "response" }),
-      signalAborted: false });
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: normalSchedule(),
+      kind: "response" }), signalAborted: false });
 
     t.after(() => h.abort());
 
     // Construction saves the ConfiguredName the controller's setup adds, poll 1 seeds the roster from the empty seed and flushes once, and every later poll reports
     // the identical set. Bounding on the third call guarantees poll 2 fully ran its field-wise comparison before we read, so no flush past construction's and
     // poll 1's proves the unchanged poll took the no-change return.
-    await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 3, { description: "the third status poll" });
+    await advanceThroughPolls(h, 2);
     await h.abort();
 
+    assert.equal(h.retrieve.callsTo("statusschedule.php").length, 3, "the third poll began, so the unchanged second one ran its whole comparison");
     assert.equal(h.flushes().length, 2, "only construction and the first poll flush; an unchanged poll does not re-flush");
   });
 
@@ -133,7 +135,7 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
 
     t.after(() => h.abort());
 
-    await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 3, { description: "the third status poll" });
+    await advanceThroughPolls(h, 2);
     await h.abort();
 
     assert.equal(h.flushes().length, 3,
@@ -156,7 +158,7 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
 
     t.after(() => h.abort());
 
-    await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 3, { description: "the third status poll" });
+    await advanceThroughPolls(h, 2);
     await h.abort();
 
     assert.equal(h.flushes().length, 3,
@@ -183,7 +185,7 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
 
     t.after(() => h.abort());
 
-    await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 3, { description: "the third status poll" });
+    await advanceThroughPolls(h, 2);
     await h.abort();
 
     assert.equal(h.flushes().length, 1, "the rename saves exactly once, and nothing else in the run saves at all");
@@ -193,13 +195,13 @@ describe("HydrawiseController zone-roster persistence (poll)", () => {
 
   test("a runtime-built context conforms to the persisted identity shapes and survives a JSON round trip", async (t) => {
 
-    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: fastPolling(normalSchedule()), kind: "response" }),
-      roster: [ SELF_IDENTITY, SIBLING_IDENTITY ], signalAborted: false });
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: normalSchedule(),
+      kind: "response" }), roster: [ SELF_IDENTITY, SIBLING_IDENTITY ], signalAborted: false });
 
     t.after(() => h.abort());
 
     // Construction saves the ConfiguredName the controller's setup adds before any poll, so the first poll's save is the second.
-    await waitUntil(() => h.flushes().length >= 2, { description: "the first poll's accessory flush, after construction's" });
+    await settleUntil(() => h.flushes().length >= 2, { description: "the first poll's accessory flush, after construction's" });
 
     const context = contextOf(h.accessory);
     const referenceController: HydrawiseControllerIdentity = { controllerId: 0, name: "", serialNumber: "" };
@@ -233,7 +235,7 @@ describe("HydrawiseController account-roster persistence (refresh)", () => {
     const h = buildController({ hasV2Client: true });
     const tick = (roster: HydrawiseControllerIdentity[]): void => {
 
-      h.controller.applyFacts({ facts: makeV2Facts(), fetchedAt: Math.floor(Date.now() / 1000) });
+      h.controller.applyFacts({ facts: makeV2Facts(), fetchedAt: Math.floor(h.clock.now() / 1000) });
       h.controller.applyRoster(roster);
     };
 

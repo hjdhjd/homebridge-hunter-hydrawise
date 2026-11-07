@@ -4,12 +4,13 @@
  * through the harness. Covers every arm of the precedence rule - option over legacy property, legacy property over catalog default, and the explicit disabled and
  * valueless option states - for the API key, the MQTT broker URL, the MQTT topic prefix, and the debug flag, plus the client the resolved values do or do not construct.
  *
- * Every value pair here is deliberately distinct, so a resolver reading the wrong arm cannot echo the right answer back and pass.
+ * Every value pair here is deliberately distinct, so a resolver reading the wrong arm cannot echo the right answer back and pass. A platform builds its client
+ * through the harness's MQTT factory double, which answers a configured broker with a recording double and MQTT off with null, so no row dials a broker.
  */
 import { describe, test } from "node:test";
+import { expectAt, loggedAt } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
 import { buildPlatform } from "./testing/platform.helpers.ts";
-import { loggedAt } from "homebridge-plugin-utils/testing";
 
 // APIEvent.SHUTDOWN's string value. Firing it aborts the platform's shutdown signal, which is what ends any MQTT client a test constructed.
 const SHUTDOWN = "shutdown";
@@ -158,15 +159,19 @@ describe("HydrawisePlatform consolidated options", () => {
 
   test("a configured broker URL option constructs a client the platform teardown ends", async (t) => {
 
-    const { emit, platform } = buildPlatform({ options: ["Enable.Mqtt.Url=mqtt://127.0.0.1:1"] });
+    const { emit, mqttFactory, platform } = buildPlatform({ options: ["Enable.Mqtt.Url=mqtt://127.0.0.1:1"] });
 
     t.after(() => emit(SHUTDOWN));
 
-    // assert.ok narrows the nullable field, which assert.notEqual cannot do, so the aborted read below type-checks without a cast.
-    assert.ok(platform.mqtt, "a broker URL configured as an option constructs a client with no legacy property in play");
+    // The client is the one the platform built through the harness's factory double, read from the factory's record of the call. assert.ok narrows the nullable
+    // answer, which assert.notEqual cannot do, so the aborted read below type-checks without a cast.
+    const { client } = expectAt(mqttFactory.createCalls, 0, "the MQTT client the platform built");
+
+    assert.ok(client, "a broker URL configured as an option constructs a client with no legacy property in play");
+    assert.equal(platform.mqtt, client, "and the platform holds the client its factory built");
 
     await platform.shutdown();
 
-    assert.equal(platform.mqtt.aborted, true, "platform teardown ends the client, so no reconnect handle outlives the test");
+    assert.equal(client.aborted, true, "platform teardown ends the client, so nothing it holds outlives the test");
   });
 });

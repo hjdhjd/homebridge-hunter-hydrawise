@@ -3,9 +3,9 @@
  * platform.ts: homebridge-hunter-hydrawise platform class.
  */
 import type { API, Characteristic, DynamicPlatformPlugin, HAP, Logging, PlatformAccessory, PlatformConfig } from "homebridge";
-import { APIEvent, AccessoryPersistence, FeatureOptions, MQTT_AVAILABILITY_OFFLINE, RateBudget, TimerRegistry, classifyTransportError, composeSignals,
-  createApiDispatcher, createMqttClient, debugGatedLog, exponentialBackoff, formatErrorMessage, loopFaultReporter, mqttTopic, notResponding, repeatDemotedLog, retry,
-  sanitizeName, superviseLoop, systemClock } from "homebridge-plugin-utils";
+import { APIEvent, AccessoryPersistence, FeatureOptions, MQTT_AVAILABILITY_OFFLINE, RateBudget, TimerRegistry, armDeadline, classifyTransportError,
+  composeSignals, createApiDispatcher, createMqttClient, debugGatedLog, exponentialBackoff, formatErrorMessage, loopFaultReporter, mqttTopic, notResponding,
+  repeatDemotedLog, retry, sanitizeName, superviseLoop, systemClock } from "homebridge-plugin-utils";
 import type { Categories, Clock, HomebridgePluginLogging, MqttClient, Nullable, RepeatDemotedLog } from "homebridge-plugin-utils";
 import type { CustomerDetailsResponse, HydrawiseAccessory, HydrawiseAccessoryContext, HydrawiseCommandOutcome, HydrawiseControllerAccessory,
   HydrawiseControllerConfig, HydrawiseControllerIdentity, HydrawiseEndpoint, HydrawiseZoneIdentity, SetZoneResponse } from "./types.ts";
@@ -34,12 +34,17 @@ import util from "node:util";
 type HydrawiseRequestFailure = "certificate" | "connect-timeout" | "destroyed" | "dns" | "invalid-key" | "rate-limit" | "refused" | "reset" | "retries-exhausted" |
   "timeout" | "transport" | "unexpected-status" | "unreachable";
 
-/* What one request to the key-based API came to: the response it was answered with, a shutdown or a withdrawn command, neither of which is a failure, or the tag
- * of the reason it failed beside the sentence the request logged for it. The request log classifies the request from it before it releases the request's lines,
- * retrieve() answers its caller from it, and command() turns it into the outcome a command reports.
+/* What one request to the key-based API came to: what the caller's read made of the response it was answered with, a shutdown or a withdrawn command, neither of
+ * which is a failure, or the tag of the reason it failed beside the sentence the request logged for it. The request log classifies the request from it before it
+ * releases the request's lines, retrieve() answers its caller from it, and command() turns it into the outcome a command reports.
  */
-type HydrawiseRequestOutcome = { response: Dispatcher.ResponseData<unknown>; status: "answered" } | { status: "aborted" } |
-  { reason: string; status: HydrawiseRequestFailure };
+type HydrawiseRequestOutcome<T> = { status: "answered"; value: T } | { status: "aborted" } | { reason: string; status: HydrawiseRequestFailure };
+
+/* What the read of an answered body came to, the answer retrieve() gives for every request Hydrawise answered: the parsed body, or the error the read met partway
+ * through - a body that is not JSON, the request's deadline, or a shutdown. The request log counts a request whose read failed as answered and says nothing for
+ * it, so the caller says what an unreadable body means.
+ */
+export type HydrawiseBodyRead = { body: unknown; status: "parsed" } | { error: unknown; status: "unreadable" };
 
 // Why one fetch of the account's controller list failed, the tag discovery's list log compares with the reason it remembers: a request retrieve() could not
 // answer, or a body that could not be parsed.
@@ -58,6 +63,19 @@ type HydrawiseZoneSetupOutcome = { accessory: HydrawiseAccessory; status: "estab
 
 // The reason an unreadable command reply gives, one sentence whichever way the reply could not be read, so every reader of the outcome names it in the same words.
 const HYDRAWISE_UNREADABLE_REPLY = "The answer from Hydrawise could not be read.";
+
+// Read an answered body as JSON, the read retrieve() hands its request. The read catches its own failure and answers it beside the error, so a body that fails
+// partway through leaves the request answered to the request log, and the caller weighs the error.
+async function readJsonBody(response: Dispatcher.ResponseData<unknown>): Promise<HydrawiseBodyRead> {
+
+  try {
+
+    return { body: await response.body.json(), status: "parsed" };
+  } catch(error) {
+
+    return { error, status: "unreadable" };
+  }
+}
 
 /**
  * How long the account-credentialed refresh loop sleeps after a tick, given the run of consecutive throttled ticks behind it.
@@ -85,6 +103,19 @@ export function v2RefreshDelay({ random = Math.random, throttles }: { random?: (
   return delay + Math.round(delay * HYDRAWISE_V2_BACKOFF_JITTER * random());
 }
 
+/* The platform's injectable defaults: what a suite substitutes to run the real platform on a timeline of its own and with no broker. Homebridge constructs the
+ * platform with its log, configuration and API alone, so every member takes its production default and the field never sees anything else.
+ *
+ * @property clock       - The one time source for every wait, deadline and time read the platform schedules. Defaults to the system clock.
+ * @property mqttFactory - How the MQTT client is built, handed the broker settings, the platform's clock and its lifetime signal. Defaults to HBPU's guarded
+ *                         factory, which answers null when MQTT is off or the broker URL is unusable.
+ */
+export interface HydrawisePlatformDefaults {
+
+  clock?: Clock;
+  mqttFactory?: typeof createMqttClient;
+}
+
 export class HydrawisePlatform implements DynamicPlatformPlugin {
 
   private readonly accessories: HydrawiseAccessory[];
@@ -92,9 +123,9 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   private readonly accountBudget: RateBudget;
   public readonly api: API;
 
-  /* The one time source every wait this plugin schedules reads, and the clock every controller stamps its account facts and its commands against. It is the
-   * production clock in the field and a controllable one under the platform double, so a suite drives a controller's cadence on a virtual timeline instead of
-   * serving it out in real seconds.
+  /* The one time source for every wait, deadline and time read this plugin schedules: the budgets, the timers, every request deadline, the stamps every controller
+   * puts on its account facts and its commands, and the present moment its log lines date an instant against. It is the system clock in the field and the clock a
+   * suite hands the constructor, so a suite drives the platform's cadences and deadlines on a virtual timeline of its own.
    */
   public readonly clock: Clock;
   private readonly commandBudget: RateBudget;
@@ -177,7 +208,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
    */
   private readonly zoneSetupFailures = new Map<string, RepeatDemotedLog<HydrawiseZoneSetupFailure>>();
 
-  constructor(log: Logging, config: PlatformConfig | undefined, api: API) {
+  constructor(log: Logging, config: PlatformConfig | undefined, api: API, { clock = systemClock, mqttFactory = createMqttClient }: HydrawisePlatformDefaults = {}) {
 
     // PlatformConfig exposes user values through an any-typed index signature, so we read each value through a bracket-access cast to its declared type and keep the
     // reads type-checked rather than any. We resolve the options list once and share it between the feature-options engine and our own config snapshot.
@@ -186,7 +217,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     this.accessories = [];
     this.account = {} as CustomerDetailsResponse;
     this.api = api;
-    this.clock = systemClock;
+    this.clock = clock;
     this.configuredDevices = {};
     this.featureOptions = new FeatureOptions(featureOptionCategories, featureOptions, options);
     this.hap = api.hap;
@@ -275,18 +306,19 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
      */
     if(this.config.username?.length && this.config.password?.length) {
 
-      this.v2Client = new HydrawiseV2Client({ budget: this.v2Budget, log: this.log, password: this.config.password, signal: this.signal,
+      this.v2Client = new HydrawiseV2Client({ budget: this.v2Budget, clock: this.clock, log: this.log, password: this.config.password, signal: this.signal,
         username: this.config.username });
 
       this.log.info("Enhanced features are enabled using your Hydrawise account login.");
     }
 
-    /* Initialize MQTT, if needed. The guarded factory answers null for each of the ways MQTT can fail to start - a broker URL or topic prefix that resolves to
-     * nothing, and a URL the client cannot parse - so a mistyped MQTT setting degrades to MQTT being off rather than keeping the rest of the plugin from
-     * loading. An unusable URL is reported once at error level, with the URL itself redacted so a broker password embedded in it never reaches the log. The
-     * platform's shutdown signal ties the client's lifetime to ours, and the platform's clock is the one the end's grace waits on, as every other wait we schedule.
+    /* Initialize MQTT, if needed, through the platform's MQTT factory, which is HBPU's guarded factory in the field. The guarded factory answers null for each of
+     * the ways MQTT can fail to start - a broker URL or topic prefix that resolves to nothing, and a URL the client cannot parse - so a mistyped MQTT setting
+     * degrades to MQTT being off rather than keeping the rest of the plugin from loading. An unusable URL is reported once at error level, with the URL itself
+     * redacted so a broker password embedded in it never reaches the log. The platform's shutdown signal ties the client's lifetime to ours, and the platform's
+     * clock is the one the end's grace waits on, as every other wait we schedule.
      */
-    this.mqtt = createMqttClient({ brokerUrl: this.config.mqttUrl, log: this.log, topicPrefix: this.config.mqttTopic }, { clock: this.clock, signal: this.signal });
+    this.mqtt = mqttFactory({ brokerUrl: this.config.mqttUrl, log: this.log, topicPrefix: this.config.mqttTopic }, { clock: this.clock, signal: this.signal });
 
     // On every broker session, state each restored controller this run has not built as unreachable. The client's lifetime is the platform's, so the registration
     // carries no signal of its own.
@@ -560,33 +592,32 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     this.publishUnconfiguredAvailability();
   }
 
-  /* One fetch of the account's controller list, as discovery's list log runs it: the request and the parse, answering what the fetch came to. Every line it writes
-   * goes through the logger the attempt hands in.
+  /* One fetch of the account's controller list, as discovery's list log runs it: the request, whose body retrieve() reads inside the request's deadline, and what
+   * that read came to, answering what the fetch came to. Every line it writes goes through the logger the attempt hands in.
    */
   private async attemptControllerList(log: HomebridgePluginLogging): Promise<HydrawiseListOutcome> {
 
-    const response = await this.retrieve("customerdetails.php");
+    const answer = await this.retrieve("customerdetails.php");
 
-    if(!response) {
+    if(!answer) {
 
       return { status: "unanswered" };
     }
 
-    try {
+    if(answer.status === "parsed") {
 
-      return { account: await response.body.json() as CustomerDetailsResponse, status: "listed" };
-    } catch(error) {
-
-      // A shutdown abort mid-read is orderly teardown - answer it quietly so the retry loop unwinds through its own signal without logging a spurious parse failure.
-      if(this.signal.aborted) {
-
-        return { error, status: "aborted" };
-      }
-
-      log.error("Unable to retrieve the list of controllers: %s.", formatErrorMessage(error));
-
-      return { error, status: "unreadable" };
+      return { account: answer.body as CustomerDetailsResponse, status: "listed" };
     }
+
+    // A shutdown abort mid-read is orderly teardown - answer it quietly so the retry loop unwinds through its own signal without logging a spurious parse failure.
+    if(this.signal.aborted) {
+
+      return { error: answer.error, status: "aborted" };
+    }
+
+    log.error("Unable to retrieve the list of controllers: %s.", formatErrorMessage(answer.error));
+
+    return { error: answer.error, status: "unreadable" };
   }
 
   /* Start the endless loop that refreshes every controller's account-credentialed facts, once, and only for an install that configured the credentials making it
@@ -1018,17 +1049,20 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     setGlobalDispatcher(this.dispatcher);
   }
 
-  // Communicate HTTP requests with the Hydrawise API, answering the response, or null for a failure or a shutdown, which the request log has already reported.
-  public async retrieve(endpoint: HydrawiseEndpoint, params?: Record<string, string>): Promise<Nullable<Dispatcher.ResponseData<unknown>>> {
+  /* Communicate HTTP requests with the Hydrawise API, answering what the read of the response's body came to, or null for a failure or a shutdown, which the
+   * request log has already reported. The body is read inside the request's own deadline, so every answered body is read before the request settles and the
+   * caller holds the parsed body or the error its read met, never a stream left to consume.
+   */
+  public async retrieve(endpoint: HydrawiseEndpoint, params?: Record<string, string>): Promise<Nullable<HydrawiseBodyRead>> {
 
-    const outcome = await this.request({ endpoint, params });
+    const outcome = await this.request({ endpoint, params, read: readJsonBody });
 
-    return (outcome.status === "answered") ? outcome.response : null;
+    return (outcome.status === "answered") ? outcome.value : null;
   }
 
   /** Send one command to Hydrawise and answer what became of it. The command takes the same path every request to the key-based API takes, through the request
-   * log and both budgets, and its reply is read here, inside the request's own deadline, so every body is read or drained and the caller holds the outcome alone. A
-   * reply whose verdict cannot be read answers unreadable, which the request log has not logged, so the caller says what it means.
+   * log and both budgets, and the request reads its reply through readCommandReply(), inside the request's own deadline, so every body is read or drained and the
+   * caller holds the outcome alone. A reply whose verdict cannot be read answers unreadable, which the request log has not logged, so the caller says what it means.
    *
    * The signal is the caller's to withdraw the command with while it still waits for a budget to admit it. A withdrawn command leaves the budget's queue and
    * answers aborted. It takes no slot, with one limit: a withdrawal that lands after the command budget has admitted the command, while the account budget still
@@ -1043,7 +1077,8 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
    */
   public async command({ params, signal }: { params: Record<string, string>; signal?: AbortSignal }): Promise<HydrawiseCommandOutcome> {
 
-    const outcome = await this.request({ endpoint: HYDRAWISE_COMMAND_ENDPOINT, params, signal });
+    const outcome = await this.request({ endpoint: HYDRAWISE_COMMAND_ENDPOINT, params,
+      read: async (response): Promise<HydrawiseCommandOutcome> => this.readCommandReply(response), signal });
 
     // Every tag the request log names reaches one outcome here with no default arm, so a tag the request learns to name is a compile error until this says what a
     // command makes of it. An invalid key and a status the platform does not accept are refusals a resend would meet again, and every other failure is a request
@@ -1052,7 +1087,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
       case "answered":
 
-        return this.readCommandReply(outcome.response);
+        return outcome.value;
 
       case "aborted":
       case "timeout":
@@ -1083,10 +1118,10 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
    * reply's message type, so the body is the only place the verdict lives. A reply that does not parse, parses into no verdict this plugin knows, or fails partway
    * through is unreadable, and the platform says nothing for it, leaving the caller to say what it means.
    *
-   * The read runs inside the request's deadline, so a body that fails mid-read is classified on the request's own terms: a shutdown is orderly teardown, and a
-   * deadline is a timeout the caller may resend. A deadline met mid-reply writes no request-log line and re-arms no pool, because the request log has already
-   * counted the request as answered. A wedge that persists meets the resend's own timeout before the reply arrives, and that timeout writes the request-log line
-   * and re-arms the pool.
+   * The request runs this read inside its deadline, so a body that fails mid-read is classified on the request's own terms: a shutdown is orderly teardown, and a
+   * deadline is a timeout the caller may resend. The read catches its own failure, so a deadline met mid-reply leaves the request answered to the request log,
+   * which writes no line for it and re-arms no pool. A wedge that persists meets the resend's own timeout before the reply arrives, and that timeout writes the
+   * request-log line and re-arms the pool.
    */
   private async readCommandReply(response: Dispatcher.ResponseData<unknown>): Promise<HydrawiseCommandOutcome> {
 
@@ -1133,23 +1168,23 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
   }
 
   /* One request to the Hydrawise API, run as one attempt of the request log, which weighs a failure's reason against the last one's before it releases the request's
-   * lines. The signal withdraws the request while it waits for admission, and the answer is what the request came to.
+   * lines. The read turns the answered response's body into the caller's answer inside the request's deadline, and it catches its own failure, so a body that
+   * fails partway through still leaves the request answered. The signal withdraws the request while it waits for admission, and the answer is what the request
+   * came to.
    */
-  private async request({ endpoint, params, signal }: { endpoint: HydrawiseEndpoint; params?: Record<string, string>;
-    signal?: AbortSignal; }): Promise<HydrawiseRequestOutcome> {
+  private async request<T>({ endpoint, params, read, signal }: { endpoint: HydrawiseEndpoint; params?: Record<string, string>;
+    read: (response: Dispatcher.ResponseData<unknown>) => Promise<T>; signal?: AbortSignal; }): Promise<HydrawiseRequestOutcome<T>> {
 
-    return this.requestFailures.attempt(async (log): Promise<HydrawiseRequestOutcome> => this.attemptRequest({ endpoint, log, params, signal }),
+    return this.requestFailures.attempt(async (log): Promise<HydrawiseRequestOutcome<T>> => this.attemptRequest({ endpoint, log, params, read, signal }),
       (result): HydrawiseRequestFailure | undefined => (((result.status === "aborted") || (result.status === "answered")) ? undefined : result.status));
   }
 
   /* One request to the Hydrawise API, as the request log runs it. Every line it writes goes through the logger the attempt hands in, and it answers what the
-   * request came to, which the log classifies before it releases the request's lines. Each failure arm answers the sentence it logged beside its tag, so a command
-   * can say which failure stopped it in the same words the log used.
+   * request came to, which the log classifies before it releases the request's lines: an answered request carries what the caller's read made of its body. Each
+   * failure arm answers the sentence it logged beside its tag, so a command can say which failure stopped it in the same words the log used.
    */
-  private async attemptRequest({ endpoint, log, params, signal: withdrawal }: { endpoint: HydrawiseEndpoint; log: HomebridgePluginLogging;
-    params?: Record<string, string>; signal?: AbortSignal; }): Promise<HydrawiseRequestOutcome> {
-
-    let response: Dispatcher.ResponseData<unknown>;
+  private async attemptRequest<T>({ endpoint, log, params, read, signal: withdrawal }: { endpoint: HydrawiseEndpoint; log: HomebridgePluginLogging;
+    params?: Record<string, string>; read: (response: Dispatcher.ResponseData<unknown>) => Promise<T>; signal?: AbortSignal; }): Promise<HydrawiseRequestOutcome<T>> {
 
     // Whether both budgets have admitted this call. The catch reads it to tell a caller's withdrawal, which can only end an admission wait, from a failure of the
     // request itself, since the request never carries the caller's signal.
@@ -1194,16 +1229,18 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       redacted.set("api_key", "redacted");
       loggedUrl = HYDRAWISE_API_BASE_URL + endpoint + "?" + redacted.toString();
 
-      /* Compose a per-request timeout with the platform's shutdown signal, so a slow request aborts on the timeout and an in-flight request aborts on shutdown, all
-       * through one signal handed to undici. The timeout is armed only now, after the budgets have admitted the call, so a wait for a rate-limit slot never eats
-       * into the time the request itself is allowed.
+      /* Arm the per-request deadline on the platform's clock and compose it with the platform's shutdown signal, so a slow request aborts on the deadline and an
+       * in-flight request aborts on shutdown, all through one signal handed to undici. The deadline is armed only now, after the budgets have admitted the call, so
+       * a wait for a rate-limit slot never eats into the time the request itself is allowed.
        *
-       * The deadline is the platform's own timeout signal rather than one armed on the plugin's clock, because it bounds the request and the caller's read of the
-       * response body - time spent on the network, not a wait this plugin schedules.
+       * The deadline bounds the request and the caller's read of its body together, because the read runs inside this scope and the deadline is released only as
+       * the scope exits, the read settled. A deadline met mid-read surfaces through the read, which answers it rather than throwing it here, so the request stays
+       * answered and the caller says what the failed read means.
        */
-      const signal = composeSignals(AbortSignal.timeout(HYDRAWISE_API_TIMEOUT * 1000), this.signal);
+      using deadline = armDeadline(HYDRAWISE_API_TIMEOUT * 1000, { clock: this.clock });
 
-      response = await request(url, { signal });
+      const signal = composeSignals(deadline.signal, this.signal);
+      const response = await request(url, { signal });
 
       /* Invalid API key. The pool does not retry this status, so it reaches this branch on the first answer.
        *
@@ -1247,7 +1284,7 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
         return { reason, status: "unexpected-status" };
       }
 
-      return { response, status: "answered" };
+      return { status: "answered", value: await read(response) };
     } catch(error) {
 
       // A caller's withdrawal is no failure either, and it is ranked here, ahead of the classifier, because the classifier knows the lifetime signal and the deadline

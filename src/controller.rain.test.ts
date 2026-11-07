@@ -8,12 +8,12 @@
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { Characteristic, Service, buildController, makeV2Facts } from "./testing/platform.helpers.ts";
+import { Characteristic, Service, buildController, makeV2Facts, pollSleep, seconds } from "./testing/platform.helpers.ts";
 import { HAPStatus, getServiceName } from "homebridge-plugin-utils";
-import { HYDRAWISE_API_JITTER, HYDRAWISE_V2_FACTS_GRACE, HYDRAWISE_V2_REFRESH_INTERVAL } from "./settings.ts";
+import { HYDRAWISE_V2_FACTS_GRACE, HYDRAWISE_V2_REFRESH_INTERVAL } from "./settings.ts";
 import type { Characteristic as HapCharacteristic, Service as HapService, PlatformAccessory } from "homebridge";
 import type { HydrawiseControllerV2Facts, HydrawiseV2ErrorPath, HydrawiseV2Sensor, StatusScheduleResponse } from "./types.ts";
-import { TestClock, advanceThroughSchedule, hapStatus, linesAt, logCount, present, settle, triggerGet, triggerSet } from "homebridge-plugin-utils/testing";
+import { advanceThroughSchedule, hapStatus, linesAt, logCount, present, settle, triggerGet, triggerSet } from "homebridge-plugin-utils/testing";
 import { bareSensors, syntheticController } from "./api.fixtures.ts";
 import { controllerV2Facts, rainSensorSubtype } from "./types.ts";
 import { describe, test } from "node:test";
@@ -43,9 +43,9 @@ const noResponse = hapStatus(HAPStatus.SERVICE_COMMUNICATION_FAILURE);
 const OPEN = Characteristic.ContactSensorState.CONTACT_NOT_DETECTED;
 const CLOSED = Characteristic.ContactSensorState.CONTACT_DETECTED;
 
-// A wire-realistic body carrying one zone, so a row driving its own clock steps the polling loop rather than racing a fast cadence.
+// A wire-realistic body carrying one zone, so a row that wants a later poll steps the controller's clock across the sleep the wire asks for.
 const status = makeStatusSchedule({ relays: [makeZone({ name: "Front Lawn", relay: 1, relay_id: 700001 })], sensors: bareSensors });
-const sleep = (status.nextpoll + HYDRAWISE_API_JITTER) * 1000;
+const sleep = pollSleep(status);
 
 // The same zone scheduled rather than running, so its valve shows the duration a tap runs it for.
 const SCHEDULED = makeStatusSchedule({ relays: [makeZone({ name: "Front Lawn", relay: 1, relay_id: 700001, run: 480, time: 68000, timestr: "16:00" })],
@@ -62,23 +62,11 @@ function wireFacts(sensors: readonly unknown[] | undefined, errorPaths: readonly
   return controllerV2Facts({ id: 1058515, sensors: sensors as Nullable<HydrawiseV2Sensor>[] | undefined, zones: [] }, errorPaths);
 }
 
-// The whole second a clock reads, the unit every facts stamp speaks.
-function seconds(clock: TestClock): number {
-
-  return Math.floor(clock.now() / 1000);
-}
-
-// The instant a row that cares only about adoption stamps its facts with, comfortably inside the lifetime.
-function now(): number {
-
-  return Math.floor(Date.now() / 1000);
-}
-
 // A controller polling the body above on a clock the row drives.
-function onClock(clock: TestClock, { body = status, ...options }: { body?: StatusScheduleResponse; hasV2Client?: boolean;
-  seedContext?: (accessory: PlatformAccessory) => void; userOptions?: string[]; } = {}): BuildControllerResult {
+function onClock({ body = status, ...options }: { body?: StatusScheduleResponse; hasV2Client?: boolean; seedContext?: (accessory: PlatformAccessory) => void;
+  userOptions?: string[]; } = {}): BuildControllerResult {
 
-  return buildController({ ...options, clock, mqtt: true, program: (recorder) => {
+  return buildController({ ...options, mqtt: true, program: (recorder) => {
 
     recorder.programDefault("statusschedule.php", { body, kind: "response" });
   }, signalAborted: false });
@@ -148,7 +136,7 @@ describe("HydrawiseController rain sensors in HomeKit", () => {
     const h = buildController({ hasV2Client: true });
 
     h.controller.applyFacts({ facts: makeV2Facts({ rainSensors: [ [ SENSOR_ID, { name: SENSOR_NAME, tripped: true } ],
-      [ SECOND_SENSOR_ID, { name: SECOND_SENSOR_NAME, tripped: false } ] ] }), fetchedAt: now() });
+      [ SECOND_SENSOR_ID, { name: SECOND_SENSOR_NAME, tripped: false } ] ] }), fetchedAt: seconds(h.clock) });
 
     assert.equal(getServiceName(sensorOf(h)), SENSOR_NAME, "the tripped sensor carries its Hydrawise name");
     assert.equal(stateOf(h).value, OPEN, "and reads open");
@@ -156,7 +144,7 @@ describe("HydrawiseController rain sensors in HomeKit", () => {
     assert.equal(stateOf(h, SECOND_SENSOR_ID).value, CLOSED, "and reads closed");
 
     h.controller.applyFacts({ facts: makeV2Facts({ rainSensors: [ [ SENSOR_ID, { name: SENSOR_NAME, tripped: false } ],
-      [ SECOND_SENSOR_ID, { name: SECOND_SENSOR_NAME, tripped: true } ] ] }), fetchedAt: now() });
+      [ SECOND_SENSOR_ID, { name: SECOND_SENSOR_NAME, tripped: true } ] ] }), fetchedAt: seconds(h.clock) });
 
     assert.equal(stateOf(h).value, CLOSED, "a facts arrival writes each listed value");
     assert.equal(stateOf(h, SECOND_SENSOR_ID).value, OPEN, "whichever way it moved");
@@ -167,15 +155,15 @@ describe("HydrawiseController rain sensors in HomeKit", () => {
     const h = buildController({ hasV2Client: true });
     const settled = h.flushes().length;
 
-    h.controller.applyFacts({ facts: LISTING, fetchedAt: now() });
+    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(h.clock) });
     assert.equal(h.flushes().length - settled, 1, "a sensor added is saved");
 
     const added = h.flushes().length;
 
-    h.controller.applyFacts({ facts: LISTING, fetchedAt: now() });
+    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(h.clock) });
     assert.equal(h.flushes().length - added, 0, "an unchanged list saves nothing");
 
-    h.controller.applyFacts({ facts: makeV2Facts(), fetchedAt: now() });
+    h.controller.applyFacts({ facts: makeV2Facts(), fetchedAt: seconds(h.clock) });
     assert.equal(h.flushes().length - added, 1, "a sensor removed is saved");
   });
 
@@ -184,14 +172,14 @@ describe("HydrawiseController rain sensors in HomeKit", () => {
     const h = buildController({ hasV2Client: true, userOptions: ["Enable.Device.Suspend.All"] });
 
     h.controller.applyFacts({ facts: makeV2Facts({ rainSensors: [ [ SENSOR_ID, { name: SENSOR_NAME, tripped: false } ],
-      [ SECOND_SENSOR_ID, { name: SECOND_SENSOR_NAME, tripped: false } ] ] }), fetchedAt: now() });
-    h.controller.applyFacts({ facts: makeV2Facts({ rainSensors: [[ SECOND_SENSOR_ID, { name: SECOND_SENSOR_NAME, tripped: false } ]] }), fetchedAt: now() });
+      [ SECOND_SENSOR_ID, { name: SECOND_SENSOR_NAME, tripped: false } ] ] }), fetchedAt: seconds(h.clock) });
+    h.controller.applyFacts({ facts: makeV2Facts({ rainSensors: [[ SECOND_SENSOR_ID, { name: SECOND_SENSOR_NAME, tripped: false } ]] }), fetchedAt: seconds(h.clock) });
 
     assert.equal(sensorOf(h), undefined, "the sensor the list dropped is removed");
     assert.ok(sensorOf(h, SECOND_SENSOR_ID), "the sensor it still names stays");
     assert.ok(h.accessory.getServiceById(Service.Switch, "All"), "and the suspend-all switch is no business of the sweep");
 
-    h.controller.applyFacts({ facts: wireFacts([{ ...WIRE_SENSOR, model: { sensorType: "FLOW_METER" } }]), fetchedAt: now() });
+    h.controller.applyFacts({ facts: wireFacts([{ ...WIRE_SENSOR, model: { sensorType: "FLOW_METER" } }]), fetchedAt: seconds(h.clock) });
 
     assert.equal(rainServices(h).length, 0, "a complete list naming only a sensor of another kind lists no rain sensor");
   });
@@ -212,12 +200,12 @@ describe("HydrawiseController rain sensors in HomeKit", () => {
 
       const h = buildController({ hasV2Client: true });
 
-      h.controller.applyFacts({ facts: LISTING, fetchedAt: now() });
+      h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(h.clock) });
 
       const hosted = sensorOf(h);
 
       assert.equal(facts.rainSensors, null, "the answer cannot say which sensors exist");
-      assert.doesNotThrow(() => h.controller.applyFacts({ facts, fetchedAt: now() }), "no throw ends the refresh");
+      assert.doesNotThrow(() => h.controller.applyFacts({ facts, fetchedAt: seconds(h.clock) }), "no throw ends the refresh");
       assert.equal(sensorOf(h), hosted, "the sensor stays, the same service");
     });
   }
@@ -231,17 +219,16 @@ describe("HydrawiseController rain sensors in HomeKit", () => {
 
     test("a sensor with " + label + " and no error beside it counts as none, and the rain sensor beside it is listed and reads", async (t) => {
 
-      const clock = new TestClock();
-      const h = onClock(clock, { hasV2Client: true });
+      const h = onClock({ hasV2Client: true });
       const facts = wireFacts([ WIRE_SENSOR, untyped ]);
 
       t.after(() => h.abort());
 
-      await advanceThroughSchedule(clock, []);
+      await advanceThroughSchedule(h.clock,[]);
 
       assert.deepEqual(facts.rainSensors, new Map([[ SENSOR_ID, { name: SENSOR_NAME, tripped: true } ]]), "the list names the rain sensor alone");
 
-      h.controller.applyFacts({ facts, fetchedAt: seconds(clock) });
+      h.controller.applyFacts({ facts, fetchedAt: seconds(h.clock) });
 
       assert.equal(await triggerGet(stateOf(h)), OPEN, "the rain sensor reads");
       assert.equal(sensorOf(h, SECOND_SENSOR_ID), undefined, "and the other has no service");
@@ -249,24 +236,23 @@ describe("HydrawiseController rain sensors in HomeKit", () => {
 
     test("a list holding only a sensor with " + label + " hosts nothing and leaves the word online", async (t) => {
 
-      const clock = new TestClock();
-      const h = onClock(clock, { hasV2Client: true });
+      const h = onClock({ hasV2Client: true });
       const facts = wireFacts([untyped]);
 
       t.after(() => h.abort());
 
-      await advanceThroughSchedule(clock, []);
+      await advanceThroughSchedule(h.clock,[]);
 
       assert.deepEqual(facts.rainSensors, new Map(), "it is a complete answer that lists none");
 
-      h.controller.applyFacts({ facts, fetchedAt: seconds(clock) });
+      h.controller.applyFacts({ facts, fetchedAt: seconds(h.clock) });
 
       assert.equal(rainServices(h).length, 0, "so nothing is hosted");
       assert.equal(lastWord(h), "online", "and nothing refuses");
 
       // A sensor hosted before such a list is one the complete list no longer names, so it goes rather than refusing for good.
-      h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(clock) });
-      h.controller.applyFacts({ facts, fetchedAt: seconds(clock) });
+      h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(h.clock) });
+      h.controller.applyFacts({ facts, fetchedAt: seconds(h.clock) });
 
       assert.equal(rainServices(h).length, 0, "a hosted sensor the list no longer names is removed");
       assert.equal(lastWord(h), "online", "with the word still online");
@@ -290,14 +276,14 @@ describe("HydrawiseController rain sensors in HomeKit", () => {
 
     const h = buildController({ hasV2Client: true });
 
-    h.controller.applyFacts({ facts: makeV2Facts({ rainSensors: null }), fetchedAt: now() });
+    h.controller.applyFacts({ facts: makeV2Facts({ rainSensors: null }), fetchedAt: seconds(h.clock) });
     assert.equal(rainServices(h).length, 0, "an answer that cannot say which sensors exist adds none");
 
-    h.controller.applyFacts({ facts: LISTING, fetchedAt: now() - LIFETIME - 1 });
+    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(h.clock) - LIFETIME - 1 });
     assert.equal(rainServices(h).length, 0, "facts past their lifetime add none");
 
-    h.controller.applyFacts({ facts: LISTING, fetchedAt: now() });
-    h.controller.applyFacts({ facts: makeV2Facts(), fetchedAt: now() - LIFETIME - 1 });
+    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(h.clock) });
+    h.controller.applyFacts({ facts: makeV2Facts(), fetchedAt: seconds(h.clock) - LIFETIME - 1 });
     assert.ok(sensorOf(h), "and remove none");
   });
 
@@ -317,18 +303,17 @@ describe("HydrawiseController rain sensor refusal", () => {
 
   test("the read answers through the facts' whole lifetime and refuses a second past it, while the irrigation system still answers", async (t) => {
 
-    const clock = new TestClock();
-    const h = onClock(clock, { hasV2Client: true });
+    const h = onClock({ hasV2Client: true });
 
     t.after(() => h.abort());
 
-    await advanceThroughSchedule(clock, []);
+    await advanceThroughSchedule(h.clock,[]);
 
-    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(clock) - LIFETIME });
+    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(h.clock) - LIFETIME });
 
     assert.equal(await triggerGet(stateOf(h)), OPEN, "a reading aged exactly its lifetime still answers");
 
-    clock.advance(1000);
+    h.clock.advance(1000);
 
     await assert.rejects(() => triggerGet(stateOf(h)), noResponse, "a second past it, the sensor refuses");
     assert.equal(await triggerGet(primary(h)), Characteristic.Active.ACTIVE, "while the irrigation system's own handler still answers");
@@ -336,16 +321,15 @@ describe("HydrawiseController rain sensor refusal", () => {
 
   test("a valve tap, a Suspend All tap and an MQTT start are each sent while the sensor's read refuses, with no line refusing a command", async (t) => {
 
-    const clock = new TestClock();
-    const h = onClock(clock, { body: SCHEDULED, hasV2Client: true, userOptions: ["Enable.Device.Suspend.All." + CONTROLLER_SERIAL] });
+    const h = onClock({ body: SCHEDULED, hasV2Client: true, userOptions: ["Enable.Device.Suspend.All." + CONTROLLER_SERIAL] });
     const mqtt = present(h.mqtt, "the MQTT recorder");
 
     t.after(() => h.abort());
 
-    await advanceThroughSchedule(clock, []);
+    await advanceThroughSchedule(h.clock,[]);
 
-    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(clock) - LIFETIME });
-    clock.advance(1000);
+    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(h.clock) - LIFETIME });
+    h.clock.advance(1000);
 
     await assert.rejects(() => triggerGet(stateOf(h)), noResponse, "the reading is a second past its lifetime, so the sensor's read refuses");
 
@@ -369,38 +353,36 @@ describe("HydrawiseController rain sensor refusal", () => {
 
     const pending = buildController({ hasV2Client: true });
 
-    pending.controller.applyFacts({ facts: LISTING, fetchedAt: now() });
+    pending.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(pending.clock) });
     await assert.rejects(() => triggerGet(stateOf(pending)), noResponse, "no poll has landed, so a current reading still refuses");
 
-    const clock = new TestClock();
-    const h = onClock(clock, { hasV2Client: true });
+    const h = onClock({ hasV2Client: true });
 
     t.after(() => h.abort());
 
-    await advanceThroughSchedule(clock, []);
+    await advanceThroughSchedule(h.clock,[]);
 
-    h.controller.applyFacts({ facts: makeV2Facts({ online: false, rainSensors: [[ SENSOR_ID, { name: SENSOR_NAME, tripped: true } ]] }), fetchedAt: seconds(clock) });
+    h.controller.applyFacts({ facts: makeV2Facts({ online: false, rainSensors: [[ SENSOR_ID, { name: SENSOR_NAME, tripped: true } ]] }), fetchedAt: seconds(h.clock) });
     await assert.rejects(() => triggerGet(stateOf(h)), noResponse, "and neither does a current reading answer once the cloud says the controller is offline");
   });
 
   test("a cached sensor refuses with the first poll landed and no facts, and a null map, until a reading lands", async (t) => {
 
-    const clock = new TestClock();
-    const h = onClock(clock, { hasV2Client: true, seedContext: seedCachedSensor });
+    const h = onClock({ hasV2Client: true, seedContext: seedCachedSensor });
     const cached = sensorOf(h);
 
     t.after(() => h.abort());
 
-    await advanceThroughSchedule(clock, []);
+    await advanceThroughSchedule(h.clock,[]);
 
     assert.equal(h.retrieve.callsTo("statusschedule.php").length, 1, "the first poll has landed");
     await assert.rejects(() => triggerGet(stateOf(h)), noResponse, "the cached sensor refuses with no facts in hand");
     assert.equal(await triggerGet(primary(h)), Characteristic.Active.ACTIVE, "while the irrigation system's own handler answers");
 
-    h.controller.applyFacts({ facts: makeV2Facts({ rainSensors: null }), fetchedAt: seconds(clock) });
+    h.controller.applyFacts({ facts: makeV2Facts({ rainSensors: null }), fetchedAt: seconds(h.clock) });
     await assert.rejects(() => triggerGet(stateOf(h)), noResponse, "an answer that cannot say which sensors exist leaves it refusing");
 
-    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(clock) });
+    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(h.clock) });
 
     assert.equal(sensorOf(h), cached, "the listed sensor is the service the cache restored, not a new one");
     assert.equal(await triggerGet(stateOf(h)), OPEN, "and it answers once a reading lands");
@@ -411,18 +393,17 @@ describe("HydrawiseController rain sensor option and login", () => {
 
   test("with the option off, no sensor exists whatever the facts list, a cached one is removed and saved, and one line says so", async (t) => {
 
-    const clock = new TestClock();
-    const h = onClock(clock, { hasV2Client: true, seedContext: seedCachedSensor, userOptions: [ "Disable.Device.Sensor.Rain", "Enable.Device.SyncName" ] });
+    const h = onClock({ hasV2Client: true, seedContext: seedCachedSensor, userOptions: [ "Disable.Device.Sensor.Rain", "Enable.Device.SyncName" ] });
 
     t.after(() => h.abort());
 
     assert.equal(rainServices(h).length, 0, "the cached sensor is removed at construction");
     assert.ok(h.flushes().at(-1)?.includes(h.accessory), "and the removal is saved");
 
-    await advanceThroughSchedule(clock, []);
+    await advanceThroughSchedule(h.clock,[]);
 
-    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(clock) });
-    await advanceThroughSchedule(clock, [sleep]);
+    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(h.clock) });
+    await advanceThroughSchedule(h.clock,[sleep]);
 
     assert.equal(rainServices(h).length, 0, "a listed sensor is not added");
     assert.equal(logCount(h.entries, "info", "Rain sensors disabled."), 1, "the option off logs its one line");
@@ -433,17 +414,16 @@ describe("HydrawiseController rain sensor option and login", () => {
 
   test("with no credentials, no sensor exists, a cached one is removed, and no line is written, whatever the option says", async (t) => {
 
-    const clock = new TestClock();
-    const h = onClock(clock, { seedContext: seedCachedSensor, userOptions: ["Disable.Device.Sensor.Rain"] });
+    const h = onClock({ seedContext: seedCachedSensor, userOptions: ["Disable.Device.Sensor.Rain"] });
 
     t.after(() => h.abort());
 
     assert.equal(rainServices(h).length, 0, "the cached sensor is removed at construction");
 
-    await advanceThroughSchedule(clock, []);
+    await advanceThroughSchedule(h.clock,[]);
 
     // No client exists here to hand facts over, so this states what one would have said.
-    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(clock) });
+    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(h.clock) });
 
     assert.equal(rainServices(h).length, 0, "a listed sensor is not added");
     assert.equal(logCount(h.entries, "info", "Rain sensors"), 0, "an install with no account login is not told about a feature it does not have");
@@ -454,7 +434,7 @@ describe("HydrawiseController rain sensor option and login", () => {
 
     const h = buildController({ hasV2Client: true });
 
-    h.controller.applyFacts({ facts: LISTING, fetchedAt: now() });
+    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(h.clock) });
 
     assert.ok(sensorOf(h), "the sensor exists at the default");
     assert.equal(logCount(h.entries, "info", "Rain sensors"), 0, "and the default is restated nowhere");
@@ -465,47 +445,45 @@ describe("HydrawiseController rain sensors topic", () => {
 
   test("publishes the sensor when facts land, nothing for an unchanged tick, an empty array at the first poll after they age out, and answers its get", async (t) => {
 
-    const clock = new TestClock();
-    const h = onClock(clock, { hasV2Client: true });
+    const h = onClock({ hasV2Client: true });
     const mqtt = present(h.mqtt, "the MQTT recorder");
     const captured = "[{\"id\":394649,\"name\":\"Hunter Rain Freeze Sensor\",\"tripped\":true}]";
 
     t.after(() => h.abort());
 
-    await advanceThroughSchedule(clock, []);
+    await advanceThroughSchedule(h.clock,[]);
 
     assert.deepEqual(rainPayloads(h), ["[]"], "the first poll has no reading to state");
     assert.equal(await mqtt.invokeGet(RAIN_TOPIC + "/get"), "[]", "and the get answers the same");
 
-    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(clock) - LIFETIME });
+    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(h.clock) - LIFETIME });
 
     assert.equal(rainPayloads(h).at(-1), captured, "facts carrying the sensor publish it");
     assert.equal(await mqtt.invokeGet(RAIN_TOPIC + "/get"), captured, "and the get answers it");
 
     const published = rainPayloads(h).length;
 
-    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(clock) - LIFETIME });
+    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(h.clock) - LIFETIME });
 
     assert.equal(rainPayloads(h).length, published, "an unchanged tick publishes nothing");
 
-    await advanceThroughSchedule(clock, [sleep]);
+    await advanceThroughSchedule(h.clock,[sleep]);
 
     assert.equal(rainPayloads(h).at(-1), "[]", "the first poll after the reading ages out publishes the empty array");
   });
 
   test("an answer that cannot say which sensors exist publishes the empty array, and a sensor with no usable name publishes a null name", async (t) => {
 
-    const clock = new TestClock();
-    const h = onClock(clock, { hasV2Client: true });
+    const h = onClock({ hasV2Client: true });
 
     t.after(() => h.abort());
 
-    await advanceThroughSchedule(clock, []);
+    await advanceThroughSchedule(h.clock,[]);
 
-    h.controller.applyFacts({ facts: makeV2Facts({ rainSensors: [[ SENSOR_ID, { name: null, tripped: false } ]] }), fetchedAt: seconds(clock) });
+    h.controller.applyFacts({ facts: makeV2Facts({ rainSensors: [[ SENSOR_ID, { name: null, tripped: false } ]] }), fetchedAt: seconds(h.clock) });
     assert.equal(rainPayloads(h).at(-1), "[{\"id\":394649,\"name\":null,\"tripped\":false}]", "a sensor with no usable name states it as null");
 
-    h.controller.applyFacts({ facts: makeV2Facts({ rainSensors: null }), fetchedAt: seconds(clock) });
+    h.controller.applyFacts({ facts: makeV2Facts({ rainSensors: null }), fetchedAt: seconds(h.clock) });
     assert.equal(rainPayloads(h).at(-1), "[]", "and a null map states no reading");
   });
 });
@@ -514,15 +492,14 @@ describe("HydrawiseController rain sensor names", () => {
 
   test("with Sync Name on, a sensor renamed in Hydrawise is renamed at the next poll and held there", async (t) => {
 
-    const clock = new TestClock();
-    const h = onClock(clock, { hasV2Client: true, userOptions: ["Enable.Device.SyncName"] });
+    const h = onClock({ hasV2Client: true, userOptions: ["Enable.Device.SyncName"] });
 
     t.after(() => h.abort());
 
-    await advanceThroughSchedule(clock, []);
+    await advanceThroughSchedule(h.clock,[]);
 
-    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(clock) });
-    h.controller.applyFacts({ facts: makeV2Facts({ rainSensors: [[ SENSOR_ID, { name: SECOND_SENSOR_NAME, tripped: true } ]] }), fetchedAt: seconds(clock) });
+    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(h.clock) });
+    h.controller.applyFacts({ facts: makeV2Facts({ rainSensors: [[ SENSOR_ID, { name: SECOND_SENSOR_NAME, tripped: true } ]] }), fetchedAt: seconds(h.clock) });
 
     const sensor = present(sensorOf(h), "the rain sensor");
 
@@ -530,7 +507,7 @@ describe("HydrawiseController rain sensor names", () => {
 
     const saved = h.flushes().length;
 
-    await advanceThroughSchedule(clock, [sleep]);
+    await advanceThroughSchedule(h.clock,[sleep]);
 
     assert.equal(getServiceName(sensor), SECOND_SENSOR_NAME, "the next poll takes the name Hydrawise reports");
     assert.equal(h.flushes().length - saved, 1, "and the rename is saved");
@@ -543,16 +520,15 @@ describe("HydrawiseController rain sensor names", () => {
 
   test("with Sync Name off a Hydrawise rename and a Home app rename each stand as the user's, and a null name decides nothing under it", async (t) => {
 
-    const clock = new TestClock();
-    const off = onClock(clock, { hasV2Client: true });
+    const off = onClock({ hasV2Client: true });
 
     t.after(() => off.abort());
 
-    await advanceThroughSchedule(clock, []);
+    await advanceThroughSchedule(off.clock, []);
 
-    off.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(clock) });
-    off.controller.applyFacts({ facts: makeV2Facts({ rainSensors: [[ SENSOR_ID, { name: SECOND_SENSOR_NAME, tripped: true } ]] }), fetchedAt: seconds(clock) });
-    await advanceThroughSchedule(clock, [sleep]);
+    off.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(off.clock) });
+    off.controller.applyFacts({ facts: makeV2Facts({ rainSensors: [[ SENSOR_ID, { name: SECOND_SENSOR_NAME, tripped: true } ]] }), fetchedAt: seconds(off.clock) });
+    await advanceThroughSchedule(off.clock, [sleep]);
 
     const sensor = present(sensorOf(off), "the rain sensor");
 
@@ -562,16 +538,15 @@ describe("HydrawiseController rain sensor names", () => {
 
     assert.equal(getServiceName(sensor), "Rain Gauge", "and a rename made in the Home app stands");
 
-    const syncClock = new TestClock();
-    const on = onClock(syncClock, { hasV2Client: true, userOptions: ["Enable.Device.SyncName"] });
+    const on = onClock({ hasV2Client: true, userOptions: ["Enable.Device.SyncName"] });
 
     t.after(() => on.abort());
 
-    await advanceThroughSchedule(syncClock, []);
+    await advanceThroughSchedule(on.clock, []);
 
-    on.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(syncClock) });
-    on.controller.applyFacts({ facts: makeV2Facts({ rainSensors: [[ SENSOR_ID, { name: null, tripped: true } ]] }), fetchedAt: seconds(syncClock) });
-    await advanceThroughSchedule(syncClock, [sleep]);
+    on.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(on.clock) });
+    on.controller.applyFacts({ facts: makeV2Facts({ rainSensors: [[ SENSOR_ID, { name: null, tripped: true } ]] }), fetchedAt: seconds(on.clock) });
+    await advanceThroughSchedule(on.clock, [sleep]);
 
     assert.equal(getServiceName(sensorOf(on)), SENSOR_NAME, "a null name holds the current one, under Sync Name too");
   });
@@ -582,7 +557,7 @@ describe("HydrawiseController rain sensor names", () => {
 
       const h = buildController({ hasV2Client: true });
 
-      h.controller.applyFacts({ facts: makeV2Facts({ rainSensors: [[ SENSOR_ID, { name, tripped: false } ]] }), fetchedAt: now() });
+      h.controller.applyFacts({ facts: makeV2Facts({ rainSensors: [[ SENSOR_ID, { name, tripped: false } ]] }), fetchedAt: seconds(h.clock) });
 
       assert.equal(getServiceName(sensorOf(h)), syntheticController.name + " Rain Sensor", "the sensor is created under a name HomeKit can carry");
     });
@@ -592,7 +567,7 @@ describe("HydrawiseController rain sensor names", () => {
 
     const h = buildController({ hasV2Client: true, userOptions: ["Enable.Device.Name." + CONTROLLER_SERIAL + "=Garden"] });
 
-    h.controller.applyFacts({ facts: makeV2Facts({ rainSensors: [[ SENSOR_ID, { name: null, tripped: false } ]] }), fetchedAt: now() });
+    h.controller.applyFacts({ facts: makeV2Facts({ rainSensors: [[ SENSOR_ID, { name: null, tripped: false } ]] }), fetchedAt: seconds(h.clock) });
 
     assert.equal(getServiceName(sensorOf(h)), "Garden Rain Sensor", "the controller's configured name leads the sensor's");
   });
@@ -602,26 +577,25 @@ describe("HydrawiseController rain sensor verdict and its lines", () => {
 
   test("the word reads offline at the first poll after a reading ages out and online when facts return, one verdict with the refusal", async (t) => {
 
-    const clock = new TestClock();
-    const h = onClock(clock, { hasV2Client: true });
+    const h = onClock({ hasV2Client: true });
 
     t.after(() => h.abort());
 
-    await advanceThroughSchedule(clock, []);
+    await advanceThroughSchedule(h.clock,[]);
 
-    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(clock) - LIFETIME });
+    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(h.clock) - LIFETIME });
     assert.equal(lastWord(h), "online", "a current reading leaves the word online");
 
-    clock.advance(1000);
+    h.clock.advance(1000);
 
     await assert.rejects(() => triggerGet(stateOf(h)), noResponse, "the reading has aged out, so the sensor refuses at once");
     assert.equal(lastWord(h), "online", "while the word has had no event to re-judge it");
 
-    await advanceThroughSchedule(clock, [sleep - 1000]);
+    await advanceThroughSchedule(h.clock,[sleep - 1000]);
 
     assert.equal(lastWord(h), "offline", "the next poll re-judges it, so it reads what the refusal reads");
 
-    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(clock) });
+    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(h.clock) });
 
     assert.equal(lastWord(h), "online", "and facts returning bring it back");
     assert.equal(await triggerGet(stateOf(h)), OPEN, "along with the read");
@@ -629,91 +603,86 @@ describe("HydrawiseController rain sensor verdict and its lines", () => {
 
   test("a cached sensor reads offline from the first poll, on a controller whose poll is good", async (t) => {
 
-    const clock = new TestClock();
-    const h = onClock(clock, { hasV2Client: true, seedContext: seedCachedSensor });
+    const h = onClock({ hasV2Client: true, seedContext: seedCachedSensor });
 
     t.after(() => h.abort());
 
-    await advanceThroughSchedule(clock, []);
+    await advanceThroughSchedule(h.clock,[]);
 
     assert.equal(lastWord(h), "offline", "the accessory refuses, so the word says so");
   });
 
   test("with no sensor carried, aged facts leave the word online", async (t) => {
 
-    const clock = new TestClock();
-    const h = onClock(clock, { hasV2Client: true });
+    const h = onClock({ hasV2Client: true });
 
     t.after(() => h.abort());
 
-    await advanceThroughSchedule(clock, []);
+    await advanceThroughSchedule(h.clock,[]);
 
-    h.controller.applyFacts({ facts: makeV2Facts(), fetchedAt: seconds(clock) - LIFETIME });
-    await advanceThroughSchedule(clock, [sleep]);
+    h.controller.applyFacts({ facts: makeV2Facts(), fetchedAt: seconds(h.clock) - LIFETIME });
+    await advanceThroughSchedule(h.clock,[sleep]);
 
     assert.equal(lastWord(h), "online", "the word is as it is with no rain sensors at all");
   });
 
   test("the rain lines are written once each, in order, across a reading that is current, then gone, then current", async (t) => {
 
-    const clock = new TestClock();
-    const h = onClock(clock, { hasV2Client: true });
+    const h = onClock({ hasV2Client: true });
 
     t.after(() => h.abort());
 
-    await advanceThroughSchedule(clock, []);
+    await advanceThroughSchedule(h.clock,[]);
 
-    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(clock) - LIFETIME });
+    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(h.clock) - LIFETIME });
     assert.deepEqual(rainLines(h), [], "a first reading is no transition");
 
-    await advanceThroughSchedule(clock, [ sleep, sleep ]);
+    await advanceThroughSchedule(h.clock,[ sleep, sleep ]);
     assert.deepEqual(rainLines(h), [NOT_RESPONDING_LINE], "the poll that finds the reading gone says why, and the next says nothing further");
 
-    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(clock) });
-    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(clock) });
+    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(h.clock) });
+    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(h.clock) });
     assert.deepEqual(rainLines(h), [ NOT_RESPONDING_LINE, RESPONDING_LINE ], "the reading returning says so once");
   });
 
   test("a process with no reading yet writes neither line, and its first reading writes none", async (t) => {
 
-    const clock = new TestClock();
-    const h = onClock(clock, { hasV2Client: true, seedContext: seedCachedSensor });
+    const h = onClock({ hasV2Client: true, seedContext: seedCachedSensor });
 
     t.after(() => h.abort());
 
-    await advanceThroughSchedule(clock, []);
-    await advanceThroughSchedule(clock, [sleep]);
+    await advanceThroughSchedule(h.clock,[]);
+    await advanceThroughSchedule(h.clock,[sleep]);
 
-    h.controller.applyFacts({ facts: makeV2Facts({ rainSensors: null }), fetchedAt: seconds(clock) });
+    h.controller.applyFacts({ facts: makeV2Facts({ rainSensors: null }), fetchedAt: seconds(h.clock) });
     assert.deepEqual(rainLines(h), [], "a cached sensor with nothing to read has lost nothing this run");
 
-    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(clock) });
+    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(h.clock) });
     assert.deepEqual(rainLines(h), [], "and a first reading has returned from nothing");
   });
 
   test("a sensor whose reading aged out and whose list then stops naming it ends the record, so a later age-out or a new sensor writes no second line", async (t) => {
 
-    const clock = new TestClock();
-    const h = onClock(clock, { hasV2Client: true });
+    const h = onClock({ hasV2Client: true });
 
     t.after(() => h.abort());
 
-    await advanceThroughSchedule(clock, []);
+    await advanceThroughSchedule(h.clock,[]);
 
-    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(clock) - LIFETIME });
-    await advanceThroughSchedule(clock, [sleep]);
+    h.controller.applyFacts({ facts: LISTING, fetchedAt: seconds(h.clock) - LIFETIME });
+    await advanceThroughSchedule(h.clock,[sleep]);
 
     assert.deepEqual(rainLines(h), [NOT_RESPONDING_LINE], "the reading ages out, and the first line says why");
 
-    h.controller.applyFacts({ facts: makeV2Facts(), fetchedAt: seconds(clock) - LIFETIME });
+    h.controller.applyFacts({ facts: makeV2Facts(), fetchedAt: seconds(h.clock) - LIFETIME });
 
     assert.equal(rainServices(h).length, 0, "a complete list drops the sensor");
 
-    await advanceThroughSchedule(clock, [sleep]);
+    await advanceThroughSchedule(h.clock,[sleep]);
 
     assert.equal(lastWord(h), "online", "no sensor carried, so the aged facts refuse nothing");
 
-    h.controller.applyFacts({ facts: makeV2Facts({ rainSensors: [[ SECOND_SENSOR_ID, { name: SECOND_SENSOR_NAME, tripped: false } ]] }), fetchedAt: seconds(clock) });
+    h.controller.applyFacts({ facts: makeV2Facts({ rainSensors: [[ SECOND_SENSOR_ID, { name: SECOND_SENSOR_NAME, tripped: false } ]] }), fetchedAt: seconds(h.clock) });
 
     assert.ok(sensorOf(h, SECOND_SENSOR_ID), "a later list names a new sensor");
     assert.deepEqual(rainLines(h), [NOT_RESPONDING_LINE], "and no second line is written, since a new sensor's first reading has returned from nothing");

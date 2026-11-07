@@ -7,16 +7,22 @@
  * endpoint, an HTTP 200 whose body carries an errors array with or without data, and the pool re-arm a timed-out call triggers. It covers too a 429 from the read
  * or its grant named up the chain, the token a refused read drops, and the password grant a refused renewal falls back to.
  *
+ * Every client and its budget run on one TestClock its row steps. A token's lifetime, each request's deadline and each wait for a slot are all read on that clock,
+ * so a row crosses an hour of token life, a request deadline or a budget window in virtual time, and proves on the clock where each request deadline is armed,
+ * what it bounds and when it is released.
+ *
  * Every fixture body below is taken from the live probe captures, so a wrong field mapping fails here rather than in the field.
  */
 // The OAuth and GraphQL wire shapes use snake_case keys such as access_token, so camelcase is disabled here to let the fixtures mirror the captured bodies verbatim.
 /* eslint-disable camelcase */
 import { HYDRAWISE_TRANSPORT_FAULT_SENTENCES, HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_BUDGET_WINDOW, HYDRAWISE_V2_CLIENT_ID, HYDRAWISE_V2_CLIENT_SECRET,
-  HYDRAWISE_V2_GRAPH_ENDPOINT, HYDRAWISE_V2_TOKEN_ENDPOINT } from "./settings.ts";
+  HYDRAWISE_V2_GRAPH_ENDPOINT, HYDRAWISE_V2_REFRESH_THRESHOLD, HYDRAWISE_V2_TIMEOUT, HYDRAWISE_V2_TOKEN_ENDPOINT } from "./settings.ts";
+import type { HydrawiseControllerV2Facts, HydrawiseV2Grant, HydrawiseV2Read } from "./types.ts";
 import { MockAgent, errors } from "undici";
-import { capturingLog, errnoError, formatLogEntry, linesAt } from "homebridge-plugin-utils/testing";
+import { TestClock, capturingLog, errnoError, formatLogEntry, linesAt, settle, settleUntil } from "homebridge-plugin-utils/testing";
 import { describe, test } from "node:test";
-import type { HydrawiseControllerV2Facts } from "./types.ts";
+import type { Dispatcher } from "undici";
+import { HeldEnd } from "./testing.helpers.ts";
 import type { HydrawiseTransportFault } from "./settings.ts";
 import { HydrawiseV2Client } from "./v2.ts";
 import { RateBudget } from "homebridge-plugin-utils";
@@ -99,18 +105,22 @@ interface RecordedCall {
   path: string;
 }
 
-// The handles a harness hands back: the client under test, the recorded call log, the ceiling it draws against, and the captured log lines.
+// The handles a harness hands back: the client under test, the recorded call log, the ceiling it draws against, the clock they run on, and the captured log lines.
 interface V2Harness {
 
   budget: RateBudget;
   calls: RecordedCall[];
   client: HydrawiseV2Client;
+  clock: TestClock;
   entries: readonly TestLogEntry[];
 }
 
 /* Build a client over a MockAgent handed in through the constructor's dispatcher factory - the SAME parameter production leaves unset, so nothing here is a path
- * production does not have. The factory answers one agent for the life of the harness; a test needing the timeout self-heal path constructs HydrawiseV2Client
- * directly instead, since this harness offers no way to override the factory it builds.
+ * production does not have. The factory answers one agent for the life of the harness; a row reading the timeout self-heal builds its client through
+ * makeRearmHarness below instead, whose factory answers a second agent after the first.
+ *
+ * The client and its budget share one TestClock, as the platform hands each its own clock, so a row that steps the clock moves the token's lifetime, the request
+ * deadlines and the ceiling's window together, and a row that never steps it holds all of them still.
  *
  * Each intercept records the call before it replies, capturing the ceiling's free slots AT DISPATCH. That number is what proves the draw is awaited rather than
  * merely present: a call that reached the wire without waiting would be recorded with its ceiling untouched.
@@ -118,9 +128,10 @@ interface V2Harness {
 function makeV2Harness(program: (agent: MockAgent, record: (path: string) => void) => void,
   options: { capacity?: number; signal?: AbortSignal } = {}): V2Harness {
 
+  const clock = new TestClock();
   const log = capturingLog();
   const signal = options.signal ?? new AbortController().signal;
-  const budget = new RateBudget({ capacity: options.capacity ?? HYDRAWISE_V2_BUDGET_CALLS, signal, window: HYDRAWISE_V2_BUDGET_WINDOW * 1000 });
+  const budget = new RateBudget({ capacity: options.capacity ?? HYDRAWISE_V2_BUDGET_CALLS, clock, signal, window: HYDRAWISE_V2_BUDGET_WINDOW * 1000 });
   const calls: RecordedCall[] = [];
   const agent = new MockAgent();
 
@@ -131,9 +142,44 @@ function makeV2Harness(program: (agent: MockAgent, record: (path: string) => voi
     calls.push({ budgetAvailableAtDispatch: budget.available, path });
   });
 
-  const client = new HydrawiseV2Client({ budget, dispatcherFactory: (): MockAgent => agent, log, password: "test-password", signal, username: "test-user" });
+  const client = new HydrawiseV2Client({ budget, clock, dispatcherFactory: (): MockAgent => agent, log, password: "test-password", signal, username: "test-user" });
 
-  return { budget, calls, client, entries: log.entries };
+  return { budget, calls, client, clock, entries: log.entries };
+}
+
+// The handles a re-arm row reads: the client, the clock it and its budget run on, the dispatcher its factory answers first and the agent it answers after a
+// re-arm, and the captured log lines.
+interface RearmHarness {
+
+  client: HydrawiseV2Client;
+  clock: TestClock;
+  entries: readonly TestLogEntry[];
+  first: Dispatcher;
+  second: MockAgent;
+}
+
+/* Build a client whose dispatcher factory answers a first agent and then a second, so a row reads the timeout self-heal through the dispatcher getter: the first
+ * agent's destroy tears it down for real, and the second serves whatever comes after the re-arm. The row programs the first agent, and a row that holds a reply's
+ * end hands its interceptor in, composed onto the first agent before the client takes it, so the dispatcher the client starts on is the composed one.
+ */
+function makeRearmHarness(program: (agent: MockAgent) => void, { interceptor }: { interceptor?: Dispatcher.DispatcherComposeInterceptor } = {}): RearmHarness {
+
+  const agent = destroyable(new MockAgent());
+  const clock = new TestClock();
+  const log = capturingLog();
+  const second = new MockAgent();
+  const signal = new AbortController().signal;
+
+  agent.disableNetConnect();
+  second.disableNetConnect();
+  program(agent);
+
+  const first = interceptor ? agent.compose(interceptor) : agent;
+  const built: Dispatcher[] = [ first, second ];
+  const client = new HydrawiseV2Client({ budget: new RateBudget({ capacity: HYDRAWISE_V2_BUDGET_CALLS, clock, signal, window: HYDRAWISE_V2_BUDGET_WINDOW * 1000 }),
+    clock, dispatcherFactory: (): Dispatcher => built.shift() ?? second, log, password: "test-password", signal, username: "test-user" });
+
+  return { client, clock, entries: log.entries, first, second };
 }
 
 /* A MockAgent whose destroy tears it down for real. undici's MockAgent implements close but inherits the base dispatcher's unimplemented destroy, and the client
@@ -199,14 +245,18 @@ async function answeredFacts(client: HydrawiseV2Client): Promise<Map<number, Hyd
 
 /* Program the token endpoint to answer each grant in turn, one-shot and in order, recording the grant type each request presented. The record is what tells a password
  * grant from a renewal, which every intercept matching on path and method alone is blind to.
+ *
+ * An answer carrying a gate is recorded as its request arrives and sent only once the gate opens, so a row holds that grant on the wire, its deadline standing,
+ * while it reads the clock or steps it.
  */
-function programGrants(agent: MockAgent, grants: (string | null)[], answers: { body: object; statusCode?: number }[]): void {
+function programGrants(agent: MockAgent, grants: (string | null)[], answers: { body: object; gate?: Promise<void>; statusCode?: number }[]): void {
 
-  for(const { body, statusCode = 200 } of answers) {
+  for(const { body, gate, statusCode = 200 } of answers) {
 
-    agent.get(V2_ORIGIN).intercept({ method: "POST", path: TOKEN_PATH }).reply(statusCode, (request): object => {
+    agent.get(V2_ORIGIN).intercept({ method: "POST", path: TOKEN_PATH }).reply(statusCode, async (request): Promise<object> => {
 
       grants.push(new URLSearchParams(request.body as string).get("grant_type"));
+      await gate;
 
       return body;
     });
@@ -224,25 +274,36 @@ describe("HydrawiseV2Client tokens", () => {
     assert.equal(harness.calls.length, 1, "the second call should have spent no grant");
   });
 
-  test("renews a token that is inside its proactive-refresh window", async () => {
+  test("renews a token once the client's clock reaches its proactive-refresh window, and reuses it until then", async () => {
 
-    // A grant whose lifetime is shorter than the proactive-refresh threshold is inside that window the instant it lands, so the next call renews rather than
-    // reusing it. That is the same arithmetic a long-lived token reaches near its expiry, without a test having to wait an hour to observe it.
     const harness = makeV2Harness((agent, record) => {
 
       agent.get(V2_ORIGIN).intercept({ method: "POST", path: TOKEN_PATH }).reply(200, (): object => {
 
         record(TOKEN_PATH);
 
-        return { access_token: "access-one", expires_in: 30, refresh_token: "refresh-one" };
+        return TOKEN_BODY;
       });
 
       programReply(agent, record, TOKEN_PATH, RENEWED_TOKEN_BODY);
     });
 
-    assert.deepEqual(await harness.client.ensureToken(), granted("access-one"), "the first grant answers the short-lived token");
-    assert.deepEqual(await harness.client.ensureToken(), granted("access-two"), "a token inside the refresh window is renewed rather than reused");
+    assert.deepEqual(await harness.client.ensureToken(), granted("access-one"), "the first grant answers the captured hour-long token");
+
+    // The window opens the refresh threshold ahead of the lifetime the grant stated, each read in whole seconds on the client's clock, so a second short of it the
+    // token still serves and the step onto it renews.
+    const windowOpens = (TOKEN_BODY.expires_in - HYDRAWISE_V2_REFRESH_THRESHOLD) * 1000;
+
+    harness.clock.advance(windowOpens - 1000);
+
+    assert.deepEqual(await harness.client.ensureToken(), granted("access-one"), "a second short of the window the token is reused");
+    assert.equal(harness.calls.length, 1, "and no second grant is spent");
+
+    harness.clock.advance(1000);
+
+    assert.deepEqual(await harness.client.ensureToken(), granted("access-two"), "once the clock reaches the window the token is renewed rather than reused");
     assert.equal(harness.calls.length, 2, "the renewal should have spent a second grant");
+    assert.equal(harness.clock.now(), windowOpens, "at the moment the window opens");
   });
 
   test("a failed grant resets the token state so the next call retries from scratch", async () => {
@@ -773,6 +834,46 @@ describe("HydrawiseV2Client account facts", () => {
     assert.equal(harness.calls[1]?.budgetAvailableAtDispatch, HYDRAWISE_V2_BUDGET_CALLS - 2, "the query dispatches against the same two spent slots");
     assert.equal(harness.budget.available, HYDRAWISE_V2_BUDGET_CALLS - 2, "one enrichment costs exactly two slots on a cold client");
   });
+
+  test("a read whose grant waits on the budget for longer than a request deadline still answers, each deadline armed at its request's admission", async () => {
+
+    const harness = makeV2Harness((agent, record) => {
+
+      programReply(agent, record, TOKEN_PATH, TOKEN_BODY);
+      programReply(agent, record, GRAPH_PATH, ACCOUNT_BODY);
+    });
+
+    // Every slot but one is spent, so the read's own draw is admitted at once and the grant it triggers waits for the oldest slot to leave the window.
+    for(let spent = 1; spent < HYDRAWISE_V2_BUDGET_CALLS; spent++) {
+
+      // eslint-disable-next-line no-await-in-loop
+      await harness.budget.acquire();
+    }
+
+    const answers: HydrawiseV2Read[] = [];
+
+    void harness.client.fetchAccountFacts().then((answer): void => {
+
+      answers.push(answer);
+    });
+
+    await settleUntil(() => harness.clock.pending === 1, { description: "the grant to wait for a slot" });
+
+    // The wait for the slot is the clock's one entry: no deadline stands while the grant is held back, since neither request has been admitted to the wire.
+    assert.equal(harness.clock.nextDeadline, HYDRAWISE_V2_BUDGET_WINDOW * 1000, "the grant waits for the oldest slot to leave the window");
+    assert.equal(harness.calls.length, 0, "and nothing has reached the wire");
+
+    // The window is far longer than a request deadline, so a deadline armed ahead of its request's admission would fire inside this one step.
+    harness.clock.advance(HYDRAWISE_V2_BUDGET_WINDOW * 1000);
+    await settleUntil(() => answers.length === 1, { description: "the read to answer once its grant was admitted" });
+
+    const [answer] = answers;
+
+    assert.ok((answer?.status === "answered") && answer.facts.has(1058515), "a wait far longer than a request deadline costs the read nothing");
+    assert.deepEqual(harness.calls.map(call => call.path), [ TOKEN_PATH, GRAPH_PATH ], "the grant and then the query reached the wire after the wait");
+    assert.deepEqual(errorLines(harness.entries), [], "with no deadline met along the way");
+    assert.equal(harness.clock.pending, 0, "and every request's deadline left the clock as its request settled");
+  });
 });
 
 describe("HydrawiseV2Client failure classification", () => {
@@ -1108,6 +1209,60 @@ describe("HydrawiseV2Client token recovery", () => {
     assert.deepEqual(await harness.client.ensureToken(), granted("access-two"), "the fallback's token is the one held");
   });
 
+  test("a refused renewal's deadline leaves the clock before the password grant it falls back to arms its own", async (t) => {
+
+    const fallback: PromiseWithResolvers<void> = Promise.withResolvers();
+    const grants: (string | null)[] = [];
+    const refusal: PromiseWithResolvers<void> = Promise.withResolvers();
+    const harness = makeV2Harness((agent, record) => {
+
+      programGrants(agent, grants, [ { body: SHORT_LIVED_TOKEN_BODY }, { body: REFUSED_GRANT_BODY, gate: refusal.promise, statusCode: 401 },
+        { body: RENEWED_TOKEN_BODY, gate: fallback.promise } ]);
+      programReply(agent, record, GRAPH_PATH, ACCOUNT_BODY);
+    });
+
+    t.after(() => {
+
+      refusal.resolve();
+      fallback.resolve();
+    });
+
+    assert.ok((await answeredFacts(harness.client)).has(1058515), "the first fetch signs in");
+
+    const answers: HydrawiseV2Read[] = [];
+
+    void harness.client.fetchAccountFacts().then((answer): void => {
+
+      answers.push(answer);
+    });
+
+    await settleUntil(() => grants.length === 2, { description: "the renewal to reach the wire" });
+
+    assert.equal(harness.clock.pending, 1, "while the renewal is held, its own deadline stands on the client's clock");
+    assert.equal(harness.clock.nextDeadline, HYDRAWISE_V2_TIMEOUT * 1000, "one request deadline from the renewal's admission");
+
+    // The refusal is answered part of the way into the renewal's deadline, so the fallback's deadline falls due at a different moment from the renewal's and the
+    // clock tells the two apart.
+    const answeredAfter = (HYDRAWISE_V2_TIMEOUT * 1000) / 3;
+
+    harness.clock.advance(answeredAfter);
+    refusal.resolve();
+    await settleUntil(() => grants.length === 3, { description: "the password grant the refused renewal falls back to" });
+
+    assert.equal(harness.clock.pending, 1, "while the fallback grant waits on the wire, the clock holds its deadline alone");
+    assert.equal(harness.clock.nextDeadline, answeredAfter + (HYDRAWISE_V2_TIMEOUT * 1000), "the fallback's own, armed as it went out, with none left from the renewal");
+
+    fallback.resolve();
+    await settleUntil(() => answers.length === 1, { description: "the fetch to answer on the fallback's token" });
+
+    const [answer] = answers;
+
+    assert.ok((answer?.status === "answered") && answer.facts.has(1058515), "the fetch answers its facts on the fallback's token");
+    assert.deepEqual(grants, [ "password", "refresh_token", "password" ], "the fallback ran inside the fetch that needed it");
+    assert.deepEqual(errorLines(harness.entries), [], "and no deadline was met along the way");
+    assert.equal(harness.clock.pending, 0, "and every deadline left the clock as its request settled");
+  });
+
   test("a fallback the password grant then refuses says the credentials are wrong", async () => {
 
     const grants: (string | null)[] = [];
@@ -1172,60 +1327,123 @@ describe("HydrawiseV2Client token recovery", () => {
 
 describe("HydrawiseV2Client dispatcher", () => {
 
-  test("a timed-out request re-arms the connection pool, and the dispatcher getter answers the replacement", async () => {
+  test("a request its deadline cuts off on the client's clock re-arms the connection pool, and the dispatcher getter answers the replacement", async (t) => {
 
-    const first = destroyable(new MockAgent());
-    const second = new MockAgent();
-    const built = [ first, second ];
-    const log = capturingLog();
-    const signal = new AbortController().signal;
+    const gate: PromiseWithResolvers<void> = Promise.withResolvers();
+    let dispatched = false;
 
-    first.disableNetConnect();
-    second.disableNetConnect();
+    // A grant whose answer waits on a gate that opens only after the row, so no answer reaches the request before its deadline does. The reply callback runs as the
+    // request reaches the agent, which is the witness that the grant is on the wire, its deadline armed, before the row steps the clock.
+    const { client, clock, entries, first, second } = makeRearmHarness((agent) => {
 
-    // The timeout is driven through the request itself rather than by reaching past the class: undici surfaces a request timeout as exactly this DOMException, so
-    // rejecting with it puts the client on the same code path a genuinely slow account would.
-    first.get(V2_ORIGIN).intercept({ method: "POST", path: TOKEN_PATH })
-      .replyWithError(new DOMException("The operation was aborted due to timeout", "TimeoutError")).persist();
+      agent.get(V2_ORIGIN).intercept({ method: "POST", path: TOKEN_PATH }).reply(200, async (): Promise<object> => {
 
-    const client = new HydrawiseV2Client({ budget: new RateBudget({ capacity: HYDRAWISE_V2_BUDGET_CALLS, signal, window: HYDRAWISE_V2_BUDGET_WINDOW * 1000 }),
-      dispatcherFactory: (): MockAgent => built.shift() ?? second, log,
-      password: "test-password", signal, username: "test-user" });
+        dispatched = true;
+        await gate.promise;
+
+        return TOKEN_BODY;
+      });
+    });
+
+    t.after(() => gate.resolve());
 
     assert.equal(client.dispatcher, first, "the client starts on the dispatcher its factory built");
-    assert.deepEqual(await client.ensureToken(), { status: "failed" }, "a timed-out grant answers a failed one");
+
+    const answers: HydrawiseV2Grant[] = [];
+    const granting = client.ensureToken();
+
+    void granting.then((answer): void => {
+
+      answers.push(answer);
+    });
+
+    await settleUntil(() => dispatched, { description: "the grant to reach the wire" });
+
+    assert.equal(clock.pending, 1, "the grant's deadline stands on the client's clock");
+    assert.equal(clock.nextDeadline, HYDRAWISE_V2_TIMEOUT * 1000, "one request deadline from the grant's admission");
+
+    // The answer is read through the turns that follow each step rather than awaited, so a deadline left off the client's clock cannot answer in real time
+    // inside the row's own timeout.
+    clock.advance((HYDRAWISE_V2_TIMEOUT * 1000) - 1);
+
+    assert.equal(await Promise.race([ granting.then(() => "answered"), settle().then(() => "pending") ]), "pending",
+      "a millisecond short of the deadline the grant is still waiting on its answer");
+
+    clock.advance(1);
+    await settleUntil(() => answers.length === 1, { description: "the grant to answer once its deadline passed" });
+
+    assert.deepEqual(answers, [{ status: "failed" }], "a grant the deadline cut off answers a failed one");
+    assert.deepEqual(errorLines(entries),
+      ["Unable to sign in to your Hydrawise account for enhanced features. The Hydrawise API took too long to respond, which can usually be safely ignored."],
+      "the timeout is reported to the user, joined to the sign-in sentence by a period");
 
     /* A wedged pool carries every request on its single connection, so it is replaced rather than waited out. The getter answering the REPLACEMENT is what makes
      * the platform's teardown correct across this: that registration reads the dispatcher at disposal time, and a captured reference would destroy the pool that
      * was already abandoned while leaving the live one open.
      */
     assert.equal(client.dispatcher, second, "the timeout re-armed the pool, and the getter answers the live one");
-    assert.ok(log.entries.some(line => (line.level === "error") && line.message.includes("too long to respond")), "the timeout is reported to the user");
+    assert.equal(clock.pending, 0, "and the deadline that fired has left the clock");
+  });
+
+  test("a deadline met while the account answer is read cuts the read off and re-arms the pool, as one met before the answer does", async (t) => {
+
+    // The hold is the account answer's alone, matched on the account path exactly as its intercept is, so the grant ahead of it answers whole and the read's body
+    // is the one left mid-read.
+    const hold = new HeldEnd((path) => path === GRAPH_PATH);
+    const { client, clock, entries, first, second } = makeRearmHarness((agent) => {
+
+      agent.get(V2_ORIGIN).intercept({ method: "POST", path: TOKEN_PATH }).reply(200, TOKEN_BODY);
+      agent.get(V2_ORIGIN).intercept({ method: "POST", path: GRAPH_PATH }).reply(200, ACCOUNT_BODY);
+    }, { interceptor: hold.interceptor() });
+
+    t.after(() => hold.release());
+
+    assert.equal(client.dispatcher, first, "the client starts on the held dispatcher its factory built");
+
+    const answers: HydrawiseV2Read[] = [];
+    const reading = client.fetchAccountFacts();
+
+    void reading.then((answer): void => {
+
+      answers.push(answer);
+    });
+
+    await hold.reached;
+
+    assert.equal(clock.pending, 1, "while the answer's body is read, the read's deadline stands on the client's clock, the grant's already released");
+    assert.equal(clock.nextDeadline, HYDRAWISE_V2_TIMEOUT * 1000, "one request deadline from the read's admission");
+
+    clock.advance((HYDRAWISE_V2_TIMEOUT * 1000) - 1);
+
+    assert.equal(await Promise.race([ reading.then(() => "answered"), settle().then(() => "pending") ]), "pending",
+      "a millisecond short of the deadline the body is still being read");
+
+    clock.advance(1);
+    await settleUntil(() => answers.length === 1, { description: "the read to answer once its deadline cut the body off" });
+
+    // The body's read sits inside the request the deadline bounds, so a deadline met there is the same timeout as one met before the answer arrived: the read's own
+    // sentence with the timeout's reason, and a pool replaced rather than trusted with the next request.
+    assert.deepEqual(answers, [{ status: "failed" }], "a read the deadline cut off mid-body answers failed");
+    assert.deepEqual(errorLines(entries),
+      ["Unable to retrieve enhanced controller details. The Hydrawise API took too long to respond, which can usually be safely ignored."],
+      "and the timeout is reported under the read's own sentence");
+    assert.equal(client.dispatcher, second, "and the deadline re-armed the pool");
+    assert.equal(clock.pending, 0, "with the deadline that fired gone from the clock");
   });
 
   test("a response deadline re-arms the connection pool exactly as the request deadline does", async () => {
 
-    const first = destroyable(new MockAgent());
-    const second = new MockAgent();
-    const built = [ first, second ];
-    const log = capturingLog();
-    const signal = new AbortController().signal;
-
-    first.disableNetConnect();
-    second.disableNetConnect();
-
     // The transport's own header deadline is a deadline elapsing exactly as the composed per-request timeout is, so it takes the same arm: the same sentence, and
     // the same replacement of a pool whose single connection every in-flight request was using.
-    first.get(V2_ORIGIN).intercept({ method: "POST", path: TOKEN_PATH }).replyWithError(new errors.HeadersTimeoutError()).persist();
+    const { client, entries, first, second } = makeRearmHarness((agent) => {
 
-    const client = new HydrawiseV2Client({ budget: new RateBudget({ capacity: HYDRAWISE_V2_BUDGET_CALLS, signal, window: HYDRAWISE_V2_BUDGET_WINDOW * 1000 }),
-      dispatcherFactory: (): MockAgent => built.shift() ?? second, log,
-      password: "test-password", signal, username: "test-user" });
+      agent.get(V2_ORIGIN).intercept({ method: "POST", path: TOKEN_PATH }).replyWithError(new errors.HeadersTimeoutError()).persist();
+    });
 
     assert.equal(client.dispatcher, first, "the client starts on the dispatcher its factory built");
     assert.deepEqual(await client.ensureToken(), { status: "failed" }, "a grant that outran the response deadline answers a failed one");
     assert.equal(client.dispatcher, second, "the deadline re-armed the pool, and the getter answers the live one");
-    assert.ok(log.entries.some(line => (line.level === "error") && line.message.includes("too long to respond")), "and the deadline is reported to the user");
+    assert.ok(entries.some(line => (line.level === "error") && line.message.includes("too long to respond")), "and the deadline is reported to the user");
   });
 
   test("every coded transport fault is reported as the sentence the plugin keeps for its kind", async () => {
@@ -1252,24 +1470,14 @@ describe("HydrawiseV2Client dispatcher", () => {
 
     for(const row of faultRows) {
 
-      const first = destroyable(new MockAgent());
-      const second = new MockAgent();
-      const built = [ first, second ];
-      const log = capturingLog();
-      const signal = new AbortController().signal;
+      const { client, entries, first } = makeRearmHarness((agent) => {
 
-      first.disableNetConnect();
-      second.disableNetConnect();
-      first.get(V2_ORIGIN).intercept({ method: "POST", path: TOKEN_PATH })
-        .replyWithError(errnoError("a transport fault", row.code)).persist();
-
-      const client = new HydrawiseV2Client({ budget: new RateBudget({ capacity: HYDRAWISE_V2_BUDGET_CALLS, signal, window: HYDRAWISE_V2_BUDGET_WINDOW * 1000 }),
-        dispatcherFactory: (): MockAgent => built.shift() ?? second, log,
-        password: "test-password", signal, username: "test-user" });
+        agent.get(V2_ORIGIN).intercept({ method: "POST", path: TOKEN_PATH }).replyWithError(errnoError("a transport fault", row.code)).persist();
+      });
 
       // eslint-disable-next-line no-await-in-loop
       assert.deepEqual(await client.ensureToken(), { status: "failed" }, "a coded transport fault answers as every failed grant does");
-      assert.deepEqual(errorLines(log.entries),
+      assert.deepEqual(errorLines(entries),
         ["Unable to sign in to your Hydrawise account for enhanced features. " + HYDRAWISE_TRANSPORT_FAULT_SENTENCES[row.kind]],
         "and it reads as the sign-in sentence joined to the fault's own by a period");
       assert.equal(client.dispatcher, first, "while a fault that is not a deadline leaves the pool alone");

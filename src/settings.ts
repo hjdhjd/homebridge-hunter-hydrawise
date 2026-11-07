@@ -122,9 +122,9 @@ export const HYDRAWISE_V2_BUDGET_CALLS = 5;
 // The trailing window, in seconds, the v2 call ceiling above is measured over.
 export const HYDRAWISE_V2_BUDGET_WINDOW = 1800;
 
-/* The v2 response timeout, in seconds. It is deliberately more generous than the v1 timeout: a v2 call can carry an OAuth round trip ahead of the query itself, and
- * the graph endpoint answers a whole account in one response where a v1 call answers one controller, so the same budget would cut off requests that were simply
- * doing more work.
+/* The v2 per-request timeout, in seconds. Each request carries its own, the token grant and the query alike, and it bounds that request and its body's read. It is
+ * deliberately more generous than the v1 timeout: the graph endpoint answers a whole account in one response where a v1 call answers one controller, so the same
+ * budget would cut off requests that were simply doing more work.
  */
 export const HYDRAWISE_V2_TIMEOUT = 15;
 

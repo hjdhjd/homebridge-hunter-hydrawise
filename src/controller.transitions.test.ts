@@ -1,27 +1,30 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
  * controller.transitions.test.ts: Multi-poll transition behavior of the HydrawiseController polling loop. Each test programs a queue of poll responses
- * and drives the live loop across them at the fast cadence, waiting on the observable each transition produces. Covers zone start / stop logging (globally and
- * per-zone by the Log.Zone feature), rain-sensor transitions, zone appearance and disappearance with valve pruning, zone-scoped Device disable, a suspension
- * arriving and lifting through an account-facts refresh, the suspended-until instant formatter's rendering tiers, and rain narration that follows the sensor's
- * own reading independent of a zone's suspension state.
+ * and steps the controller's clock across the sleeps between them at the wire's own cadence, until the observable each transition produces stands. Covers zone
+ * start / stop logging (globally and per-zone by the Log.Zone feature), rain-sensor transitions, zone appearance and disappearance with valve pruning, zone-scoped
+ * Device disable, a suspension arriving and lifting through an account-facts refresh, the suspended-until instant formatter's rendering tiers, and rain narration
+ * that follows the sensor's own reading independent of a zone's suspension state.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
 /* eslint-disable camelcase */
 import type { HydrawiseControllerV2Facts, HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
-import { Service, buildController, makeV2Facts, makeZoneV2Facts } from "./testing/platform.helpers.ts";
+import { Service, advanceThroughPolls, buildController, makeV2Facts, makeZoneV2Facts, seconds } from "./testing/platform.helpers.ts";
+import { TestClock, advanceUntil, formatLogEntry, logCount, loggedAt, settleUntil } from "homebridge-plugin-utils/testing";
 import { bareSensors, rainSensors } from "./api.fixtures.ts";
 import { describe, test } from "node:test";
-import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
-import { formatLogEntry, logCount, loggedAt, waitUntil } from "homebridge-plugin-utils/testing";
+import { makeStatusSchedule, makeZone } from "./api.helpers.ts";
 import { HYDRAWISE_UNSCHEDULED_SENTINEL } from "./types.ts";
 import assert from "node:assert/strict";
 
-// Compose a fast-cadence schedule from a zone list and an optional sensor block (the bare, non-referencing sensor by default).
+/* Compose a wire-realistic schedule from a zone list and an optional sensor block (the bare, non-referencing sensor by default). The first poll goes out as the
+ * controller is built and lands within turns, so a first-poll state is read with no step of the clock, and a row that wants a later poll steps the controller's
+ * clock across the sleep the wire asks for.
+ */
 function schedule(zones: HydrawiseZoneConfig[], sensors: StatusScheduleResponse["sensors"] = bareSensors): StatusScheduleResponse {
 
-  return fastPolling(makeStatusSchedule({ relays: zones, sensors }));
+  return makeStatusSchedule({ relays: zones, sensors });
 }
 
 // A single zone scheduled to run later (not currently running, outside the active window).
@@ -58,7 +61,7 @@ describe("HydrawiseController updateState transitions", () => {
     t.after(() => h.abort());
 
     // Poll 1 seeds the valve (no transition), poll 2 turns it on (Started), the default poll turns it back off (Stopped).
-    await waitUntil(() => loggedAt(h.entries, "info", "Stopped"), { description: "an info line containing \"Stopped\"" });
+    await advanceUntil(h.clock, () => loggedAt(h.entries, "info", "Stopped"), { description: "an info line containing \"Stopped\"" });
 
     assert.ok(loggedAt(h.entries, "info", "Started"), "turning a zone on across polls should log a start");
     assert.ok(loggedAt(h.entries, "info", "Stopped"), "turning a zone off across polls should log a stop");
@@ -76,8 +79,8 @@ describe("HydrawiseController updateState transitions", () => {
 
     t.after(() => h.abort());
 
-    // Wait until at least two polls have run so the on-transition has certainly been processed, then confirm it produced no start log.
-    await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 3, { description: "the third status poll" });
+    // Step past the poll that turns the zones on, so the on-transition has certainly been processed, then confirm it produced no start log.
+    await advanceThroughPolls(h, 2);
 
     assert.ok(loggedAt(h.entries, "info", "Bravo [Zone 2]: Started"), "the sibling whose Log.Zone is at its default logs the start the same poll made");
     assert.ok(!loggedAt(h.entries, "info", "Alpha [Zone 1]: Started"), "a zone with Log.Zone disabled should not log its start");
@@ -94,7 +97,7 @@ describe("HydrawiseController updateState transitions", () => {
 
     t.after(() => h.abort());
 
-    await waitUntil(() => loggedAt(h.entries, "info", "Rain sensor appears to be allowing irrigation"),
+    await advanceUntil(h.clock, () => loggedAt(h.entries, "info", "Rain sensor appears to be allowing irrigation"),
       { description: "an info line containing \"Rain sensor appears to be allowing irrigation\"" });
 
     assert.ok(loggedAt(h.entries, "info", "Rain sensor appears to be stopping irrigation"), "a rain stop should be logged");
@@ -112,7 +115,7 @@ describe("HydrawiseController updateState transitions", () => {
 
     t.after(() => h.abort());
 
-    await waitUntil(() => loggedAt(h.entries, "info", "Gamma [Zone 3]: Currently running"),
+    await settleUntil(() => loggedAt(h.entries, "info", "Gamma [Zone 3]: Currently running"),
       { description: "an info line containing \"Gamma [Zone 3]: Currently running\"" });
 
     assert.ok(loggedAt(h.entries, "info", "Alpha [Zone 1]: No runs are currently scheduled."), "an unscheduled zone states the absence rather than guessing a cause");
@@ -129,7 +132,7 @@ describe("HydrawiseController updateState transitions", () => {
 
     t.after(() => h.abort());
 
-    await waitUntil(() => loggedAt(h.entries, "info", "Beta [Zone 2]:"), { description: "an info line containing \"Beta [Zone 2]:\"" });
+    await settleUntil(() => loggedAt(h.entries, "info", "Beta [Zone 2]:"), { description: "an info line containing \"Beta [Zone 2]:\"" });
 
     // Every zone the sensor covers carries the sentinel, so the sensor itself is the evidence and both zones read as rain-stopped rather than merely unscheduled.
     assert.ok(loggedAt(h.entries, "info", "Alpha [Zone 1]: Rain sensor appears to be preventing irrigation."), "a fully sentineled covered group reads as a rain stop");
@@ -149,9 +152,9 @@ describe("HydrawiseController updateState transitions", () => {
 
     t.after(() => h.abort());
 
-    // Wait past the poll that moves Beta so the transition has certainly been processed, then confirm it produced no rain line. Gamma still holds a schedule under
+    // Step past the poll that moves Beta so the transition has certainly been processed, then confirm it produced no rain line. Gamma still holds a schedule under
     // the same sensor, so the sensor is demonstrably not tripping and Beta is merely without a run - a state the rain sentence would misreport.
-    await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 3, { description: "the third status poll" });
+    await advanceThroughPolls(h, 2);
 
     assert.ok(loggedAt(h.entries, "info", "Alpha [Zone 1]: No runs are currently scheduled."), "the first poll's mixed body was processed");
     assert.equal(logCount(h.entries, "info", "Rain sensor appears to be stopping irrigation"), 0,
@@ -172,7 +175,7 @@ describe("HydrawiseController updateState transitions", () => {
 
     t.after(() => h.abort());
 
-    await waitUntil(() => loggedAt(h.entries, "info", "Beta [Zone 2]: Rain sensor appears to be allowing irrigation."),
+    await advanceUntil(h.clock, () => loggedAt(h.entries, "info", "Beta [Zone 2]: Rain sensor appears to be allowing irrigation."),
       { description: "an info line containing \"Beta [Zone 2]: Rain sensor appears to be allowing irrigation.\"" });
 
     /* Alpha's own wire body never moves across these three polls - it carries the sentinel throughout - so both of its lines are driven entirely by Beta, the last
@@ -199,8 +202,9 @@ describe("HydrawiseController updateState transitions", () => {
     t.after(() => h.abort());
 
     // Both valves appear on poll 1; Beta vanishes from every later poll, so its valve is pruned while Alpha's survives.
-    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700002") !== undefined, { description: "the valve for zone 700002 to appear" });
-    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700002") === undefined, { description: "the valve for zone 700002 to be removed" });
+    await settleUntil(() => h.accessory.getServiceById(Service.Valve, "700002") !== undefined, { description: "the valve for zone 700002 to appear" });
+    await advanceUntil(h.clock, () => h.accessory.getServiceById(Service.Valve, "700002") === undefined,
+      { description: "the valve for zone 700002 to be removed" });
 
     assert.ok(h.accessory.getServiceById(Service.Valve, "700001"), "the surviving zone's valve should remain");
     assert.equal(h.accessory.getServiceById(Service.Valve, "700002"), undefined, "the vanished zone's valve should be pruned");
@@ -217,7 +221,7 @@ describe("HydrawiseController updateState transitions", () => {
 
     t.after(() => h.abort());
 
-    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700003") !== undefined, { description: "the valve for zone 700003 to appear" });
+    await advanceUntil(h.clock, () => h.accessory.getServiceById(Service.Valve, "700003") !== undefined, { description: "the valve for zone 700003 to appear" });
 
     assert.ok(h.accessory.getServiceById(Service.Valve, "700003"), "a newly appearing zone should get a valve");
   });
@@ -228,12 +232,13 @@ describe("HydrawiseController updateState transitions", () => {
       makeZone({ name: "Gamma", relay: 3, relay_id: 700003, run: 480, time: 70000, timestr: "16:16" }) ];
 
     const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(threeZones), kind: "response" }),
-      signalAborted: false, userOptions: ["Disable.Device.700002"] });
+      signalAborted: false,
+      userOptions: ["Disable.Device.700002"] });
 
     t.after(() => h.abort());
 
     // Wait for the enabled zones' valves, then confirm the disabled zone never got one.
-    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700003") !== undefined, { description: "the valve for zone 700003 to appear" });
+    await settleUntil(() => h.accessory.getServiceById(Service.Valve, "700003") !== undefined, { description: "the valve for zone 700003 to appear" });
 
     assert.ok(h.accessory.getServiceById(Service.Valve, "700001"), "the first enabled zone should have a valve");
     assert.equal(h.accessory.getServiceById(Service.Valve, "700002"), undefined, "the zone disabled at zone scope should have no valve");
@@ -248,13 +253,14 @@ describe("HydrawiseController updateState transitions", () => {
     // The controller-scoped disable turns every zone off, and the zone-scoped enable override - resolved at the device slot ahead of the controller slot - flips
     // just zone 700001 back on. The controller itself is built directly, so the whole-device platform gate is not in play here.
     const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(threeZones), kind: "response" }),
-      signalAborted: false, userOptions: [ "Disable.Device.SN0A1B2C3D4", "Enable.Device.700001" ] });
+      signalAborted: false,
+      userOptions: [ "Disable.Device.SN0A1B2C3D4", "Enable.Device.700001" ] });
 
     t.after(() => h.abort());
 
     // Wait for a full pass (the last enabled zone would be 700001 here) then confirm only the overridden zone got a valve.
-    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
-    await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 2, { description: "the second status poll" });
+    await settleUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
+    await advanceThroughPolls(h, 1);
 
     assert.ok(h.accessory.getServiceById(Service.Valve, "700001"), "the zone with the enable override should have a valve");
     assert.equal(h.accessory.getServiceById(Service.Valve, "700002"), undefined, "a sibling zone under the controller disable should have no valve");
@@ -288,19 +294,19 @@ describe("HydrawiseController suspension transitions", () => {
 
     t.after(() => h.abort());
 
-    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
+    await settleUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
 
-    h.controller.applyFacts({ facts: suspendedFacts(), fetchedAt: Math.floor(Date.now() / 1000) });
+    h.controller.applyFacts({ facts: suspendedFacts(), fetchedAt: seconds(h.clock) });
 
     assert.equal(logCount(h.entries, "info", "Suspended until"), 1, "the suspension is narrated exactly once");
     assert.ok(loggedAt(h.entries, "info", "[Zone 1]"), "the line names the zone the operator sees on the controller");
 
     // A repeat of the same facts is not a transition, so it says nothing further.
-    h.controller.applyFacts({ facts: suspendedFacts(), fetchedAt: Math.floor(Date.now() / 1000) });
+    h.controller.applyFacts({ facts: suspendedFacts(), fetchedAt: seconds(h.clock) });
     assert.equal(logCount(h.entries, "info", "Suspended until"), 1, "an unchanged suspension narrates nothing further");
 
     // Clearing it is its own transition, narrated once and in its own words.
-    h.controller.applyFacts({ facts: makeV2Facts({ zones: [[ 700001, makeZoneV2Facts() ]] }), fetchedAt: Math.floor(Date.now() / 1000) });
+    h.controller.applyFacts({ facts: makeV2Facts({ zones: [[ 700001, makeZoneV2Facts() ]] }), fetchedAt: seconds(h.clock) });
 
     assert.equal(logCount(h.entries, "info", "Suspension lifted."), 1, "lifting the suspension is narrated exactly once");
   });
@@ -316,10 +322,10 @@ describe("HydrawiseController suspension transitions", () => {
     t.after(() => h.abort());
 
     // The facts land before any poll has completed, so the very first poll's walk seeds the zone already reading as suspended.
-    h.controller.applyFacts({ facts: suspendedFacts(), fetchedAt: Math.floor(Date.now() / 1000) });
+    h.controller.applyFacts({ facts: suspendedFacts(), fetchedAt: seconds(h.clock) });
 
-    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
-    await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 2, { description: "the second status poll" });
+    await settleUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
+    await advanceThroughPolls(h, 1);
 
     // The status sentence is the control that the facts landed before the first sighting, so the zone was seeded reading as suspended rather than never classified.
     assert.ok(loggedAt(h.entries, "info", "Watering is suspended until"), "the zone's first-sighting status names the suspension it was sighted under");
@@ -335,9 +341,9 @@ describe("HydrawiseController suspension transitions", () => {
 
     t.after(() => h.abort());
 
-    h.controller.applyFacts({ facts: suspendedFacts(), fetchedAt: Math.floor(Date.now() / 1000) });
+    h.controller.applyFacts({ facts: suspendedFacts(), fetchedAt: seconds(h.clock) });
 
-    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
+    await settleUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
 
     assert.ok(loggedAt(h.entries, "info", "Watering is suspended until"), "the zone's status sentence names its suspension");
     assert.ok(!loggedAt(h.entries, "info", "No runs are currently scheduled"), "and never falls back to the unscheduled wording");
@@ -351,7 +357,7 @@ describe("HydrawiseController suspension transitions", () => {
 
     t.after(() => h.abort());
 
-    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
+    await settleUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
 
     assert.ok(loggedAt(h.entries, "info", "No runs are currently scheduled"), "the key-based sentence is what an unenriched zone reports");
     assert.equal(logCount(h.entries, "info", "suspended"), 0, "and no suspension is claimed anywhere");
@@ -360,22 +366,27 @@ describe("HydrawiseController suspension transitions", () => {
 
 describe("HydrawiseController suspension instant rendering", () => {
 
+  /* The instant every rendering here is judged from: local noon on a fixed calendar day, so an hour past it falls on the same day in every timezone, and every
+   * expectation is read from this seed rather than from the host's own day. The day lies after the root time the status bodies carry, and a reported suspension
+   * classifies as one only while it is still ahead of that time, so each suspension the rows narrate stands.
+   */
+  const NOON = new Date(2026, 5, 15, 12).getTime();
+
   // One zone under the ambiguous sentinel shape, so the narrated sentence rests entirely on the account facts.
   function sentinelZone(): HydrawiseZoneConfig {
 
     return makeZone({ name: "Alpha", relay: 1, relay_id: 700001, run: 0, time: HYDRAWISE_UNSCHEDULED_SENTINEL, timestr: "" });
   }
 
-  // Drive a controller to narrate a suspension ending at the given instant, and hand back its captured lines.
+  // Drive a controller on a clock seeded at the instant above to narrate a suspension ending at the given instant, and hand back its captured lines.
   async function narrate(until: number): Promise<string[]> {
 
-    const h = buildController({ hasV2Client: true,
+    const h = buildController({ clock: new TestClock(NOON), hasV2Client: true,
       program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([sentinelZone()]), kind: "response" }), signalAborted: false });
 
-    h.controller.applyFacts({ facts: makeV2Facts({ zones: [[ 700001, makeZoneV2Facts({ suspendedUntil: until }) ]] }),
-      fetchedAt: Math.floor(Date.now() / 1000) });
+    h.controller.applyFacts({ facts: makeV2Facts({ zones: [[ 700001, makeZoneV2Facts({ suspendedUntil: until }) ]] }), fetchedAt: seconds(h.clock) });
 
-    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
+    await settleUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
     await h.abort();
 
     return h.entries.map(formatLogEntry);
@@ -386,18 +397,14 @@ describe("HydrawiseController suspension instant rendering", () => {
     /* The runtime formatter's rendering tiers, driven through the sentence a user actually reads. Every expected string is computed through the identical Intl
      * call the formatter itself makes, so a host in another locale or timezone moves both sides together rather than reddening a correct implementation.
      */
-    const soon = Math.floor(Date.now() / 1000) + 3600;
-    const soonWhen = new Date(soon * 1000);
-    const soonClock = soonWhen.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+    const start = NOON / 1000;
+    const soon = start + 3600;
+    const soonClock = new Date(soon * 1000).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
 
-    // An hour out can legitimately fall on tomorrow's calendar day near midnight, so the expectation is derived the same way the formatter decides it.
-    const sameDay = soonWhen.toDateString() === new Date().toDateString();
-    const expectedSoon = sameDay ? soonClock : (soonWhen.toLocaleDateString(undefined, { weekday: "short" }) + " " + soonClock);
-
-    assert.ok((await narrate(soon)).some(line => line.includes("Watering is suspended until " + expectedSoon + ".")),
+    assert.ok((await narrate(soon)).some(line => line.includes("Watering is suspended until " + soonClock + ".")),
       "a near-term suspension renders through the clock tier");
 
-    const later = Math.floor(Date.now() / 1000) + (3 * 24 * 3600);
+    const later = start + (3 * 24 * 3600);
     const laterWhen = new Date(later * 1000);
     const expectedLater = laterWhen.toLocaleDateString(undefined, { weekday: "short" }) + " " +
       laterWhen.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
@@ -405,7 +412,7 @@ describe("HydrawiseController suspension instant rendering", () => {
     assert.ok((await narrate(later)).some(line => line.includes("Watering is suspended until " + expectedLater + ".")),
       "one a few days out carries its weekday");
 
-    const distant = Math.floor(Date.now() / 1000) + (400 * 24 * 3600);
+    const distant = start + (400 * 24 * 3600);
 
     assert.ok((await narrate(distant)).some(line => line.includes("Watering is suspended until " + new Date(distant * 1000).toLocaleDateString() + ".")),
       "and one beyond the week renders as a locale date, where a weekday alone would be ambiguous");
@@ -416,11 +423,6 @@ describe("HydrawiseController rain transitions speak for the sensor", () => {
 
   // The suspension instant the live account capture recorded, kept verbatim so these assertions run against a real far-future value.
   const SUSPENDED_UNTIL = 1903928399;
-
-  function now(): number {
-
-    return Math.floor(Date.now() / 1000);
-  }
 
   // The facts one refresh reports for the single covered zone: what the sensor says, and whether a suspension stands.
   function facts(sensorStopped: boolean, suspendedUntil: number | null): HydrawiseControllerV2Facts {
@@ -437,16 +439,16 @@ describe("HydrawiseController rain transitions speak for the sensor", () => {
       program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([rainZone()], rainSensors), kind: "response" }),
       signalAborted: false });
 
-    h.controller.applyFacts({ facts: first, fetchedAt: now() });
+    h.controller.applyFacts({ facts: first, fetchedAt: seconds(h.clock) });
 
-    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
-    await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 2, { description: "the second status poll" });
+    await settleUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
+    await advanceThroughPolls(h, 1);
 
     const settled = h.retrieve.callsTo("statusschedule.php").length;
 
-    h.controller.applyFacts({ facts: second, fetchedAt: now() });
+    h.controller.applyFacts({ facts: second, fetchedAt: seconds(h.clock) });
 
-    await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length > (settled + 1), { description: "the second status poll past the settled one" });
+    await advanceThroughPolls(h, settled + 1);
     await h.abort();
 
     return h.entries.map(formatLogEntry);

@@ -14,14 +14,15 @@
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { Characteristic, Service, buildController, makeV2Facts, restoreCached, seedEstablished } from "./testing/platform.helpers.ts";
+import { Characteristic, Service, buildController, crossRevertDelay, makeV2Facts, pollSleep, restoreCached, seconds,
+  seedEstablished } from "./testing/platform.helpers.ts";
 import type { CharacteristicValue, Characteristic as HapCharacteristic, PlatformAccessory, WithUUID } from "homebridge";
-import { HAP_DEFAULT_MODEL, HOMEBRIDGE_UNKNOWN_FIRMWARE, HYDRAWISE_API_JITTER, HYDRAWISE_REVERT_DELAY, HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
+import { HAP_DEFAULT_MODEL, HOMEBRIDGE_UNKNOWN_FIRMWARE, HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
 import type { HydrawiseAccessoryContext, HydrawiseControllerHardware, StatusScheduleResponse } from "./types.ts";
-import { TestClock, advanceThroughSchedule, hapStatus, logCount, present, triggerGet, triggerSet, waitUntil } from "homebridge-plugin-utils/testing";
+import { advanceThroughSchedule, hapStatus, logCount, present, settleUntil, triggerGet, triggerSet } from "homebridge-plugin-utils/testing";
 import { controllerIdentity, suspendZoneSubtype, zoneAccessoryId } from "./types.ts";
 import { describe, test } from "node:test";
-import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
+import { makeStatusSchedule, makeZone } from "./api.helpers.ts";
 import type { BuildControllerResult } from "./testing/platform.helpers.ts";
 import { HAPStatus } from "homebridge-plugin-utils";
 import assert from "node:assert/strict";
@@ -60,13 +61,6 @@ function firmwareOf(accessory: PlatformAccessory): string | undefined {
   return (accessory.context as HydrawiseAccessoryContext).firmware;
 }
 
-// The instant a facts snapshot is stamped with. Tests that care only about adoption stamp it now, which is comfortably inside the freshness window every consumer
-// gates on; the tests that care about that window stamp their own age instead.
-function now(): number {
-
-  return Math.floor(Date.now() / 1000);
-}
-
 // Seed an accessory the way HAP restores a cached one: real model and firmware values already sitting in the characteristics before anything configures it.
 function seedCached(accessory: PlatformAccessory): void {
 
@@ -76,11 +70,10 @@ function seedCached(accessory: PlatformAccessory): void {
   information?.updateCharacteristic(Characteristic.FirmwareRevision, CACHED.firmware);
 }
 
-// A status body carrying one zone, at the fast cadence a live-loop test needs.
-function schedule(): StatusScheduleResponse {
-
-  return fastPolling(makeStatusSchedule({ relays: [makeZone({ name: "Front Lawn", relay: 1, relay_id: STANDALONE_RELAY_ID })], sensors: bareSensors }));
-}
+// A wire-realistic body carrying the one zone, so a row that wants a later poll steps the controller's clock across the sleep the wire asks for.
+const status: StatusScheduleResponse = makeStatusSchedule({ relays: [makeZone({ name: "Front Lawn", relay: 1, relay_id: STANDALONE_RELAY_ID })],
+  sensors: bareSensors });
+const sleep = pollSleep(status);
 
 describe("HydrawiseController hardware display without credentials", () => {
 
@@ -200,7 +193,7 @@ describe("HydrawiseController facts adoption", () => {
     const h = buildController({ hasV2Client: true });
     const before = h.flushes().length;
 
-    h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: now() });
+    h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: seconds(h.clock) });
 
     assert.equal(informationValue(h.accessory, Characteristic.Model), FETCHED.model, "the real model replaces the placeholder");
     assert.equal(informationValue(h.accessory, Characteristic.FirmwareRevision), FETCHED.firmware, "the real firmware replaces HAP's default");
@@ -224,7 +217,7 @@ describe("HydrawiseController facts adoption", () => {
     const h = buildController({ hasV2Client: true });
     const before = h.flushes().length;
 
-    h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: now() });
+    h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: seconds(h.clock) });
     h.controller.applyRoster([ controllerIdentity(h.controllerConfig), { controllerId: 500002, name: "Second Controller", serialNumber: "SN9Z8Y7X6W5" } ]);
 
     assert.equal(h.flushes().length - before, 1, "the hardware and the roster share one cache write");
@@ -238,11 +231,11 @@ describe("HydrawiseController facts adoption", () => {
      */
     const h = buildController({ hasV2Client: true });
 
-    h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: now() });
+    h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: seconds(h.clock) });
 
     const settled = h.flushes().length;
 
-    h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: now() + 1 });
+    h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: seconds(h.clock) + 1 });
 
     assert.equal(h.flushes().length - settled, 0, "an identical second answer is not worth a disk write");
   });
@@ -255,13 +248,13 @@ describe("HydrawiseController facts adoption", () => {
     const h = buildController({ hasV2Client: true });
     const information = present(h.accessory.getService(Service.AccessoryInformation), "the information service");
 
-    h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: now() });
+    h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: seconds(h.clock) });
 
     // The window opens on an accessory that already holds exactly these values. HAP raises a change for every update, an unchanged value included, and the
     // accessory's change record holds each one, so whatever is recorded below is a write the plugin chose to perform against an unchanged fact.
     h.accessory.clearObservations();
 
-    h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: now() + 1 });
+    h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: seconds(h.clock) + 1 });
 
     assert.equal(h.accessory.changesOn(information, Characteristic.Model, Characteristic.FirmwareRevision).length, 2,
       "an identical second answer still reaches both characteristics rather than being gated in the plugin");
@@ -272,11 +265,11 @@ describe("HydrawiseController facts adoption", () => {
     // Hardware self-heals on every tick rather than being learned once, so a firmware upgrade the user performs in the Hydrawise app reaches HomeKit on its own.
     const h = buildController({ hasV2Client: true });
 
-    h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: now() });
+    h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: seconds(h.clock) });
 
     const settled = h.flushes().length;
 
-    h.controller.applyFacts({ facts: makeV2Facts({ hardware: { firmware: "4.99", model: FETCHED.model } }), fetchedAt: now() + 1 });
+    h.controller.applyFacts({ facts: makeV2Facts({ hardware: { firmware: "4.99", model: FETCHED.model } }), fetchedAt: seconds(h.clock) + 1 });
 
     assert.equal(informationValue(h.accessory, Characteristic.FirmwareRevision), "4.99", "the upgraded firmware replaces the version already on display");
     assert.equal(h.flushes().length - settled, 1, "a genuine hardware change is worth exactly one write");
@@ -288,11 +281,11 @@ describe("HydrawiseController facts adoption", () => {
     // controller last adopted.
     const h = buildController({ hasV2Client: true });
 
-    h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: now() });
+    h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: seconds(h.clock) });
 
     assert.equal(firmwareOf(h.accessory), FETCHED.firmware, "the adopted version is carried in the context");
 
-    h.controller.applyFacts({ facts: makeV2Facts({ hardware: { firmware: "4.99", model: FETCHED.model } }), fetchedAt: now() + 1 });
+    h.controller.applyFacts({ facts: makeV2Facts({ hardware: { firmware: "4.99", model: FETCHED.model } }), fetchedAt: seconds(h.clock) + 1 });
 
     assert.equal(firmwareOf(h.accessory), "4.99", "and an upgraded version replaces it");
   });
@@ -302,8 +295,8 @@ describe("HydrawiseController facts adoption", () => {
     // A controller whose hardware block comes back incomplete composes no hardware at all, and that absence must not blank a correct display.
     const h = buildController({ hasV2Client: true });
 
-    h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: now() });
-    h.controller.applyFacts({ facts: makeV2Facts({ online: true }), fetchedAt: now() + 1 });
+    h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: seconds(h.clock) });
+    h.controller.applyFacts({ facts: makeV2Facts({ online: true }), fetchedAt: seconds(h.clock) + 1 });
 
     assert.equal(informationValue(h.accessory, Characteristic.Model), FETCHED.model, "the established model stands");
     assert.equal(informationValue(h.accessory, Characteristic.FirmwareRevision), FETCHED.firmware, "and the established firmware with it");
@@ -318,7 +311,7 @@ describe("HydrawiseController facts adoption", () => {
      */
     const first = buildController({ hasV2Client: true });
 
-    first.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: now() });
+    first.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: seconds(first.clock) });
 
     const second = buildController({ hasV2Client: true, seedContext: (seed) => {
 
@@ -341,8 +334,8 @@ describe("HydrawiseController facts adoption", () => {
     const first = buildController({ hasV2Client: true });
     const second = buildController({ controller: { controller_id: 500002, serial_number: "SN9Z8Y7X6W5" }, hasV2Client: true });
 
-    first.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: now() });
-    second.controller.applyFacts({ facts: makeV2Facts({ hardware: CACHED }), fetchedAt: now() });
+    first.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: seconds(first.clock) });
+    second.controller.applyFacts({ facts: makeV2Facts({ hardware: CACHED }), fetchedAt: seconds(second.clock) });
 
     assert.equal(informationValue(first.accessory, Characteristic.Model), FETCHED.model, "the first controller shows its own model");
     assert.equal(informationValue(second.accessory, Characteristic.Model), CACHED.model, "and the second shows its own, not its sibling's");
@@ -356,14 +349,14 @@ describe("HydrawiseController standalone zone hardware", () => {
     /* The credentialed path is where this has to be checked. An install without credentials enriches nothing anywhere, so the same assertion there would pass
      * against an implementation that happily stamped a zone with its controller's firmware the moment credentials appeared.
      */
-    const h = buildController({ hasV2Client: true, program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(), kind: "response" }),
-      signalAborted: false, userOptions: [STANDALONE_ON] });
+    const h = buildController({ hasV2Client: true, program: (recorder) => recorder.programDefault("statusschedule.php", { body: status,
+      kind: "response" }), signalAborted: false, userOptions: [STANDALONE_ON] });
 
     t.after(() => h.abort());
 
-    h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: now() });
+    h.controller.applyFacts({ facts: makeV2Facts({ hardware: FETCHED }), fetchedAt: seconds(h.clock) });
 
-    await waitUntil(() => h.zoneAccessories.get(STANDALONE_RELAY_ID)?.getServiceById(Service.Valve, STANDALONE_SUBTYPE) !== undefined,
+    await settleUntil(() => h.zoneAccessories.get(STANDALONE_RELAY_ID)?.getServiceById(Service.Valve, STANDALONE_SUBTYPE) !== undefined,
       { description: "the standalone zone's valve on its own accessory to appear" });
 
     const zoneAccessory = h.zoneAccessories.get(STANDALONE_RELAY_ID);
@@ -389,8 +382,8 @@ describe("HydrawiseController standalone zone hardware", () => {
      * install with no credentials at all. Its firmware reads Homebridge's restore placeholder, which Homebridge stamps on every cached accessory before the
      * plugin sees it.
      */
-    const h = buildController({ hasV2Client: true, program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(), kind: "response" }),
-      signalAborted: false, userOptions: [STANDALONE_ON] });
+    const h = buildController({ hasV2Client: true, program: (recorder) => recorder.programDefault("statusschedule.php", { body: status,
+      kind: "response" }), signalAborted: false, userOptions: [STANDALONE_ON] });
 
     t.after(() => h.abort());
 
@@ -407,7 +400,7 @@ describe("HydrawiseController standalone zone hardware", () => {
     restoreCached(api, restored);
     h.zoneAccessories.set(STANDALONE_RELAY_ID, restored);
 
-    await waitUntil(() => restored.getServiceById(Service.Valve, STANDALONE_SUBTYPE) !== undefined,
+    await settleUntil(() => restored.getServiceById(Service.Valve, STANDALONE_SUBTYPE) !== undefined,
       { description: "the standalone zone's valve on the restored accessory to appear" });
 
     assert.equal(informationValue(restored, Characteristic.FirmwareRevision), HOMEBRIDGE_UNKNOWN_FIRMWARE,
@@ -418,23 +411,13 @@ describe("HydrawiseController standalone zone hardware", () => {
 
 describe("HydrawiseController controller availability", () => {
 
-  // A wire-realistic body carrying the one zone, so a row driving its own clock steps the polling loop rather than racing a fast cadence.
-  const status = makeStatusSchedule({ relays: [makeZone({ name: "Front Lawn", relay: 1, relay_id: STANDALONE_RELAY_ID })], sensors: bareSensors });
-  const sleep = (status.nextpoll + HYDRAWISE_API_JITTER) * 1000;
-
   // The option entry that turns on the suspend-all switch, so a row can read the controller accessory's second refusing characteristic.
   const SUSPEND_ALL_ON = "Enable.Device.Suspend.All." + CONTROLLER_SERIAL;
 
-  // The whole second a clock reads, the unit every facts stamp speaks.
-  function seconds(clock: TestClock): number {
+  // A controller polling the wire-realistic body on a clock the row drives.
+  function onClock(options: { hasV2Client?: boolean; userOptions?: string[] } = {}): BuildControllerResult {
 
-    return Math.floor(clock.now() / 1000);
-  }
-
-  // A controller polling the body above on a clock the row drives.
-  function onClock(clock: TestClock, options: { hasV2Client?: boolean; userOptions?: string[] } = {}): BuildControllerResult {
-
-    return buildController({ ...options, clock, mqtt: true, program: (recorder) => {
+    return buildController({ ...options, mqtt: true, program: (recorder) => {
 
       recorder.programDefault("statusschedule.php", { body: status, kind: "response" });
     }, signalAborted: false });
@@ -473,19 +456,18 @@ describe("HydrawiseController controller availability", () => {
 
   test("the cloud's word that the controller is offline refuses a standalone valve, and a good poll does not clear it", async (t) => {
 
-    const clock = new TestClock();
-    const h = onClock(clock, { hasV2Client: true, userOptions: [STANDALONE_ON] });
+    const h = onClock({ hasV2Client: true, userOptions: [STANDALONE_ON] });
 
     t.after(() => h.abort());
 
-    await advanceThroughSchedule(clock, []);
+    await advanceThroughSchedule(h.clock, []);
     assert.equal(await triggerGet(standaloneValve(h)), Characteristic.Active.ACTIVE, "the hosted valve answers once the first poll has landed");
 
-    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: seconds(clock) });
+    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: seconds(h.clock) });
     await assert.rejects(() => triggerGet(standaloneValve(h)), noResponse, "the cloud's offline word refuses the valve on its own accessory");
 
     // The next poll lands and rewrites the valve's value, which is exactly what a stored refusal could not survive and a handler-served one does.
-    await advanceThroughSchedule(clock, [sleep]);
+    await advanceThroughSchedule(h.clock, [sleep]);
 
     assert.equal(h.retrieve.callsTo("statusschedule.php").length, 2, "the next poll has landed");
     await assert.rejects(() => triggerGet(standaloneValve(h)), noResponse, "and the valve still refuses");
@@ -493,17 +475,16 @@ describe("HydrawiseController controller availability", () => {
 
   test("the cloud's offline word refuses a zone's manual run and its suspension switch as well as its reads", async (t) => {
 
-    const clock = new TestClock();
-    const h = onClock(clock, { hasV2Client: true, userOptions: [ STANDALONE_ON, SUSPEND_ZONE_ON ] });
+    const h = onClock({ hasV2Client: true, userOptions: [ STANDALONE_ON, SUSPEND_ZONE_ON ] });
 
     t.after(() => h.abort());
 
-    await advanceThroughSchedule(clock, []);
+    await advanceThroughSchedule(h.clock, []);
 
     const zoneSwitch = present(h.zoneAccessories.get(STANDALONE_RELAY_ID)?.getServiceById(Service.Switch, suspendZoneSubtype(STANDALONE_RELAY_ID)),
       "the standalone zone's suspension switch").getCharacteristic(Characteristic.On);
 
-    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: seconds(clock) });
+    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: seconds(h.clock) });
 
     const commandsBefore = h.commands.calls.length;
 
@@ -515,41 +496,39 @@ describe("HydrawiseController controller availability", () => {
 
   test("facts aged exactly their lifetime still refuse, a second older refuse nothing, and the word follows on the next poll", async (t) => {
 
-    const clock = new TestClock();
-    const h = onClock(clock, { hasV2Client: true });
+    const h = onClock({ hasV2Client: true });
 
     t.after(() => h.abort());
 
-    await advanceThroughSchedule(clock, []);
+    await advanceThroughSchedule(h.clock, []);
     assert.equal(lastWord(h), "online", "the first poll states the controller online");
 
-    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: seconds(clock) - HYDRAWISE_V2_FACTS_TTL });
+    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: seconds(h.clock) - HYDRAWISE_V2_FACTS_TTL });
 
     await assert.rejects(() => triggerGet(primary(h)), noResponse, "a snapshot aged exactly its lifetime is still trusted, so it refuses");
     assert.equal(lastWord(h), "offline", "and the word follows the facts as they land");
 
     // One second later the same snapshot has aged out. Nothing marks that moment, so the handlers answer at once while the word waits for the next poll.
-    clock.advance(1000);
+    h.clock.advance(1000);
 
     assert.equal(await triggerGet(primary(h)), Characteristic.Active.ACTIVE, "one second older, the snapshot is past its lifetime and refuses nothing");
     assert.equal(lastWord(h), "offline", "the word has had no event to re-judge it");
 
-    await advanceThroughSchedule(clock, [sleep - 1000]);
+    await advanceThroughSchedule(h.clock, [sleep - 1000]);
 
     assert.equal(lastWord(h), "online", "the next poll re-judges the word");
   });
 
   test("an install with an API key alone answers on the same wire, whatever the cloud would say", async (t) => {
 
-    const clock = new TestClock();
-    const h = onClock(clock, { userOptions: [STANDALONE_ON] });
+    const h = onClock({ userOptions: [STANDALONE_ON] });
 
     t.after(() => h.abort());
 
-    await advanceThroughSchedule(clock, []);
+    await advanceThroughSchedule(h.clock, []);
 
     // No client exists here to hand facts over, so this states what one would have said; the verdict reads the cloud's word only where credentials fetch it.
-    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: seconds(clock) });
+    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: seconds(h.clock) });
 
     assert.equal(await triggerGet(primary(h)), Characteristic.Active.ACTIVE, "the irrigation system answers");
     assert.equal(await triggerGet(standaloneValve(h)), Characteristic.Active.ACTIVE, "and so does the standalone valve");
@@ -558,17 +537,16 @@ describe("HydrawiseController controller availability", () => {
 
   test("a write to the irrigation system's Active returns to Active after the revert beat, and a read answers Active", async (t) => {
 
-    const clock = new TestClock();
-    const h = onClock(clock);
+    const h = onClock();
 
     t.after(() => h.abort());
 
-    await advanceThroughSchedule(clock, []);
+    await advanceThroughSchedule(h.clock, []);
     await triggerSet(primary(h), Characteristic.Active.INACTIVE);
 
     assert.equal(primary(h).value, Characteristic.Active.INACTIVE, "HomeKit's write lands for the beat");
 
-    clock.advance(HYDRAWISE_REVERT_DELAY);
+    await crossRevertDelay(h.clock);
 
     assert.equal(primary(h).value, Characteristic.Active.ACTIVE, "and Active is put back after it");
     assert.equal(await triggerGet(primary(h)), Characteristic.Active.ACTIVE, "a read answers Active");
@@ -576,10 +554,9 @@ describe("HydrawiseController controller availability", () => {
 
   test("a cached standalone zone accessory no poll hosts refuses, binds when a poll first hosts it, and refuses again when unhosted", async (t) => {
 
-    const clock = new TestClock();
     const sibling = makeZone({ name: "Back Lawn", relay: 2, relay_id: STANDALONE_RELAY_ID + 1 });
     const zone = makeZone({ name: "Front Lawn", relay: 1, relay_id: STANDALONE_RELAY_ID });
-    const h = buildController({ clock, program: (recorder) => {
+    const h = buildController({ program: (recorder) => {
 
       recorder.program("statusschedule.php", { body: { ...status, relays: [sibling] }, kind: "response" });
       recorder.program("statusschedule.php", { body: { ...status, relays: [ zone, sibling ] }, kind: "response" });
@@ -595,13 +572,13 @@ describe("HydrawiseController controller availability", () => {
 
     restoreCached(api, restored);
 
-    await advanceThroughSchedule(clock, []);
+    await advanceThroughSchedule(h.clock, []);
     assert.equal(h.retrieve.callsTo("statusschedule.php").length, 1, "the first poll has landed without the zone");
 
     // The platform keeps the accessory through its grace and hands it back when the zone returns; the reconcile double models that by reusing what it holds.
     h.zoneAccessories.set(STANDALONE_RELAY_ID, restored);
 
-    await advanceThroughSchedule(clock, [sleep]);
+    await advanceThroughSchedule(h.clock, [sleep]);
 
     assert.equal(await triggerGet(valve), Characteristic.Active.ACTIVE, "the cached valve answers the value the poll that hosts it projected");
 
@@ -611,7 +588,7 @@ describe("HydrawiseController controller availability", () => {
     assert.equal(h.commands.calls.length, 1, "a stop reaches the wire, so the valve was bound when a poll first hosted it");
 
     // The zone drops off the wire again, and the accessory is held through its grace with nothing describing it.
-    await advanceThroughSchedule(clock, [sleep]);
+    await advanceThroughSchedule(h.clock, [sleep]);
 
     await assert.rejects(() => triggerGet(valve), noResponse, "an accessory the last poll did not host refuses");
   });
@@ -644,14 +621,13 @@ describe("HydrawiseController controller availability", () => {
 
   test("a first reading that says offline is narrated and refuses", async (t) => {
 
-    const clock = new TestClock();
-    const h = onClock(clock, { hasV2Client: true });
+    const h = onClock({ hasV2Client: true });
 
     t.after(() => h.abort());
 
-    await advanceThroughSchedule(clock, []);
+    await advanceThroughSchedule(h.clock, []);
 
-    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: seconds(clock) });
+    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: seconds(h.clock) });
 
     assert.equal(logCount(h.entries, "info", "The controller is offline."), 1, "the controller refuses on this reading, so the log says why");
     await assert.rejects(() => triggerGet(primary(h)), noResponse, "and the controller accessory refuses");
@@ -660,7 +636,7 @@ describe("HydrawiseController controller availability", () => {
   test("a first reading that says online seeds silently, and only a genuine flip is narrated", () => {
 
     const h = buildController({ hasV2Client: true });
-    const now = Math.floor(Date.now() / 1000);
+    const now = seconds(h.clock);
 
     h.controller.applyFacts({ facts: makeV2Facts({ online: true }), fetchedAt: now });
     assert.equal(logCount(h.entries, "info", "The controller is"), 0, "a first reading of online narrates nothing");

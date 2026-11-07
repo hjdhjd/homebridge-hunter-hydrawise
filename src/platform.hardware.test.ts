@@ -8,23 +8,24 @@
  * with the wrong controller enriched. The firmware restore rows cover what the platform writes as Homebridge restores an accessory: the version a controller
  * accessory's context carries, written back over Homebridge's placeholder while the credentials are configured.
  *
- * What these tests deliberately do NOT wait on is the loop's quarter-hour sleep. The real platform runs on the system clock and takes no other, so the second tick
- * is driven through the production refresh method directly, and the sleep between ticks is read from what each tick answers rather than waited out.
+ * The loop's quarter-hour sleep is crossed in virtual time. The platform these rows build runs on a TestClock, so a row reads each sleep the loop asked that clock
+ * for, asserts it, and steps the clock across it, and the tick after it is the loop's own.
  */
 // The Hydrawise API wire shapes use snake_case keys such as controller_id, so camelcase is disabled here to let the controller fixture mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { Characteristic, Service, buildPlatform, installMockDispatcher, installV2Client, makeTestV2Client, makeV2Facts, programJsonReply, refreshV2FactsOnce,
-  seedAccessory, v2BudgetOf, waitFor } from "./testing/platform.helpers.ts";
-import { HOMEBRIDGE_UNKNOWN_FIRMWARE, HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_GRAPH_ENDPOINT, HYDRAWISE_V2_TOKEN_ENDPOINT } from "./settings.ts";
+import { Characteristic, Service, buildPlatform, installMockDispatcher, installV2Client, makeTestV2Client, makeV2Facts, programJsonReply, seedAccessory,
+  v2BudgetOf } from "./testing/platform.helpers.ts";
+import { HOMEBRIDGE_UNKNOWN_FIRMWARE, HYDRAWISE_V2_BUDGET_CALLS, HYDRAWISE_V2_GRAPH_ENDPOINT, HYDRAWISE_V2_REFRESH_INTERVAL,
+  HYDRAWISE_V2_TOKEN_ENDPOINT } from "./settings.ts";
 import type { Characteristic as HapCharacteristic, PlatformAccessory, WithUUID } from "homebridge";
 import type { HydrawiseAccessoryContext, HydrawiseControllerHardware, HydrawiseControllerV2Facts, HydrawiseV2Read } from "./types.ts";
+import type { TestClock, TestLogEntry } from "homebridge-plugin-utils/testing";
+import { advanceUntil, expectAt, logCount, loggedAt, present, settle, settleUntil } from "homebridge-plugin-utils/testing";
 import { controllerIdentity, zoneAccessoryId } from "./types.ts";
 import { describe, test } from "node:test";
-import { fastPolling, makeCustomerDetails, normalSchedule } from "./api.helpers.ts";
-import { logCount, loggedAt, waitUntil } from "homebridge-plugin-utils/testing";
+import { makeCustomerDetails, normalSchedule } from "./api.helpers.ts";
 import { HydrawiseV2Client } from "./v2.ts";
 import { MockAgent } from "undici";
-import type { TestLogEntry } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
 import { syntheticController } from "./api.fixtures.ts";
 import { v2RefreshDelay } from "./platform.ts";
@@ -82,6 +83,15 @@ function rosterNames(accessory: PlatformAccessory | undefined): string[] {
   return ((accessory?.context as HydrawiseAccessoryContext | undefined)?.controllers ?? []).map(entry => entry.name);
 }
 
+/* Every sleep the refresh loop asked the platform's clock for, in order. The loop sleeps at least the refresh interval after every tick, and every other wait
+ * these rows' platforms schedule is shorter - a poll's cadence, a request's deadline, a save window, a key-based budget's window - since their account client is
+ * a double that draws no budget, so the spans that long are the loop's alone.
+ */
+function refreshSleeps(clock: TestClock): number[] {
+
+  return clock.requested.filter(ms => ms >= HYDRAWISE_V2_REFRESH_INTERVAL * 1000);
+}
+
 describe("HydrawisePlatform hardware enrichment gate", () => {
 
   test("configures no account-credentialed client when neither credential is set", (t) => {
@@ -128,7 +138,7 @@ describe("HydrawisePlatform hardware distribution", () => {
 
   test("hands each controller the hardware its own correlation id names", async (t) => {
 
-    const { emit, platform, registered, updated } = buildPlatform({ options: CREDENTIAL_OPTIONS });
+    const { clock, emit, platform, registered, updated } = buildPlatform({ options: CREDENTIAL_OPTIONS });
 
     t.after(() => emit(SHUTDOWN));
     await using dispatcher = installMockDispatcher();
@@ -136,8 +146,8 @@ describe("HydrawisePlatform hardware distribution", () => {
     /* The second fetch's map is deliberately keyed in the OPPOSITE order to the account's controller list, and both entries carry facts the other controller could
      * plausibly own. A distribution that matched positionally rather than by id would swap them, and each assertion below would then read the sibling's model.
      *
-     * The first fetch carries no hardware, so discovery's saves and the first polls' are behind the count taken below before any hardware lands, and the tick this
-     * row drives is the only thing that can save it.
+     * The first fetch carries no hardware, so discovery's saves and the first polls' are behind the count taken below before any hardware lands, and the tick
+     * this row crosses into is the only thing that can write it.
      */
     const { client, fetches } = makeTestV2Client((fetch) => (fetch === 1) ?
       answered([ SECOND_CONTROLLER.controller_id, makeV2Facts() ], [ syntheticController.controller_id, makeV2Facts() ]) :
@@ -153,27 +163,43 @@ describe("HydrawisePlatform hardware distribution", () => {
 
     const firstUuid = platform.hap.uuid.generate(syntheticController.controller_id.toString());
     const secondUuid = platform.hap.uuid.generate(SECOND_CONTROLLER.controller_id.toString());
-    const first = await waitFor(() => registered().find(accessory => accessory.UUID === firstUuid), { description: "the first controller's accessory to register" });
-    const second = await waitFor(() => registered().find(accessory => accessory.UUID === secondUuid), { description: "the second controller's accessory to register" });
 
-    // The refresh loop's first tick and each controller's first poll run on their own schedules, so the wait is on each having landed.
-    await waitUntil(() => (fetches() >= 1) && [ first, second ].every(accessory => (accessory.context as HydrawiseAccessoryContext).schedule !== undefined),
+    await settleUntil(() => [ firstUuid, secondUuid ].every(uuid => registered().some(accessory => accessory.UUID === uuid)),
+      { description: "each controller's accessory to register" });
+
+    const first = present(registered().find(accessory => accessory.UUID === firstUuid), "the first controller's accessory");
+    const second = present(registered().find(accessory => accessory.UUID === secondUuid), "the second controller's accessory");
+
+    // The refresh loop's first tick and each controller's first poll run on their own schedules, so the wait is on each having landed and the loop being asleep.
+    const polled = (accessory: PlatformAccessory): boolean => (accessory.context as HydrawiseAccessoryContext).schedule !== undefined;
+
+    await settleUntil(() => (refreshSleeps(clock).length === 1) && [ first, second ].every(polled),
       { description: "the first refresh tick and each controller's first poll" });
 
     const savesBefore = updated().length;
+    const sleep = expectAt(refreshSleeps(clock), 0, "the loop's sleep after its first tick");
 
-    await refreshV2FactsOnce(platform);
+    assert.equal(sleep, HYDRAWISE_V2_REFRESH_INTERVAL * 1000, "the first tick answered, so the loop sleeps the cadence");
+
+    clock.advance(sleep);
+    await settleUntil(() => (fetches() === 2) && (informationValue(second, Characteristic.Model) === SECOND_HARDWARE.model),
+      { description: "the loop's second tick to distribute the hardware" });
 
     assert.equal(informationValue(first, Characteristic.Model), FIRST_HARDWARE.model, "the first controller shows its own model");
     assert.equal(informationValue(second, Characteristic.Model), SECOND_HARDWARE.model, "the second controller shows its own model");
     assert.equal(informationValue(first, Characteristic.FirmwareRevision), FIRST_HARDWARE.firmware, "the first controller shows its own firmware");
     assert.equal(informationValue(second, Characteristic.FirmwareRevision), SECOND_HARDWARE.firmware, "the second controller shows its own firmware");
 
-    // The durable half of the same claim: the tick that landed the hardware saved each accessory with its own values, which is what the next restart reads back.
+    /* The durable half of the same claim: each accessory was saved after the tick landed the hardware, carrying its own version, which is what the next restart
+     * reads back. Crossing the loop's sleep crosses each controller's poll cadence too, so a save after it may be a poll's as well as the tick's, and the version
+     * in the context is what ties it to the tick, since only the tick writes one.
+     */
     const saves = updated().slice(savesBefore);
 
-    assert.ok(saves.some(batch => batch.includes(first)), "the tick's save carries the first controller's accessory");
+    assert.ok(saves.some(batch => batch.includes(first)), "a save after the tick carries the first controller's accessory");
     assert.ok(saves.some(batch => batch.includes(second)), "and the second controller's");
+    assert.equal((first.context as HydrawiseAccessoryContext).firmware, FIRST_HARDWARE.firmware, "with the first controller's own version in its context");
+    assert.equal((second.context as HydrawiseAccessoryContext).firmware, SECOND_HARDWARE.firmware, "and the second controller's in its own");
   });
 
   test("the account's controller name reaches every persisted identity at once", async (t) => {
@@ -183,7 +209,7 @@ describe("HydrawisePlatform hardware distribution", () => {
      * question, so a name that reached only some of them would leave the webUI listing one controller under different names depending on which entry it happened
      * to read.
      */
-    const { emit, platform, registered } = buildPlatform({ options: [ ...CREDENTIAL_OPTIONS, "Enable.Device.Standalone." + STANDALONE_RELAY_ID.toString() ] });
+    const { clock, emit, platform, registered } = buildPlatform({ options: [ ...CREDENTIAL_OPTIONS, "Enable.Device.Standalone." + STANDALONE_RELAY_ID.toString() ] });
 
     t.after(() => emit(SHUTDOWN));
     await using dispatcher = installMockDispatcher();
@@ -191,20 +217,24 @@ describe("HydrawisePlatform hardware distribution", () => {
     installV2Client(platform, makeTestV2Client(answered([ syntheticController.controller_id, makeV2Facts({ name: ACCOUNT_CONTROLLER_NAME }) ])).client);
 
     programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
-    programJsonReply(dispatcher.agent, "statusschedule.php", fastPolling(normalSchedule()));
+    programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
 
     const controllerUuid = platform.hap.uuid.generate(syntheticController.controller_id.toString());
     const zoneUuid = platform.hap.uuid.generate(zoneAccessoryId(syntheticController.controller_id, STANDALONE_RELAY_ID));
-    const controllerAccessory = await waitFor(() => registered().find(accessory => accessory.UUID === controllerUuid),
-      { description: "the first controller's accessory to register" });
-    const zoneAccessory = await waitFor(() => registered().find(accessory => accessory.UUID === zoneUuid), { description: "the zone accessory to register" });
 
-    // Each surface is waited on where it is written, so a slower cadence cannot make a faster one's assertion read a value that had not landed yet.
-    await waitUntil(() => identityName(controllerAccessory, "controller") === ACCOUNT_CONTROLLER_NAME,
+    await settleUntil(() => [ controllerUuid, zoneUuid ].every(uuid => registered().some(accessory => accessory.UUID === uuid)),
+      { description: "the controller's accessory and the zone's to register" });
+
+    const controllerAccessory = present(registered().find(accessory => accessory.UUID === controllerUuid), "the controller's accessory");
+    const zoneAccessory = present(registered().find(accessory => accessory.UUID === zoneUuid), "the zone's accessory");
+
+    // Each surface is written on its own cadence, the poll's or the tick's, so the walk steps the platform's clock, poll by poll at the wire's own cadence, until
+    // each surface carries the account name, and a slower cadence cannot make a faster one's assertion read a value that had not landed yet.
+    await advanceUntil(clock, () => identityName(controllerAccessory, "controller") === ACCOUNT_CONTROLLER_NAME,
       { description: "the controller identity to carry the account name" });
-    await waitUntil(() => identityName(zoneAccessory, "ownerController") === ACCOUNT_CONTROLLER_NAME,
+    await advanceUntil(clock, () => identityName(zoneAccessory, "ownerController") === ACCOUNT_CONTROLLER_NAME,
       { description: "the zone's owner identity to carry the account name" });
 
     assert.equal(identityName(controllerAccessory, "controller"), ACCOUNT_CONTROLLER_NAME, "the controller persists the account's name as its own identity");
@@ -226,10 +256,9 @@ describe("HydrawisePlatform hardware distribution", () => {
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
+    await settleUntil(() => (registered().length >= 1) && (fetches() >= 1), { description: "the first accessory registration and the first account fetch" });
 
-    const accessory = await waitFor(() => registered()[0], { description: "the first accessory registration" });
-
-    await waitUntil(() => fetches() >= 1, { description: "the first account fetch" });
+    const accessory = expectAt(registered(), 0, "the first accessory registration");
 
     /* A failed enrichment is not a failed startup. The accessory keeps exactly the information a user without credentials would see, which is the display the whole
      * credential gate falls back to, and it persists nothing it did not learn.
@@ -244,7 +273,7 @@ describe("HydrawisePlatform hardware distribution", () => {
 
   test("a second discovery pass starts no second refresh loop", async (t) => {
 
-    const { emit, entries, platform } = buildPlatform({ options: CREDENTIAL_OPTIONS });
+    const { clock, emit, entries, platform } = buildPlatform({ options: CREDENTIAL_OPTIONS });
 
     t.after(() => emit(SHUTDOWN));
     await using dispatcher = installMockDispatcher();
@@ -256,23 +285,25 @@ describe("HydrawisePlatform hardware distribution", () => {
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => fetches() >= 1, { description: "the first account fetch" });
+    await settleUntil(() => fetches() >= 1, { description: "the first account fetch" });
 
     /* Re-entering discovery is a real cadence - the launch event can fire again, and the supervisor can re-enter the loop - and each re-entry would start a whole
      * second refresh loop running forever beside the first, doubling this account's spend against a ceiling measured in single digits. The count is EXACT rather
-     * than a lower bound: the loop's own next tick is a quarter hour away and cannot reach this assertion, so any second fetch here is a second loop.
+     * than a lower bound: the loop's own next tick waits on a sleep nothing steps here, so any second fetch is a second loop, and the one sleep the platform's
+     * clock was asked for is the witness that one loop runs.
      */
     const connections = logCount(entries, "info", "Successfully connected");
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => logCount(entries, "info", "Successfully connected") > connections, { description: "another connection line" });
+    await settleUntil(() => logCount(entries, "info", "Successfully connected") > connections, { description: "another connection line" });
 
     assert.equal(fetches(), 1, "a re-entered discovery pass should start no second loop and spend no second fetch");
+    assert.deepEqual(refreshSleeps(clock), [HYDRAWISE_V2_REFRESH_INTERVAL * 1000], "and one loop sleeps on the platform's clock");
   });
 
   test("a failed tick ends only that tick, and a later one still distributes", async (t) => {
 
-    const { emit, platform, registered } = buildPlatform({ options: CREDENTIAL_OPTIONS });
+    const { clock, emit, platform, registered } = buildPlatform({ options: CREDENTIAL_OPTIONS });
 
     t.after(() => emit(SHUTDOWN));
     await using dispatcher = installMockDispatcher();
@@ -286,17 +317,24 @@ describe("HydrawisePlatform hardware distribution", () => {
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
+    await settleUntil(() => (registered().length >= 1) && (refreshSleeps(clock).length === 1),
+      { description: "the first accessory registration and the loop's sleep after its first tick" });
 
-    const accessory = await waitFor(() => registered()[0], { description: "the first accessory registration" });
+    const accessory = expectAt(registered(), 0, "the first accessory registration");
 
-    await waitUntil(() => fetches() >= 1, { description: "the first account fetch" });
+    assert.equal(fetches(), 1, "the loop's first tick spent its one fetch");
     assert.equal(informationValue(accessory, Characteristic.Model), "Hydrawise", "the failed first tick enriched nothing and left the placeholder standing");
 
     /* The property this asserts is the METHOD BOUNDARY. A failed fetch returns from the tick, not from the loop, so the refresh survives its first transient
      * failure; the same early return written inline in the loop body would leave the loop function entirely and end the refresh for the life of the plugin. The
-     * tick is driven directly because the loop's own next one is a quarter hour away.
+     * row crosses the loop's own sleep on the platform's clock, so the tick after it is run by the loop the failure did not end.
      */
-    await refreshV2FactsOnce(platform);
+    const sleep = expectAt(refreshSleeps(clock), 0, "the loop's sleep after its failed tick");
+
+    assert.equal(sleep, HYDRAWISE_V2_REFRESH_INTERVAL * 1000, "a failed tick keeps the cadence");
+
+    clock.advance(sleep);
+    await settleUntil(() => informationValue(accessory, Characteristic.Model) === FIRST_HARDWARE.model, { description: "the loop's second tick to distribute" });
 
     assert.equal(informationValue(accessory, Characteristic.Model), FIRST_HARDWARE.model, "a later tick distributes normally, so the failure was not terminal");
     assert.equal(fetches(), 2, "each tick spends exactly one fetch");
@@ -304,7 +342,7 @@ describe("HydrawisePlatform hardware distribution", () => {
 
   test("a shutdown ends the refresh loop without reporting a fault", async () => {
 
-    const { emit, entries, platform } = buildPlatform({ options: CREDENTIAL_OPTIONS });
+    const { clock, emit, entries, platform } = buildPlatform({ options: CREDENTIAL_OPTIONS });
 
     await using dispatcher = installMockDispatcher();
 
@@ -315,17 +353,24 @@ describe("HydrawisePlatform hardware distribution", () => {
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => fetches() >= 1, { description: "the first account fetch" });
+    await settleUntil(() => refreshSleeps(clock).length === 1, { description: "the loop's sleep after its first tick" });
 
     const spent = fetches();
 
     emit(SHUTDOWN);
+    await settleUntil(() => platform.signal.aborted, { description: "the shutdown to abort the platform's signal" });
 
-    // The loop is bound to the platform's shutdown signal, so the abort ends the sleep it is sitting in and unwinds it. A teardown is orderly rather than a fault, so
-    // the supervisor swallows it silently - a reported fault here would tell every user their plugin broke every time Homebridge stopped.
-    await waitUntil(() => true, { description: "the shutdown to reach the loop" });
+    /* The loop is bound to the platform's shutdown signal, so the abort ends the sleep it is sitting in and unwinds it. The row then steps the platform's clock
+     * across a whole refresh interval, the span a sleep that outlived the shutdown would come due in, so a loop the abort missed would tick again here. A teardown
+     * is orderly rather than a fault, so the supervisor swallows it silently - a reported fault here would tell every user their plugin broke every time Homebridge
+     * stopped.
+     */
+    clock.advance(HYDRAWISE_V2_REFRESH_INTERVAL * 1000);
+    await settle();
 
+    assert.equal(clock.now(), HYDRAWISE_V2_REFRESH_INTERVAL * 1000, "the platform's clock crossed a whole refresh interval after the shutdown");
     assert.equal(fetches(), spent, "no further tick runs after shutdown");
+    assert.equal(clock.pending, 0, "and nothing the platform scheduled outlives it, the loop's sleep among them");
     assert.ok(!loggedAt(entries, "error", "stopped unexpectedly"), "a shutdown unwinds the loop quietly rather than reporting a fault");
   });
 
@@ -340,8 +385,9 @@ describe("HydrawisePlatform hardware distribution", () => {
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
+    await settleUntil(() => registered().length >= 1, { description: "the first accessory registration" });
 
-    const accessory = await waitFor(() => registered()[0], { description: "the first accessory registration" });
+    const accessory = expectAt(registered(), 0, "the first accessory registration");
 
     /* The parity case stated as an assertion: an install with no credentials shows exactly what it always has. The MockAgent has net connect disabled and
      * intercepts only the two key-based endpoints, so a request escaping the credential gate would fail this test loudly rather than reaching the network.
@@ -425,7 +471,7 @@ describe("HydrawisePlatform connection reporting", () => {
 
   test("the account tier reports itself connected ONCE, on the first successful refresh", async (t) => {
 
-    const { emit, entries, platform } = buildPlatform({ options: CREDENTIAL_OPTIONS });
+    const { clock, emit, entries, platform } = buildPlatform({ options: CREDENTIAL_OPTIONS });
 
     t.after(() => emit(SHUTDOWN));
 
@@ -438,20 +484,20 @@ describe("HydrawisePlatform connection reporting", () => {
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => fetches() >= 1, { description: "the first account fetch" });
+    await settleUntil(() => refreshSleeps(clock).length === 1, { description: "the loop's sleep after its first tick" });
 
     const connected = (): number => logCount(entries, "info", "connected to the Hydrawise account API");
-
-    await waitUntil(() => connected() >= 1, { description: "the first account connection" });
 
     // The two tiers are delineated: the key-based line names the API key, and the account line names the enhanced features it unlocks.
     assert.ok(loggedAt(entries, "info", "Successfully connected to the Hydrawise API using your API key."), "the key-based tier names how it connected");
     assert.equal(connected(), 1, "the account tier reports itself connected exactly once");
 
     /* A second successful refresh is not a second connection. Without the latch every refresh tick would republish the same line every quarter hour for the life
-     * of the plugin, which is log noise rather than news.
+     * of the plugin, which is log noise rather than news. The row crosses the loop's sleep on the platform's clock, and the second tick's own sleep is the
+     * witness that the tick ran to its end before the count is read.
      */
-    await refreshV2FactsOnce(platform);
+    clock.advance(expectAt(refreshSleeps(clock), 0, "the loop's sleep after its first tick"));
+    await settleUntil(() => refreshSleeps(clock).length === 2, { description: "the loop's second tick to settle into its sleep" });
 
     assert.equal(fetches(), 2, "the second refresh really did run");
     assert.equal(connected(), 1, "and it reported no second connection");
@@ -459,7 +505,7 @@ describe("HydrawisePlatform connection reporting", () => {
 
   test("a failed first refresh reports no connection, and a later success reports one", async (t) => {
 
-    const { emit, entries, platform } = buildPlatform({ options: CREDENTIAL_OPTIONS });
+    const { clock, emit, entries, platform } = buildPlatform({ options: CREDENTIAL_OPTIONS });
 
     t.after(() => emit(SHUTDOWN));
 
@@ -474,14 +520,17 @@ describe("HydrawisePlatform connection reporting", () => {
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => fetches() >= 1, { description: "the first account fetch" });
+    await settleUntil(() => refreshSleeps(clock).length === 1, { description: "the loop's sleep after its first tick" });
 
     const connected = (): number => logCount(entries, "info", "connected to the Hydrawise account API");
 
+    assert.equal(fetches(), 1, "the loop's first tick spent its one fetch");
     assert.equal(connected(), 0, "a failed tick claims no connection - the client already reported the failure in its own words");
 
-    await refreshV2FactsOnce(platform);
+    clock.advance(expectAt(refreshSleeps(clock), 0, "the loop's sleep after its failed tick"));
+    await settleUntil(() => refreshSleeps(clock).length === 2, { description: "the loop's second tick to settle into its sleep" });
 
+    assert.equal(fetches(), 2, "the loop's second tick ran");
     assert.equal(connected(), 1, "the first tick that actually answered reports the connection");
   });
 
@@ -497,7 +546,7 @@ describe("HydrawisePlatform connection reporting", () => {
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => registered()[0] !== undefined, { description: "the first accessory registration" });
+    await settleUntil(() => registered()[0] !== undefined, { description: "the first accessory registration" });
 
     assert.ok(loggedAt(entries, "info", "Successfully connected to the Hydrawise API using your API key."), "the key-based line still reports");
     assert.ok(!loggedAnywhere(entries, "account API"), "and nothing claims an account connection that was never made");
@@ -523,14 +572,14 @@ describe("HydrawisePlatform connection reporting", () => {
     account.intercept({ method: "POST", path: new URL(HYDRAWISE_V2_GRAPH_ENDPOINT).pathname }).reply(200, { data: { me: { controllers: [null] } },
       errors: [{ message: "Internal server error", path: [ "me", "controllers", 0, "hardware" ] }] }).persist();
 
-    installV2Client(platform, new HydrawiseV2Client({ budget: v2BudgetOf(platform),
+    installV2Client(platform, new HydrawiseV2Client({ budget: v2BudgetOf(platform), clock: platform.clock,
       dispatcherFactory: (): MockAgent => Object.assign(agent, { destroy: async (): Promise<void> => { await agent.close(); } }), log: platform.log,
       password: "test-password", signal: platform.signal, username: "test-user" }));
     programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => loggedAt(entries, "error", "Unable to retrieve enhanced controller details: Internal server error."),
+    await settleUntil(() => loggedAt(entries, "error", "Unable to retrieve enhanced controller details: Internal server error."),
       { description: "the read's error line" });
 
     assert.ok(!loggedAnywhere(entries, "connected to the Hydrawise account API"), "a read that enriched nothing reports no connection");
@@ -554,7 +603,7 @@ describe("HydrawisePlatform refresh pacing", () => {
 
   test("consecutive throttled ticks lengthen the sleep, and any other tick ends the run", async (t) => {
 
-    const { emit, entries, platform } = buildPlatform({ options: CREDENTIAL_OPTIONS });
+    const { clock, emit, platform } = buildPlatform({ options: CREDENTIAL_OPTIONS });
 
     t.after(() => emit(SHUTDOWN));
 
@@ -562,27 +611,48 @@ describe("HydrawisePlatform refresh pacing", () => {
 
     const ready = answered([ syntheticController.controller_id, makeV2Facts({ hardware: FIRST_HARDWARE }) ]);
     const throttled: HydrawiseV2Read = { status: "throttled" };
-    const script: HydrawiseV2Read[] = [ ready, throttled, throttled, throttled, ready, throttled, { status: "failed" }, throttled, throttled ];
-    const { client, fetches } = makeTestV2Client((fetch) => script[fetch - 1] ?? ready);
+
+    /* Each tick's read beside the span its sleep must fall in, inclusive. A backed-off sleep runs past its rung by up to a quarter of it, and the cadence takes no
+     * jitter, so a rung's span is its own width and a quarter more, and the cadence's is the one value.
+     */
+    const ticks: [ HydrawiseV2Read, number, number, string ][] = [
+      [ ready, 900000, 900000, "the loop's first tick answers, and sleeps the cadence" ],
+      [ throttled, 900000, 900000, "the first throttled tick keeps the cadence" ],
+      [ throttled, 1800000, 2250000, "the second sleeps two intervals, spread up to a quarter past them" ],
+      [ throttled, 3600000, 4500000, "the third sleeps the ceiling, spread the same way" ],
+      [ ready, 900000, 900000, "an answered tick after them restores the cadence" ],
+      [ throttled, 900000, 900000, "a throttle after the answer starts a new run" ],
+      [ { status: "failed" }, 900000, 900000, "a failed tick keeps the cadence" ],
+      [ throttled, 900000, 900000, "and ends the run, so the next throttle is the first of its own" ],
+      [ throttled, 1800000, 2250000, "which the one after it follows as the second" ]
+    ];
+    const { client, fetches } = makeTestV2Client((fetch) => ticks[fetch - 1]?.[0] ?? ready);
 
     installV2Client(platform, client);
-    programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
-    programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
-    // The loop's own first tick answers and then sleeps a quarter hour, so every tick after it is driven here.
+    // An account listing no controllers, so no poll runs, and every sleep the platform's clock is asked for past discovery's own request is the loop's.
+    programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails({ controllers: [] }));
+
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => logCount(entries, "info", "connected to the Hydrawise account API") === 1, { description: "the loop's first tick to land" });
 
-    const within = (delay: number, low: number, high: number, label: string): void => assert.ok((delay >= low) && (delay <= high), label + " reads " + delay.toString());
+    /* Each tick's sleep is read from what the loop asked the platform's clock for, asserted, and crossed, so every tick after the first is the loop's own. The
+     * last tick's sleep is read and left standing, so the count after the walk reads the ticks the script states.
+     */
+    for(const [ index, [ , low, high, label ] ] of ticks.entries()) {
 
-    assert.equal(await refreshV2FactsOnce(platform), 900000, "the first throttled tick keeps the cadence");
-    within(await refreshV2FactsOnce(platform), 1800000, 2250000, "the second sleeps two intervals, spread up to a quarter past them");
-    within(await refreshV2FactsOnce(platform), 3600000, 4500000, "the third sleeps the ceiling, spread the same way");
-    assert.equal(await refreshV2FactsOnce(platform), 900000, "an answered tick after them restores the cadence");
-    assert.equal(await refreshV2FactsOnce(platform), 900000, "a throttle after the answer starts a new run");
-    assert.equal(await refreshV2FactsOnce(platform), 900000, "a failed tick keeps the cadence");
-    assert.equal(await refreshV2FactsOnce(platform), 900000, "and ends the run, so the next throttle is the first of its own");
-    within(await refreshV2FactsOnce(platform), 1800000, 2250000, "which the one after it follows as the second");
-    assert.equal(fetches(), script.length, "every tick spent exactly one fetch");
+      // eslint-disable-next-line no-await-in-loop
+      await settleUntil(() => refreshSleeps(clock).length === (index + 1), { description: "the loop's sleep after tick " + String(index + 1) });
+
+      const sleep = expectAt(refreshSleeps(clock), index, "the loop's sleep after tick " + String(index + 1));
+
+      assert.ok((sleep >= low) && (sleep <= high), label + " reads " + sleep.toString());
+
+      if(index < (ticks.length - 1)) {
+
+        clock.advance(sleep);
+      }
+    }
+
+    assert.equal(fetches(), ticks.length, "every tick spent exactly one fetch");
   });
 });

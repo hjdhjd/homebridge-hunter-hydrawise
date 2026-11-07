@@ -10,7 +10,7 @@
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
 import type { HydrawiseCommandHandlers, HydrawiseCommandTarget, HydrawiseCommandValue, HydrawisePreparedCommand } from "./commands.ts";
-import { assertNoUnhandledRejections, capturingLog, linesAt, present, waitUntil } from "homebridge-plugin-utils/testing";
+import { TestClock, assertNoUnhandledRejections, capturingLog, linesAt, present, settle, settleUntil } from "homebridge-plugin-utils/testing";
 import { describe, test } from "node:test";
 import type { CapturingLog } from "homebridge-plugin-utils/testing";
 import { HYDRAWISE_REVERT_DELAY } from "./settings.ts";
@@ -18,16 +18,12 @@ import type { HydrawiseCommandOutcome } from "./types.ts";
 import { HydrawiseCommandQueue } from "./commands.ts";
 import { TimerRegistry } from "homebridge-plugin-utils";
 import assert from "node:assert/strict";
-import { setTimeout as delay } from "node:timers/promises";
+import { crossRevertDelay } from "./testing/platform.helpers.ts";
 import { makeZone } from "./api.helpers.ts";
 
 // The fault every row throws, and the line the queue says it in.
 const FAULT = new Error("The handler failed.");
 const FAULT_LINE = "Unable to finish a command to Hydrawise: The handler failed.";
-
-// How long, in milliseconds, a row waits for the queue to fall idle before it calls the queue wedged. A queue that contains its faults falls idle within a few
-// turns, so the span separates the two however the machine is loaded.
-const IDLE_MS = 1000;
 
 // The targets every row queues, in the order it queues them: the account-wide switch, whose handlers a row makes throw, then a zone's valve, waiting its turn.
 const SUSPEND_ALL: HydrawiseCommandTarget = { kind: "suspend-all" };
@@ -40,10 +36,11 @@ const RECORD = { at: 100, commandedUntil: 200 };
 // control is written, or in a send that throws as it is made.
 type HydrawiseQueueFault = "confirm" | "prepare" | "reject" | "render" | "throw";
 
-// The queue under test and what a row reads of it: the targets sent, the controls written and the requests reported as not taking, in order, and the logger the
-// queue was handed.
+// The queue under test and what a row reads of it: the clock its timer registry arms each control's write on, the targets sent, the controls written and the
+// requests reported as not taking, in order, and the logger the queue was handed.
 interface QueueHarness {
 
+  clock: TestClock;
   lifetime: AbortController;
   log: CapturingLog;
   queue: HydrawiseCommandQueue;
@@ -54,11 +51,13 @@ interface QueueHarness {
 }
 
 /* Build a queue over handlers that answer every command with the given outcome and throw the given fault for the account-wide switch alone. A held queue answers
- * no send until the row releases it, which is how a row puts a fault after the platform has shut down.
+ * no send until the row releases it, which is how a row puts a fault after the platform has shut down. The timer registry runs on a clock the row steps, so a
+ * control's write lands when the row crosses the revert delay and at no other moment.
  */
 function buildQueue({ fault, held = false, outcome = { status: "confirmed" } }: { fault: HydrawiseQueueFault; held?: boolean;
   outcome?: HydrawiseCommandOutcome; }): QueueHarness {
 
+  const clock = new TestClock();
   const lifetime = new AbortController();
   const log = capturingLog();
   const gate: PromiseWithResolvers<void> = Promise.withResolvers();
@@ -130,9 +129,9 @@ function buildQueue({ fault, held = false, outcome = { status: "confirmed" } }: 
     }
   };
 
-  const queue = new HydrawiseCommandQueue({ handlers, log, name: "500001", signal: lifetime.signal, timers: new TimerRegistry({ signal: lifetime.signal }) });
+  const queue = new HydrawiseCommandQueue({ handlers, log, name: "500001", signal: lifetime.signal, timers: new TimerRegistry({ clock, signal: lifetime.signal }) });
 
-  return { lifetime, log, queue, release: (): void => gate.resolve(), rendered, sent, unconfirmed };
+  return { clock, lifetime, log, queue, release: (): void => gate.resolve(), rendered, sent, unconfirmed };
 }
 
 // Queue the account-wide switch's command and then the valve's, in one turn, so the valve waits its turn behind the switch.
@@ -142,22 +141,18 @@ function enqueueBoth(queue: HydrawiseCommandQueue): void {
   queue.enqueue(VALVE, { duration: 300, on: true, origin: "homekit" });
 }
 
-// Wait for the queue to fall idle, failing the row rather than hanging it when the queue is wedged. The deadline is cancelled once the race settles, so a row
-// that fell idle leaves no timer behind it.
+// Wait for the queue to fall idle, failing the row rather than hanging it when the queue is wedged. The queue moves on promises alone, so a queue that contains
+// its faults falls idle within a few turns, and a turn budget tells the two apart however the machine is loaded.
 async function idleWithin(queue: HydrawiseCommandQueue): Promise<void> {
 
-  const deadline = new AbortController();
+  let idle = false;
 
-  try {
+  void queue.idle.then(() => {
 
-    await Promise.race([ queue.idle, delay(IDLE_MS, undefined, { signal: deadline.signal }).then((): never => {
+    idle = true;
+  });
 
-      throw new Error("The queue did not fall idle within " + IDLE_MS.toString() + " ms.");
-    }) ]);
-  } finally {
-
-    deadline.abort();
-  }
+  await settleUntil(() => idle, { description: "the queue to fall idle" });
 }
 
 describe("HydrawiseCommandQueue fault containment", () => {
@@ -178,7 +173,9 @@ describe("HydrawiseCommandQueue fault containment", () => {
     assert.deepEqual(linesAt(h.log.entries, "error"), [FAULT_LINE], "and the fault is said once");
     assert.equal(h.queue.pending(SUSPEND_ALL), undefined, "the switch's confirmed command holds nothing pending");
 
-    await waitUntil(() => h.rendered.includes("suspend-all"), { description: "the suspend-all switch to be written" });
+    await crossRevertDelay(h.clock);
+
+    assert.ok(h.rendered.includes("suspend-all"), "and the suspend-all switch is written once the revert delay passes");
   });
 
   test("a confirmation that faults with a newer request waiting behind it leaves that request to be sent", async (t) => {
@@ -190,7 +187,7 @@ describe("HydrawiseCommandQueue fault containment", () => {
     await assertNoUnhandledRejections(async () => {
 
       h.queue.enqueue(SUSPEND_ALL, { on: true, origin: "homekit" });
-      await waitUntil(() => h.sent.length === 1, { description: "the switch's command to be sent" });
+      await settleUntil(() => h.sent.length === 1, { description: "the switch's command to be sent" });
       h.queue.enqueue(SUSPEND_ALL, { on: false, origin: "homekit" });
       h.release();
       await idleWithin(h.queue);
@@ -216,7 +213,9 @@ describe("HydrawiseCommandQueue fault containment", () => {
     assert.deepEqual(linesAt(h.log.entries, "error"), [FAULT_LINE], "the fault is said once");
     assert.equal(h.queue.pending(SUSPEND_ALL), undefined, "and the switch's request is dropped");
 
-    await waitUntil(() => h.rendered.includes("suspend-all"), { description: "the suspend-all switch to be written back" });
+    await crossRevertDelay(h.clock);
+
+    assert.ok(h.rendered.includes("suspend-all"), "the suspend-all switch is written back once the revert delay passes");
   });
 
   for(const fault of [ "reject", "throw" ] as const) {
@@ -237,7 +236,9 @@ describe("HydrawiseCommandQueue fault containment", () => {
       assert.deepEqual(linesAt(h.log.entries, "error"), [FAULT_LINE], "the fault is said once");
       assert.equal(h.queue.pending(SUSPEND_ALL), undefined, "and the switch's request rests rather than waiting on an answer that never comes");
 
-      await waitUntil(() => h.rendered.includes("suspend-all"), { description: "the suspend-all switch to be written back" });
+      await crossRevertDelay(h.clock);
+
+      assert.ok(h.rendered.includes("suspend-all"), "the suspend-all switch is written back once the revert delay passes");
     });
   }
 
@@ -251,15 +252,20 @@ describe("HydrawiseCommandQueue fault containment", () => {
 
       enqueueBoth(h.queue);
       await idleWithin(h.queue);
-      await waitUntil(() => h.rendered.includes("suspend-all"), { description: "the refused switch to be written back" });
+      await crossRevertDelay(h.clock);
 
       // Several write delays pass, any of which a rewrite of the faulty control would have landed in.
-      await delay(HYDRAWISE_REVERT_DELAY * 4);
+      h.clock.advance(HYDRAWISE_REVERT_DELAY * 4);
+      await settle();
     });
 
     assert.deepEqual(h.unconfirmed, [ "suspend-all", "valve" ], "each refusal is reported as the controller's own to say");
     assert.deepEqual(h.rendered.filter(kind => kind === "suspend-all"), ["suspend-all"], "the faulty control is written once");
     assert.deepEqual(linesAt(h.log.entries, "error"), [FAULT_LINE], "and the fault is said once");
+
+    // The clock crossed every one of those delays and holds nothing armed, so no rewrite was waiting on a step the row did not take.
+    assert.equal(h.clock.now(), HYDRAWISE_REVERT_DELAY * 5, "the clock crossed the first write and the delays after it");
+    assert.equal(h.clock.pending, 0, "and no write is left armed on it");
   });
 
   test("a fault met after the platform shuts down says nothing", async (t) => {
@@ -271,7 +277,7 @@ describe("HydrawiseCommandQueue fault containment", () => {
     await assertNoUnhandledRejections(async () => {
 
       enqueueBoth(h.queue);
-      await waitUntil(() => h.sent.length === 1, { description: "the switch's command to be sent" });
+      await settleUntil(() => h.sent.length === 1, { description: "the switch's command to be sent" });
       h.lifetime.abort();
       h.release();
       await idleWithin(h.queue);
@@ -279,6 +285,7 @@ describe("HydrawiseCommandQueue fault containment", () => {
 
     assert.deepEqual(h.sent, ["suspend-all"], "nothing more is sent after shutdown");
     assert.equal(h.log.entries.length, 0, "and the fault is not said");
+    assert.equal(h.clock.pending, 0, "with nothing left armed on the queue's clock to send or say anything later");
   });
 });
 
@@ -286,6 +293,7 @@ describe("HydrawiseCommandQueue one command in flight", () => {
 
   test("a timeout answered first and another target tapped after it in one synchronous turn keeps one command in flight", async (t) => {
 
+    const clock = new TestClock();
     const lifetime = new AbortController();
 
     t.after(() => lifetime.abort());
@@ -317,23 +325,27 @@ describe("HydrawiseCommandQueue one command in flight", () => {
     };
 
     const queue = new HydrawiseCommandQueue({ handlers, log: capturingLog(), name: "500001", signal: lifetime.signal,
-      timers: new TimerRegistry({ signal: lifetime.signal }) });
+      timers: new TimerRegistry({ clock, signal: lifetime.signal }) });
     const kinds = (): HydrawiseCommandTarget["kind"][] => sends.map(send => send.kind);
 
     queue.enqueue(SUSPEND_ALL, { on: true, origin: "homekit" });
-    await waitUntil(() => sends.length === 1, { description: "the switch's command to be sent" });
+    await settleUntil(() => sends.length === 1, { description: "the switch's command to be sent" });
 
     // The one synchronous turn, in this order: the answer lands, and then the valve is tapped.
     present(sends[0], "the switch's send").answer.resolve({ status: "timeout" });
     queue.enqueue(VALVE, { duration: 300, on: true, origin: "homekit" });
 
-    await waitUntil(() => sends.length > 1, { description: "the next command to be sent" });
-    await delay(HYDRAWISE_REVERT_DELAY);
+    await settleUntil(() => sends.length > 1, { description: "the next command to be sent" });
+
+    // The queue sends on promises alone, so the turns that would carry a second command out pass here, and a revert delay is crossed on its clock beside them.
+    await settle();
+    await crossRevertDelay(clock);
 
     assert.deepEqual(kinds(), [ "suspend-all", "suspend-all" ], "the resend is the one command in flight, with the valve waiting behind it");
+    assert.equal(clock.pending, 0, "and nothing armed on the queue's clock holds a send back");
 
     present(sends[1], "the switch's resend").answer.resolve({ status: "confirmed" });
-    await waitUntil(() => sends.length > 2, { description: "the valve's command to be sent" });
+    await settleUntil(() => sends.length > 2, { description: "the valve's command to be sent" });
 
     assert.deepEqual(kinds(), [ "suspend-all", "suspend-all", "valve" ], "and the valve's turn comes once the resend is answered");
 

@@ -12,11 +12,11 @@ import { HYDRAWISE_RAIN_SENSOR_TYPE, HYDRAWISE_UNSCHEDULED_SENTINEL, controllerV
   sameScheduleStatus, scheduleStatus, zoneIdentity } from "./types.ts";
 import type { HydrawiseAccessoryContext, HydrawiseScheduleStatus, HydrawiseZoneConfig, HydrawiseZoneIdentity, HydrawiseZoneScheduleState,
   StatusScheduleResponse } from "./types.ts";
+import { advanceThroughPolls, buildController, buildPlatform, makeV2Facts, makeZoneV2Facts, seconds, seedEstablished } from "./testing/platform.helpers.ts";
 import { bareSensors, normalZoneMatrix, rainSensors, sentinelZoneMatrix, syntheticController } from "./api.fixtures.ts";
-import { buildController, buildPlatform, makeV2Facts, makeZoneV2Facts, pollsCompleted, seedEstablished } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
-import { expectAt, logCount, waitUntil } from "homebridge-plugin-utils/testing";
-import { fastPolling, makeStatusSchedule, makeZone, normalSchedule, rainStopped } from "./api.helpers.ts";
+import { expectAt, logCount, settleUntil } from "homebridge-plugin-utils/testing";
+import { makeStatusSchedule, makeZone, normalSchedule, rainStopped } from "./api.helpers.ts";
 import { HYDRAWISE_ACTIVE_ZONE_INDICATOR } from "./settings.ts";
 import assert from "node:assert/strict";
 
@@ -33,10 +33,12 @@ const BETA_RELAY_ID = 700002;
 // The suspension instant the live 2026-08-09 account capture recorded, kept verbatim so these assertions run against a real far-future value rather than a round number.
 const SUSPENDED_UNTIL = 1903928399;
 
-// Compose a fast-cadence schedule around a zone list and a sensor block, so a live-loop test cycles in roughly 250ms rather than the wire-realistic minute.
+/* Compose a wire-realistic schedule around a zone list and a sensor block. The first poll goes out as the controller is built and lands within turns, so a
+ * first-poll state is read with no step of the clock, and a row that counts later polls steps the controller's clock across the sleep the wire asks for.
+ */
 function schedule(zones: HydrawiseZoneConfig[], sensors: StatusScheduleResponse["sensors"] = bareSensors, time = ROOT_TIME): StatusScheduleResponse {
 
-  return fastPolling(makeStatusSchedule({ relays: zones, sensors, time }));
+  return makeStatusSchedule({ relays: zones, sensors, time });
 }
 
 // Compose a rain-class sensor block from one relay-id group per sensor, so a scenario states which zones each sensor covers and nothing more. Coverage and the rain
@@ -285,12 +287,12 @@ describe("HydrawiseController schedule persistence (poll)", () => {
 
   test("a fresh first poll seeds both projections through a single flush", async (t) => {
 
-    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: fastPolling(normalSchedule()), kind: "response" }),
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: normalSchedule(), kind: "response" }),
       signalAborted: false });
 
     t.after(() => h.abort());
 
-    await pollsCompleted(h, 2);
+    await advanceThroughPolls(h, 2);
     await h.abort();
 
     const persisted = scheduleOf(h.accessory);
@@ -302,13 +304,14 @@ describe("HydrawiseController schedule persistence (poll)", () => {
 
   test("a feature-disabled zone still appears in the persisted projection", async (t) => {
 
-    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: fastPolling(normalSchedule()), kind: "response" }),
-      signalAborted: false, userOptions: ["Disable.Device.700002"] });
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: normalSchedule(), kind: "response" }),
+      signalAborted: false,
+      userOptions: ["Disable.Device.700002"] });
 
     t.after(() => h.abort());
 
     // Construction saves the ConfiguredName the controller's setup adds before any poll, so the first poll's save is the second.
-    await waitUntil(() => h.flushes().length >= 2, { description: "the first poll's accessory flush, after construction's" });
+    await settleUntil(() => h.flushes().length >= 2, { description: "the first poll's accessory flush, after construction's" });
 
     // The projection takes no feature parameter and structurally cannot exclude a zone, so this assertion guards a future writer who threads the enabled-zone set into
     // it rather than distinguishing what the code does today.
@@ -325,7 +328,7 @@ describe("HydrawiseController schedule persistence (poll)", () => {
 
     t.after(() => h.abort());
 
-    await pollsCompleted(h, 2);
+    await advanceThroughPolls(h, 2);
     await h.abort();
 
     // The two wire bodies genuinely differ - the root clock advanced and every countdown fell - yet they describe the same scheduled instants, so the change gate
@@ -344,7 +347,7 @@ describe("HydrawiseController schedule persistence (poll)", () => {
 
     t.after(() => h.abort());
 
-    await pollsCompleted(h, 2);
+    await advanceThroughPolls(h, 2);
     await h.abort();
 
     const persisted = expectAt(scheduleOf(h.accessory).zones, 0, "zone");
@@ -370,7 +373,7 @@ describe("HydrawiseController schedule persistence (poll)", () => {
 
     t.after(() => h.abort());
 
-    await pollsCompleted(h, 2);
+    await advanceThroughPolls(h, 2);
     await h.abort();
 
     const persisted = scheduleOf(h.accessory);
@@ -395,7 +398,7 @@ describe("HydrawiseController schedule persistence (poll)", () => {
 
     t.after(() => h.abort());
 
-    await pollsCompleted(h, 2);
+    await advanceThroughPolls(h, 2);
     await h.abort();
 
     // The two projections carry the same zone count and the same schedule facts at every index but one, so a comparison that stopped at the length - or that
@@ -424,7 +427,7 @@ describe("HydrawiseController schedule persistence (poll)", () => {
 
     t.after(() => h.abort());
 
-    await pollsCompleted(h, 2);
+    await advanceThroughPolls(h, 2);
     await h.abort();
 
     // A flush count alone cannot say which projection moved, because both travel through the one channel, so the schedule half's no-change claim is asserted on the
@@ -454,7 +457,7 @@ describe("HydrawiseController schedule restore (restart)", () => {
 
     assert.deepEqual(contextOf(h.accessory).schedule, prior, "the prior projection survives the constructor's wipe-then-seed pass");
 
-    await pollsCompleted(h, 2);
+    await advanceThroughPolls(h, 2);
     await h.abort();
 
     // Retaining the restored asOf is the deliberate conservatism of the design: the facts held when they were written and they still hold, and the only surface
@@ -491,7 +494,7 @@ describe("HydrawiseController schedule restore (restart)", () => {
       t.after(() => h.abort());
 
       // eslint-disable-next-line no-await-in-loop
-      await pollsCompleted(h, 2);
+      await advanceThroughPolls(h, 2);
 
       // eslint-disable-next-line no-await-in-loop
       await h.abort();
@@ -518,7 +521,7 @@ describe("HydrawiseController schedule restore (restart)", () => {
 
     t.after(() => h.abort());
 
-    await pollsCompleted(h, 2);
+    await advanceThroughPolls(h, 2);
     await h.abort();
 
     assert.equal(h.flushes().length, 1, "the corrupt-timestamp prior is dropped at restore, so the first poll seeds the projection through exactly one flush");
@@ -631,10 +634,10 @@ describe("HydrawiseController schedule classification with account facts", () =>
 
     t.after(() => h.abort());
 
-    await waitUntil(() => contextOf(h.accessory).schedule !== undefined, { description: "the first poll to persist its projection" });
+    await settleUntil(() => contextOf(h.accessory).schedule !== undefined, { description: "the first poll to persist its projection" });
 
     h.controller.applyFacts({ facts: makeV2Facts({ zones: [[ ALPHA_RELAY_ID, makeZoneV2Facts({ suspendedUntil: SUSPENDED_UNTIL }) ]] }),
-      fetchedAt: Math.floor(Date.now() / 1000) });
+      fetchedAt: seconds(h.clock) });
 
     assert.deepEqual(scheduleOf(h.accessory).zones, [{ relayId: ALPHA_RELAY_ID, state: "suspended", until: SUSPENDED_UNTIL }], "the zone starts out suspended");
 
@@ -645,7 +648,7 @@ describe("HydrawiseController schedule classification with account facts", () =>
 
     assert.deepEqual([...facts.zones.keys()], [BETA_RELAY_ID], "the zone the error names is omitted, and the zone beside it stands");
 
-    h.controller.applyFacts({ facts, fetchedAt: Math.floor(Date.now() / 1000) });
+    h.controller.applyFacts({ facts, fetchedAt: seconds(h.clock) });
 
     assert.deepEqual(scheduleOf(h.accessory).zones, [{ relayId: ALPHA_RELAY_ID, state: "suspended", until: SUSPENDED_UNTIL }], "so it keeps its carry");
     assert.equal(logCount(h.entries, "info", "Suspension lifted."), 0, "and says nothing of a suspension that never lifted");
@@ -691,17 +694,17 @@ describe("HydrawiseController schedule classification with account facts", () =>
     // Both zones under one type-1 sensor carry the unscheduled shape, which the key-based inference reads as a rain stop. A quiet reading from the facts would retire
     // that inference, so reading the nulled sensor as absent would call a real rain stop no stop at all.
     const body = schedule([ sentinelZone(), sentinelZone({ name: "Beta", relay: 2, relay_id: BETA_RELAY_ID }) ], sensorsCovering([ ALPHA_RELAY_ID, BETA_RELAY_ID ]));
-    const h = buildController({ hasV2Client: true, program: (recorder) => recorder.programDefault("statusschedule.php", { body, kind: "response" }),
-      signalAborted: false });
+    const h = buildController({ hasV2Client: true,
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body, kind: "response" }), signalAborted: false });
 
     t.after(() => h.abort());
 
-    await waitUntil(() => contextOf(h.accessory).schedule !== undefined, { description: "the first poll to persist its projection" });
+    await settleUntil(() => contextOf(h.accessory).schedule !== undefined, { description: "the first poll to persist its projection" });
 
     const quiet = { model: { sensorType: "LEVEL_CLOSED" }, status: { active: false }, zones: [{ id: BETA_RELAY_ID }] };
     const facts = controllerV2Facts({ sensors: [ quiet, null ], zones: [ { id: ALPHA_RELAY_ID }, { id: BETA_RELAY_ID } ] });
 
-    h.controller.applyFacts({ facts, fetchedAt: Math.floor(Date.now() / 1000) });
+    h.controller.applyFacts({ facts, fetchedAt: seconds(h.clock) });
 
     assert.deepEqual(scheduleOf(h.accessory).zones.map(zone => zone.state), [ "sensor-stopped", "sensor-stopped" ], "the inference still decides for both");
   });
@@ -852,7 +855,7 @@ describe("HydrawiseController sticky suspension across a restart", () => {
 
     t.after(() => h.abort());
 
-    await pollsCompleted(h, 2);
+    await advanceThroughPolls(h, 2);
     await h.abort();
 
     assert.deepEqual(scheduleOf(h.accessory).zones, [{ relayId: ALPHA_RELAY_ID, state: "suspended", until: SUSPENDED_UNTIL }],
@@ -872,7 +875,7 @@ describe("HydrawiseController sticky suspension across a restart", () => {
 
     t.after(() => h.abort());
 
-    await pollsCompleted(h, 2);
+    await advanceThroughPolls(h, 2);
     await h.abort();
 
     assert.deepEqual(scheduleOf(h.accessory).zones, [{ relayId: ALPHA_RELAY_ID, state: "unscheduled" }],

@@ -3,24 +3,29 @@
  * platform.configure.test.ts: Discovery and lifecycle behavior of the HydrawisePlatform, driven by firing the captured DID_FINISH_LAUNCHING handler to
  * run the private configureHydrawise against a MockAgent-backed wire. Covers the discovery happy path, the controller word a fresh accessory is minted under where
  * HomeKit can carry nothing of its name, the short-circuiting second pass and cached-accessory reuse,
- * orphan pruning, the bug-16 device gate in both directions, the no-API-key early return, the bug-2 debug routing, the MQTT construction arms, the discovery
- * retry failure paths and the report of a repeating one, the shutdown teardown and the retained offline each built controller states through the MQTT client's
- * end ahead of it, the refusal a restored accessory answers with until its controller vouches for it, the retained offline the platform states for a restored
- * controller this run does not build, and the one startup line an option set globally or on one controller writes across a whole account.
+ * orphan pruning, the bug-16 device gate in both directions, the no-API-key early return, the bug-2 debug routing, the MQTT client the platform builds through its
+ * factory with its own clock and signal, the discovery retry failure paths and the report of a repeating one on the platform's clock, the quiet unwind of a
+ * shutdown met while the controller list is read, the shutdown teardown and the retained offline each built controller states through the MQTT client's end ahead
+ * of it, the refusal a restored accessory answers with until its controller vouches for it, the retained offline the platform states for a restored controller
+ * this run does not build, and the one startup line an option set globally or on one controller writes across a whole account.
+ *
+ * Every platform here runs on the TestClock the harness builds it on, and builds its MQTT client through HBPU's factory double, so a row steps every retry and
+ * grace it crosses and reads the client the platform built from the factory's record of the call.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as controller_id, so camelcase is disabled here to let the controller fixture mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { Characteristic, Service, TestMqttClient, buildPlatform, dispatcherOf, installMockDispatcher, installV2Client, makeTestV2Client, programJsonReply,
-  programStatusReply, seedAccessory, v2DispatcherOf } from "./testing/platform.helpers.ts";
-import { HAPStatus, MQTT_DEFAULT_END_GRACE_MS, MqttClient, onAbort } from "homebridge-plugin-utils";
+import type { BuildPlatformResult, TestMqttClient } from "./testing/platform.helpers.ts";
+import { Characteristic, Service, buildPlatform, dispatcherOf, heldEndFor, installMockDispatcher, installV2Client, makeTestV2Client, programCountedReply,
+  programJsonReply, programStatusReply, seedAccessory, v2DispatcherOf } from "./testing/platform.helpers.ts";
+import { HAPStatus, MQTT_DEFAULT_END_GRACE_MS, createMqttClient, onAbort } from "homebridge-plugin-utils";
+import { HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_TIMEOUT } from "./settings.ts";
 import { HYDRAWISE_CONTROLLER_FALLBACK_NAME, HydrawiseReservedNames, suspendZoneSubtype, zoneAccessoryId } from "./types.ts";
 import type { Characteristic as HapCharacteristic, PlatformAccessory } from "homebridge";
 import { describe, test } from "node:test";
-import { formatLogEntry, hapStatus, linesAt, logCount, loggedAt, present, settle, settleUntil, triggerGet, triggerSet, waitUntil } from "homebridge-plugin-utils/testing";
+import { expectAt, formatLogEntry, hapStatus, linesAt, logCount, loggedAt, present, settle, settlePastMqttEnd, settleUntil, triggerGet,
+  triggerSet } from "homebridge-plugin-utils/testing";
 import { makeCustomerDetails, normalSchedule } from "./api.helpers.ts";
-import { HYDRAWISE_API_RETRY_INTERVAL } from "./settings.ts";
-import type { MqttConnectHandler } from "homebridge-plugin-utils";
 import type { TestContext } from "node:test";
 import type { TestLogEntry } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
@@ -43,27 +48,25 @@ function untrimmedCustomerDetails(): ReturnType<typeof makeCustomerDetails> {
   return makeCustomerDetails({ controllers: [{ ...syntheticController, name: "  Test Controller  " }] });
 }
 
-// Stand HBPU's recording MQTT double where the platform's client goes, so a row reads the final words shutdown's end states and can refuse them. The platform is
-// built with no broker URL, so no client of its own is displaced, and a controller discovery builds registers its word on the double. The double arms its end's
-// grace on the platform's clock, as the platform's client does. The double's lifetime is the row's own, which shutdown's end or the row's `await using` binding
-// ends.
-function installMqttDouble(platform: Parameters<typeof seedAccessory>[0]): TestMqttClient {
+// The broker a row configures so the platform builds an MQTT client. The harness's factory double answers it with a recording double, so nothing ever dials it.
+const BROKER_URL = "mqtt://127.0.0.1:1";
 
-  const mqtt = new TestMqttClient({ clock: platform.clock });
+// The MQTT client double the platform built through the harness's factory, read from the factory's record of the call, so a row reads the final words shutdown's
+// end states, and can refuse them, on the client the platform built and every controller registered its word on. The double arms its end's grace on the clock
+// and lives on the signal the platform handed the factory, as the platform's real client does.
+function builtMqtt({ mqttFactory }: Pick<BuildPlatformResult, "mqttFactory">): TestMqttClient {
 
-  (platform as unknown as { mqtt: TestMqttClient }).mqtt = mqtt;
-
-  return mqtt;
+  return present(expectAt(mqttFactory.createCalls, 0, "the MQTT client the platform built").client, "the double the factory answered a configured broker with");
 }
 
 // The synthetic controller's availability topic tail, composed as the controller composes the topic its word and its final offline go to.
 const AVAILABILITY = syntheticController.serial_number + "/availability";
 
-// Race a shutdown against two macrotask turns, the one the end's write-flush yield costs and one more, answering which came first, so a row tells a teardown that
-// ran at once from one waiting out the grace.
+// Race a shutdown against the turns an MQTT end that nothing holds takes to finish, as HBPU's double states them, answering whether shutdown finished within
+// them, so a row tells a teardown that ran at once from one waiting out the grace.
 async function shutdownWithinATurn(platform: Parameters<typeof seedAccessory>[0]): Promise<boolean> {
 
-  return Promise.race([ platform.shutdown().then(() => true), settle(2).then(() => false) ]);
+  return Promise.race([ platform.shutdown().then(() => true), settlePastMqttEnd().then(() => false) ]);
 }
 
 describe("HydrawisePlatform configure", () => {
@@ -78,7 +81,7 @@ describe("HydrawisePlatform configure", () => {
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => registered().length >= 1, { description: "the first accessory registration" });
+    await settleUntil(() => registered().length >= 1, { description: "the first accessory registration" });
 
     assert.equal(registered().length, 1, "the single discovered controller should be registered once");
     assert.equal(registered()[0]?.displayName, "Test Controller", "the controller name should be trimmed of surrounding whitespace");
@@ -99,7 +102,7 @@ describe("HydrawisePlatform configure", () => {
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => registered().length >= 1, { description: "the first accessory registration" });
+    await settleUntil(() => registered().length >= 1, { description: "the first accessory registration" });
 
     assert.equal(registered()[0]?.displayName, "Garden Controller", "a fresh accessory carries the name the user configured rather than the wire's");
   });
@@ -118,7 +121,7 @@ describe("HydrawisePlatform configure", () => {
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => registered().length >= 1, { description: "the first accessory registration" });
+    await settleUntil(() => registered().length >= 1, { description: "the first accessory registration" });
 
     const information = present(registered()[0]?.getService(Service.AccessoryInformation), "the fresh accessory's information service");
 
@@ -142,7 +145,7 @@ describe("HydrawisePlatform configure", () => {
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => registered().length >= 2, { description: "both controllers' accessory registrations" });
+    await settleUntil(() => registered().length >= 2, { description: "both controllers' accessory registrations" });
 
     assert.deepEqual(registered().map((accessory) => accessory.displayName), [ HYDRAWISE_CONTROLLER_FALLBACK_NAME, "Second Controller" ],
       "the controller HomeKit can carry no name for is minted under the word, and the next is minted under its own");
@@ -168,7 +171,7 @@ describe("HydrawisePlatform configure", () => {
     programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => cached.getService(Service.IrrigationSystem) !== undefined, { description: "the cached accessory's irrigation system to appear" });
+    await settleUntil(() => cached.getService(Service.IrrigationSystem) !== undefined, { description: "the cached accessory's irrigation system to appear" });
 
     assert.equal(registered().length, 0, "the cached accessory is reused rather than registered anew");
     assert.equal(cached.displayName, "Test Controller", "and discovery does not rename it");
@@ -184,10 +187,10 @@ describe("HydrawisePlatform configure", () => {
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => logCount(entries, "info", "Successfully connected") >= 1, { description: "an info line containing \"Successfully connected\"" });
+    await settleUntil(() => logCount(entries, "info", "Successfully connected") >= 1, { description: "an info line containing \"Successfully connected\"" });
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => logCount(entries, "info", "Successfully connected") >= 2, { description: "the second info line containing \"Successfully connected\"" });
+    await settleUntil(() => logCount(entries, "info", "Successfully connected") >= 2, { description: "the second info line containing \"Successfully connected\"" });
 
     assert.equal(registered().length, 1, "the short-circuiting second pass should not register the controller again");
   });
@@ -204,7 +207,7 @@ describe("HydrawisePlatform configure", () => {
     programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => updated().length >= 1, { description: "the first accessory cache update" });
+    await settleUntil(() => updated().length >= 1, { description: "the first accessory cache update" });
 
     assert.equal(registered().length, 0, "a cached accessory should be reused, not registered anew");
     assert.ok(cached.getService(Service.IrrigationSystem), "the reused accessory should be configured with an irrigation system service");
@@ -223,7 +226,7 @@ describe("HydrawisePlatform configure", () => {
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => unregistered().length >= 1, { description: "the first accessory unregistration" });
+    await settleUntil(() => unregistered().length >= 1, { description: "the first accessory unregistration" });
 
     assert.equal(unregistered()[0]?.UUID, platform.hap.uuid.generate("999999"), "the orphaned accessory should be unregistered");
     assert.ok(!loggedAt(entries, "error", "stopped unexpectedly"), "and the bridge accepted the unregistration, so discovery ran on past the sweep");
@@ -241,7 +244,7 @@ describe("HydrawisePlatform configure", () => {
 
     // Discovery fetches the controller list successfully (the success log fires) and then the serial-keyed device gate excludes the controller before any
     // accessory is registered.
-    await waitUntil(() => logCount(entries, "info", "Successfully connected") >= 1, { description: "an info line containing \"Successfully connected\"" });
+    await settleUntil(() => logCount(entries, "info", "Successfully connected") >= 1, { description: "an info line containing \"Successfully connected\"" });
 
     assert.equal(registered().length, 0, "a serial-keyed device disable should exclude the controller");
   });
@@ -260,7 +263,7 @@ describe("HydrawisePlatform configure", () => {
 
     // The cached accessory matches the discovered controller's UUID, but the serial-keyed device gate excludes it, so configureController removes the cached
     // accessory rather than leaving it stranded.
-    await waitUntil(() => unregistered().length >= 1, { description: "the first accessory unregistration" });
+    await settleUntil(() => unregistered().length >= 1, { description: "the first accessory unregistration" });
 
     assert.equal(unregistered()[0]?.UUID, platform.hap.uuid.generate("500001"), "the disabled controller's cached accessory should be unregistered");
     assert.ok(!loggedAt(entries, "error", "stopped unexpectedly"), "and the bridge accepted the unregistration, so discovery ran on past it");
@@ -276,7 +279,7 @@ describe("HydrawisePlatform configure", () => {
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => registered().length >= 1, { description: "the first accessory registration" });
+    await settleUntil(() => registered().length >= 1, { description: "the first accessory registration" });
 
     assert.equal(registered().length, 1, "a controller-id-keyed disable does not match the serial-scoped gate, so the controller is still configured");
   });
@@ -314,18 +317,35 @@ describe("HydrawisePlatform configure", () => {
     assert.ok(!loggedAt(entries, "warn", "Debug logging on. Expect a lot of data."), "a disabled debug gate emits nothing");
   });
 
-  test("constructs an MQTT client for a valid broker URL", (t) => {
+  test("constructs an MQTT client for a valid broker URL, handing its factory the platform's own clock and signal", (t) => {
 
-    const { emit, platform } = buildPlatform({ mqttUrl: "mqtt://127.0.0.1:1" });
+    const { emit, mqttFactory, platform } = buildPlatform({ mqttUrl: BROKER_URL });
 
     t.after(() => emit(SHUTDOWN));
 
-    assert.notEqual(platform.mqtt, null, "a valid broker URL should construct an MQTT client");
+    /* The handoff is what this plugin owns: the broker settings it resolved, its logger, the clock every wait it schedules reads, and the lifetime signal its
+     * shutdown aborts. What the factory then makes of them, the double's lifetime composing that signal among it, is HBPU's, and its own suite proves it.
+     */
+    const call = expectAt(mqttFactory.createCalls, 0, "the MQTT client the platform built");
+
+    assert.equal(mqttFactory.createCalls.length, 1, "the platform builds one client");
+    assert.notEqual(call.client, null, "a valid broker URL should construct an MQTT client");
+    assert.equal(platform.mqtt, call.client, "and the platform holds the client its factory answered");
+    assert.equal(call.config.brokerUrl, BROKER_URL, "the factory is handed the broker URL the platform resolved");
+    assert.equal(call.config.topicPrefix, platform.config.mqttTopic, "and the topic prefix");
+    assert.equal(call.config.log, platform.log, "and the platform's own logger");
+
+    const init = present(call.init, "the init the platform handed its factory");
+
+    assert.equal(init.clock, platform.clock, "the client's waits run on the platform's own clock");
+    assert.equal(init.signal, platform.signal, "and its lifetime is the platform's own signal");
   });
 
   test("degrades gracefully when the MQTT broker URL is invalid", (t) => {
 
-    const { emit, entries, platform } = buildPlatform({ mqttUrl: "not-a-valid-url" });
+    // HBPU's own factory, because the degradation is its own: mqtt.js refuses the URL before any socket or timer exists, and the factory reports it through the
+    // platform's logger and answers null.
+    const { emit, entries, platform } = buildPlatform({ mqttFactory: createMqttClient, mqttUrl: "not-a-valid-url" });
 
     t.after(() => emit(SHUTDOWN));
 
@@ -342,7 +362,7 @@ describe("HydrawisePlatform configure", () => {
     programStatusReply(dispatcher.agent, "customerdetails.php", 404);
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => loggedAt(entries, "error", "Invalid API key"), { description: "an error line containing \"Invalid API key\"" });
+    await settleUntil(() => loggedAt(entries, "error", "Invalid API key"), { description: "an error line containing \"Invalid API key\"" });
 
     assert.equal(registered().length, 0, "a failed discovery fetch should configure no controller while it retries");
   });
@@ -356,7 +376,7 @@ describe("HydrawisePlatform configure", () => {
     programStatusReply(dispatcher.agent, "customerdetails.php", 200, "this is not valid json");
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => loggedAt(entries, "error", "Unable to retrieve the list of controllers"),
+    await settleUntil(() => loggedAt(entries, "error", "Unable to retrieve the list of controllers"),
       { description: "an error line containing \"Unable to retrieve the list of controllers\"" });
 
     assert.equal(registered().length, 0, "a discovery parse failure should configure no controller while it retries");
@@ -365,7 +385,7 @@ describe("HydrawisePlatform configure", () => {
   test("an unreadable controller list that repeats is reported once at error and once at debug, each as one sentence", async (t) => {
 
     // Debug is on so the demoted repeat reaches the capture, through the warn channel the platform's debug gate emits on.
-    const { emit, entries } = buildPlatform({ debug: true });
+    const { clock, emit, entries } = buildPlatform({ debug: true });
     const failures = (): TestLogEntry[] => entries.filter(entry => formatLogEntry(entry).includes("Unable to retrieve the list of controllers"));
 
     t.after(() => emit(SHUTDOWN));
@@ -375,17 +395,50 @@ describe("HydrawisePlatform configure", () => {
     programStatusReply(dispatcher.agent, "customerdetails.php", 200, "this is not valid json");
     programStatusReply(dispatcher.agent, "customerdetails.php", 200, "this is not valid json");
 
-    // Discovery waits out its retry on the production clock, which arms the global timers, so the mock replaces them before discovery starts and the row crosses
-    // the retry interval in virtual time rather than waiting it out.
-    t.mock.timers.enable({ apis: ["setTimeout"] });
+    // Discovery waits out its retry on the platform's own clock, the one the row built it on, so the row crosses the retry interval by stepping that clock, and a
+    // platform that kept a clock of its own would leave the repeat unreached.
     emit(DID_FINISH_LAUNCHING);
     await settleUntil(() => failures().length === 1, { description: "the first unreadable list's report" });
 
-    t.mock.timers.tick(HYDRAWISE_API_RETRY_INTERVAL * 1000);
+    clock.advance((HYDRAWISE_API_RETRY_INTERVAL * 1000) - 1);
+    await settle();
+
+    assert.equal(failures().length, 1, "a millisecond short of the retry interval discovery has not fetched the list again");
+
+    clock.advance(1);
     await settleUntil(() => failures().length === 2, { description: "the repeat's report" });
 
     assert.deepEqual(failures().map(entry => entry.level), [ "error", "warn" ], "the first unreadable list is reported at error and its repeat at debug");
     assert.ok(failures().every(entry => !stripVTControlCharacters(formatLogEntry(entry)).includes("\n    at ")), "and neither report carries a stack frame");
+  });
+
+  test("a shutdown met while the controller list is read unwinds discovery quietly", async () => {
+
+    /* The platform runs on a clock nothing advances, so the list request's deadline stands for as long as the request's scope does, and it leaves the clock only
+     * as that scope exits with the read settled. Its release after the shutdown is the witness that the read met the abort and discovery has answered it.
+     */
+    const { clock, emit, entries, platform } = buildPlatform();
+    const heldEnd = heldEndFor("customerdetails.php");
+
+    await using dispatcher = installMockDispatcher({ heldEnd });
+
+    const served = programCountedReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
+
+    emit(DID_FINISH_LAUNCHING);
+    await heldEnd.reached;
+
+    assert.equal(clock.pending, 1, "the list's bytes have arrived and its end is held, so its read is pending");
+    assert.equal(clock.nextDeadline, HYDRAWISE_API_TIMEOUT * 1000, "and the one entry on the clock is the request's own deadline");
+
+    emit(SHUTDOWN);
+    await settleUntil(() => clock.pending === 0, { description: "the list request's deadline to be released as its read settles" });
+
+    assert.equal(platform.signal.aborted, true, "the shutdown aborted the read through the platform's signal");
+    assert.equal(served(), 1, "discovery fetched the list once and retries nothing after the shutdown");
+    assert.equal(entries.filter(entry => formatLogEntry(entry).includes("Unable to retrieve the list of controllers")).length, 0,
+      "an aborted read is no failure, so discovery says nothing about it");
+    assert.ok(!loggedAt(entries, "info", "Successfully connected"), "and the list it never finished reading was never adopted");
+    assert.equal(entries.filter(entry => entry.level === "error").length, 0, "nothing reaches error");
   });
 
   test("aborts the shutdown signal when Homebridge shuts down", async () => {
@@ -397,7 +450,7 @@ describe("HydrawisePlatform configure", () => {
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => registered().length >= 1, { description: "the first accessory registration" });
+    await settleUntil(() => registered().length >= 1, { description: "the first accessory registration" });
 
     assert.equal(platform.signal.aborted, false, "the platform signal is live before shutdown");
     assert.equal(dispatcherOf(platform)?.destroyed, false, "the dispatcher is live before shutdown");
@@ -405,7 +458,7 @@ describe("HydrawisePlatform configure", () => {
     // This row fires Homebridge's own event rather than calling shutdown(), so it is the one that proves the registration, and it waits for the abort because
     // the handler awaits the MQTT client's end before the teardown.
     emit(SHUTDOWN);
-    await waitUntil(() => platform.signal.aborted, { description: "the shutdown handler's abort" });
+    await settleUntil(() => platform.signal.aborted, { description: "the shutdown handler's abort" });
 
     assert.equal(platform.signal.aborted, true, "the shutdown handler aborts the platform signal");
     assert.equal(dispatcherOf(platform)?.destroyed, true, "the shutdown handler destroys the platform dispatcher");
@@ -420,7 +473,7 @@ describe("HydrawisePlatform configure", () => {
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => registered().length >= 1, { description: "the first accessory registration" });
+    await settleUntil(() => registered().length >= 1, { description: "the first accessory registration" });
 
     let destroyedAtAbort: boolean | undefined;
 
@@ -472,9 +525,10 @@ describe("HydrawisePlatform configure", () => {
 
   test("shutdown states each built controller offline, retained, and waits for the word to be written before it aborts the signal", async () => {
 
-    const { emit, platform } = buildPlatform();
+    const built = buildPlatform({ mqttUrl: BROKER_URL });
+    const { emit, platform } = built;
+    const mqtt = builtMqtt(built);
 
-    await using mqtt = installMqttDouble(platform);
     await using dispatcher = installMockDispatcher();
     programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
@@ -483,13 +537,13 @@ describe("HydrawisePlatform configure", () => {
 
     // The controller states offline as it is built and online once its first poll lands, so the row waits for the online word: an offline recorded after it can
     // only be the final word shutdown's end states.
-    await waitUntil(() => mqtt.publishedTo(AVAILABILITY).at(-1)?.payload === "online", { description: "the controller's first online word" });
+    await settleUntil(() => mqtt.publishedTo(AVAILABILITY).at(-1)?.payload === "online", { description: "the controller's first online word" });
 
     const before = mqtt.publishedTo(AVAILABILITY).length;
 
-    /* Sample the topic AT ABORT TIME. The double is not bound to the platform's signal, so under a shutdown that aborted first a later word would still be
-     * recorded and the end state could not tell it from one published before; the frame the abort runs in is the only place the order is observable. A recorded
-     * word was also published while the client was connected, because the double refuses every publish while it is not.
+    /* Sample the topic AT ABORT TIME, the frame the abort runs in, which is where the order between the word and the abort is observable: the end state reads the
+     * same once both have happened, whichever came first. A recorded word was also published while the client was connected, because the double refuses every
+     * publish while it is not.
      */
     let wordsAtAbort = mqtt.publishedTo(AVAILABILITY).slice(before);
 
@@ -522,15 +576,16 @@ describe("HydrawisePlatform configure", () => {
   test("a refused offline word holds nothing up: shutdown resolves at once and the abort still runs", async () => {
 
     // Debug is on so the refusal's debug line reaches the capture, through the warn channel the platform's debug gate emits on.
-    const { emit, entries, platform, registered } = buildPlatform({ debug: true });
+    const built = buildPlatform({ debug: true, mqttUrl: BROKER_URL });
+    const { emit, entries, platform, registered } = built;
+    const mqtt = builtMqtt(built);
 
-    await using mqtt = installMqttDouble(platform);
     await using dispatcher = installMockDispatcher();
     programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => registered().length >= 1, { description: "the first accessory registration" });
+    await settleUntil(() => registered().length >= 1, { description: "the first accessory registration" });
 
     // The broker session is gone, so the word is refused at once, as the library's client refuses a publish it holds no session for.
     mqtt.connected = false;
@@ -544,35 +599,40 @@ describe("HydrawisePlatform configure", () => {
       "the controller's handler notes the refusal at debug with its topic, since the plugin is stopping and the user has nothing to act on");
   });
 
-  test("a word the broker never takes holds the teardown for the grace at most, and the abort still runs", async (t) => {
+  test("a word the broker never takes holds the teardown for the grace at most, and the abort still runs", async () => {
 
     // Debug is on so the abandoned word's debug line reaches the capture, through the warn channel the platform's debug gate emits on.
-    const { emit, entries, platform } = buildPlatform({ debug: true });
+    const built = buildPlatform({ debug: true, mqttUrl: BROKER_URL });
+    const { clock, emit, entries, platform } = built;
+    const mqtt = builtMqtt(built);
 
-    await using mqtt = installMqttDouble(platform);
     await using dispatcher = installMockDispatcher();
     programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => mqtt.publishedTo(AVAILABILITY).at(-1)?.payload === "online", { description: "the controller's first online word" });
+    await settleUntil(() => mqtt.publishedTo(AVAILABILITY).at(-1)?.payload === "online", { description: "the controller's first online word" });
 
-    /* The end arms its default grace on the platform's clock, the system clock, which reads the global timers the mock replaces from here on, so the row crosses
-     * the grace in virtual time rather than waiting it out. The hold is never released: it stands for a broker that never takes the write, so only the grace can
-     * end the wait.
+    /* The end arms its default grace on the platform's clock, the one the factory handed the client, so the row crosses the grace by stepping that clock. The hold
+     * is never released: it stands for a broker that never takes the write, so only the grace can end the wait. The teardown is read through the turns that
+     * follow the step rather than awaited, so a grace left off the platform's clock cannot end it in real time inside the row's own timeout.
      */
-    t.mock.timers.enable({ apis: ["setTimeout"] });
     mqtt.holdPublishes();
 
-    const shutdown = platform.shutdown();
+    let tornDown = false;
 
-    t.mock.timers.tick(MQTT_DEFAULT_END_GRACE_MS - 1);
+    void platform.shutdown().then((): void => {
+
+      tornDown = true;
+    });
+
+    clock.advance(MQTT_DEFAULT_END_GRACE_MS - 1);
     await settle();
 
     assert.equal(platform.signal.aborted, false, "the teardown waits out the grace for a word still being written");
 
-    t.mock.timers.tick(1);
-    await shutdown;
+    clock.advance(1);
+    await settleUntil(() => tornDown, { description: "the grace to end the wait for the word and the teardown to run" });
 
     assert.equal(platform.signal.aborted, true, "the grace ends the wait, and the abort runs");
     assert.equal(mqtt.publishedTo(AVAILABILITY).at(-1)?.payload, "online", "the abandoned word was never recorded");
@@ -667,7 +727,7 @@ describe("HydrawisePlatform restore-time refusal and unconfigured availability",
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => platform.configuredDevices[platform.hap.uuid.generate(OWNER.controllerId.toString())]?.unavailable === false,
+    await settleUntil(() => platform.configuredDevices[platform.hap.uuid.generate(OWNER.controllerId.toString())]?.unavailable === false,
       { description: "the controller's first poll to land" });
 
     assert.equal(await triggerGet(active(controller)), Characteristic.Active.ACTIVE, "the claimed accessory answers once its controller reaches Hydrawise");
@@ -686,7 +746,7 @@ describe("HydrawisePlatform restore-time refusal and unconfigured availability",
     programStatusReply(dispatcher.agent, "customerdetails.php", 404);
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => loggedAt(entries, "error", "Invalid API key"), { description: "an error line containing \"Invalid API key\"" });
+    await settleUntil(() => loggedAt(entries, "error", "Invalid API key"), { description: "an error line containing \"Invalid API key\"" });
 
     await assert.rejects(() => triggerGet(active(controller)), noResponse, "the controller accessory still refuses");
     await assert.rejects(() => triggerGet(active(zone, "700002")), noResponse, "and so does the zone accessory");
@@ -710,7 +770,7 @@ describe("HydrawisePlatform restore-time refusal and unconfigured availability",
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => platform.configuredDevices[platform.hap.uuid.generate(OWNER.controllerId.toString())]?.unavailable === false,
+    await settleUntil(() => platform.configuredDevices[platform.hap.uuid.generate(OWNER.controllerId.toString())]?.unavailable === false,
       { description: "the controller's first poll to land" });
 
     await assert.rejects(() => triggerGet(active(malformed)), noResponse, "an accessory nothing in this run vouches for refuses");
@@ -718,22 +778,13 @@ describe("HydrawisePlatform restore-time refusal and unconfigured availability",
 
   test("a restored controller this run does not build is stated offline, retained, on connect and after discovery, and a built one is not", async (t) => {
 
-    // The client is the library's real one, pointed at a port nothing listens on, with its connect registration and its guarded publish recorded rather than run,
-    // so the platform's own registration is what a session's arrival drives.
-    const connects: MqttConnectHandler[] = [];
-    const publishes: { init: unknown; payload: unknown; topic: string }[] = [];
-
-    t.mock.method(MqttClient.prototype, "onConnect", (handler: MqttConnectHandler): void => {
-
-      connects.push(handler);
-    });
-
-    t.mock.method(MqttClient.prototype, "publishGuarded", (topic: string, payload: unknown, init?: unknown): void => {
-
-      publishes.push({ init, payload, topic });
-    });
-
-    const { emit, platform } = buildPlatform({ mqttUrl: "mqtt://127.0.0.1:1", options: ["Disable.Device." + DISABLED.serial_number] });
+    /* The client is the factory double the platform built, which held its session from the start, so the platform's connect registration has run on no session
+     * yet. The row drives each session through the double's connection lever, whose false-to-true edge runs every connect registration, as a broker session's
+     * arrival runs them on the platform's real client.
+     */
+    const built = buildPlatform({ mqttUrl: BROKER_URL, options: ["Disable.Device." + DISABLED.serial_number] });
+    const { emit, platform } = built;
+    const mqtt = builtMqtt(built);
 
     t.after(() => emit(SHUTDOWN));
     await using dispatcher = installMockDispatcher();
@@ -741,41 +792,53 @@ describe("HydrawisePlatform restore-time refusal and unconfigured availability",
     restoreController(platform);
     restoreController(platform, { controllerId: DISABLED.controller_id, name: DISABLED.name, serialNumber: DISABLED.serial_number });
 
-    // The platform registered its statement at construction, before any controller existed, so it is the first registration recorded.
-    const platformConnect = present(connects[0], "the platform's connect registration");
+    // Every word recorded on one controller's availability topic, and the platform's statement among them: a retained offline.
+    const words = (serial: string): string[] => mqtt.publishedTo(serial + "/availability").map(entry => entry.payload.toString());
+    const statedOffline = (serial: string, since = 0): number => mqtt.publishedTo(serial + "/availability").slice(since)
+      .filter(entry => (entry.payload === "offline") && entry.retain).length;
+    const startSession = async (): Promise<void> => {
 
-    // The statement the platform makes: retained offline, with no change gate, which is what tells it apart from a controller stating its own word.
-    const statedOffline = (serial: string, since = 0): number => publishes.slice(since).filter(entry => (entry.topic === serial + "/availability") &&
-      (entry.payload === "offline") && (JSON.stringify(entry.init) === JSON.stringify({ retain: true }))).length;
+      mqtt.connected = false;
+      mqtt.connected = true;
+      await settle();
+    };
 
-    await platformConnect();
+    await startSession();
 
     assert.equal(statedOffline(OWNER.serialNumber), 1, "before discovery the controller about to be built is not yet built, so it is stated offline");
     assert.equal(statedOffline(DISABLED.serial_number), 1, "and so is the disabled one");
 
-    const beforeDiscovery = publishes.length;
+    const ownerBefore = words(OWNER.serialNumber).length;
+    const disabledBefore = words(DISABLED.serial_number).length;
 
     programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails({ controllers: [ { ...syntheticController }, { ...DISABLED } ] }));
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
+    /* The end of discovery states the disabled controller again in the session already held. The double records a change-gated repeat only when its payload
+     * differs, so a second identical offline recorded here is the witness that the platform's statement carries no change gate.
+     */
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => statedOffline(DISABLED.serial_number, beforeDiscovery) >= 1, { description: "the end of discovery to state the disabled controller" });
+    await settleUntil(() => statedOffline(DISABLED.serial_number, disabledBefore) >= 1, { description: "the end of discovery to state the disabled controller" });
+    await settleUntil(() => words(OWNER.serialNumber).at(-1) === "online", { description: "the built controller's first online word" });
 
-    assert.equal(statedOffline(OWNER.serialNumber, beforeDiscovery), 0, "discovery states nothing for the controller it built");
+    assert.deepEqual(words(OWNER.serialNumber).slice(ownerBefore), [ "offline", "online" ],
+      "discovery states nothing for the controller it built: its topic carries the controller's own words alone, offline as it is built and online once it polls");
 
-    const afterDiscovery = publishes.length;
+    const ownerAfter = words(OWNER.serialNumber).length;
+    const disabledAfter = words(DISABLED.serial_number).length;
 
-    await platformConnect();
+    await startSession();
 
-    assert.equal(statedOffline(DISABLED.serial_number, afterDiscovery), 1, "a later session restates the disabled controller, its accessory long removed");
-    assert.equal(statedOffline(OWNER.serialNumber, afterDiscovery), 0, "and leaves the built controller to state its own word");
+    assert.equal(statedOffline(DISABLED.serial_number, disabledAfter), 1, "a later session restates the disabled controller, its accessory long removed");
+    assert.equal(statedOffline(OWNER.serialNumber, ownerAfter), 0, "and leaves the built controller to state its own word");
   });
 
   test("shutdown states the controller it built offline and leaves a restored controller it did not build to the word already standing", async () => {
 
-    const { emit, platform } = buildPlatform({ options: ["Disable.Device." + DISABLED.serial_number] });
+    const built = buildPlatform({ mqttUrl: BROKER_URL, options: ["Disable.Device." + DISABLED.serial_number] });
+    const { emit, platform } = built;
+    const mqtt = builtMqtt(built);
 
-    await using mqtt = installMqttDouble(platform);
     await using dispatcher = installMockDispatcher();
 
     restoreController(platform);
@@ -788,8 +851,8 @@ describe("HydrawisePlatform restore-time refusal and unconfigured availability",
 
     // Discovery states the disabled controller offline once it has settled which controllers it builds, so that word is the one standing when shutdown begins.
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => mqtt.publishedTo(unbuilt).length >= 1, { description: "the end of discovery to state the disabled controller" });
-    await waitUntil(() => mqtt.publishedTo(AVAILABILITY).at(-1)?.payload === "online", { description: "the built controller's first online word" });
+    await settleUntil(() => mqtt.publishedTo(unbuilt).length >= 1, { description: "the end of discovery to state the disabled controller" });
+    await settleUntil(() => mqtt.publishedTo(AVAILABILITY).at(-1)?.payload === "online", { description: "the built controller's first online word" });
 
     const unbuiltBefore = mqtt.publishedTo(unbuilt).length;
 
@@ -818,7 +881,7 @@ describe("HydrawisePlatform feature option startup lines", () => {
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => registered().length === 2, { description: "both controllers' accessories to register" });
+    await settleUntil(() => registered().length === 2, { description: "both controllers' accessories to register" });
 
     return linesAt(entries, "info").filter(line => line.includes(label));
   }

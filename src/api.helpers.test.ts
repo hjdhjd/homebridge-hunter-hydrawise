@@ -1,13 +1,13 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
  * api.helpers.test.ts: Self-test for the API response factories. Asserts the factory defaults, the override merge, the scenario composers' distinguishing
- * shapes, the fast-cadence stamp, and the fresh-clone-per-call isolation that keeps production's reassign-and-trim from leaking across tests.
+ * shapes, and the fresh-clone-per-call isolation that keeps production's reassign-and-trim from leaking across tests.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
 /* eslint-disable camelcase */
 import { UNSCHEDULED_SENTINEL, allRelayIds } from "./api.fixtures.ts";
-import { allSuspended, fastPolling, makeCustomerDetails, makeStatusSchedule, makeZone, normalSchedule, rainStopped } from "./api.helpers.ts";
+import { allSuspended, makeCustomerDetails, makeStatusSchedule, makeZone, normalSchedule, rainStopped } from "./api.helpers.ts";
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { expectAt } from "homebridge-plugin-utils/testing";
@@ -101,14 +101,5 @@ describe("scenario composers", () => {
 
     assert.ok(schedule.relays.every(zone => zone.time === UNSCHEDULED_SENTINEL), "every suspended zone carries the unscheduled sentinel");
     assert.equal(expectAt(schedule.sensors, 0, "sensor").relays.length, 0, "the bare sensor references no zone, distinguishing suspend from a rain stop");
-  });
-
-  test("fastPolling accelerates the cadence on a fresh clone", () => {
-
-    const base = normalSchedule();
-    const fast = fastPolling(base);
-
-    assert.equal(fast.nextpoll, 0.05, "fastPolling stamps the fast cadence");
-    assert.equal(base.nextpoll, 60, "fastPolling leaves the base untouched");
   });
 });

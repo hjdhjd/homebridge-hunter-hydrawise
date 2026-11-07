@@ -16,7 +16,7 @@ import { HYDRAWISE_ZONE_FALLBACK_NAME, controllerIdentity, zoneAccessoryId, zone
 import type { HydrawiseControllerConfig, HydrawiseZoneConfig, HydrawiseZoneIdentity } from "./types.ts";
 import { buildPlatform, installMockDispatcher, programJsonReply, seedAccessory } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
-import { formatLogEntry, logCount, loggedAt, waitUntil } from "homebridge-plugin-utils/testing";
+import { formatLogEntry, logCount, loggedAt, settleUntil } from "homebridge-plugin-utils/testing";
 import { makeCustomerDetails, makeStatusSchedule, makeZone, normalSchedule } from "./api.helpers.ts";
 import type { HydrawisePlatform } from "./platform.ts";
 import type { PlatformAccessory } from "homebridge";
@@ -401,7 +401,7 @@ describe("HydrawisePlatform zone accessories (orphan sweep)", () => {
     emit(DID_FINISH_LAUNCHING);
 
     // The controller accessory's mark lands inside configureController, which the sweep follows in the same synchronous frame, and the save view closes its window.
-    await waitUntil(() => updated().length >= 1, { description: "the first accessory cache update" });
+    await settleUntil(() => updated().length >= 1, { description: "the first accessory cache update" });
 
     assert.equal(unregistered().length, 0, "the sweep leaves a zone accessory whose owner is present and enabled in place");
     assert.ok(!loggedAt(entries, "error", "stopped unexpectedly"), "and discovery ran through the sweep without a fault, so the kept accessory is the sweep's verdict");
@@ -422,7 +422,7 @@ describe("HydrawisePlatform zone accessories (orphan sweep)", () => {
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => unregistered().length >= 1, { description: "the first accessory unregistration" });
+    await settleUntil(() => unregistered().length >= 1, { description: "the first accessory unregistration" });
 
     assert.equal(unregistered()[0]?.UUID, zoneUuid(platform, 500999, 700099), "a zone accessory whose owner the account does not list is swept away");
     assert.ok(!loggedAt(entries, "error", "stopped unexpectedly"), "and the bridge accepted the unregistration, so discovery ran on past the sweep");
@@ -441,7 +441,7 @@ describe("HydrawisePlatform zone accessories (orphan sweep)", () => {
     programJsonReply(dispatcher.agent, "customerdetails.php", makeCustomerDetails());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => unregistered().length >= 1, { description: "the first accessory unregistration" });
+    await settleUntil(() => unregistered().length >= 1, { description: "the first accessory unregistration" });
 
     assert.equal(unregistered()[0]?.UUID, zoneUuid(platform, 500001, 700001), "a zone accessory whose owner is disabled is swept away with it");
     assert.ok(!loggedAt(entries, "error", "stopped unexpectedly"), "and the bridge accepted the unregistration, so discovery ran on past the sweep");
@@ -464,7 +464,7 @@ describe("HydrawisePlatform zone accessories (orphan sweep)", () => {
     programJsonReply(dispatcher.agent, "statusschedule.php", normalSchedule());
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => unregistered().length >= 1, { description: "the first accessory unregistration" });
+    await settleUntil(() => unregistered().length >= 1, { description: "the first accessory unregistration" });
 
     assert.equal(unregistered()[0]?.UUID, zoneUuid(platform, 500001, 700001),
       "an unreadable context takes the controller arm and is swept, so the next poll can rebuild it");
@@ -487,8 +487,8 @@ describe("HydrawisePlatform zone accessories (names HomeKit cannot carry)", () =
     programJsonReply(dispatcher.agent, "statusschedule.php", makeStatusSchedule({ relays: [zoneFixture({ name: "\u{1F331}" })] }));
 
     emit(DID_FINISH_LAUNCHING);
-    await waitUntil(() => registered().some((accessory) => accessory.UUID === zoneUuid(platform, syntheticController.controller_id, ZONE_RELAY_ID)),
-      { description: "the zone's own accessory registration", timeoutMs: 5000 });
+    await settleUntil(() => registered().some((accessory) => accessory.UUID === zoneUuid(platform, syntheticController.controller_id, ZONE_RELAY_ID)),
+      { description: "the zone's own accessory registration" });
 
     const promoted = registered().find((accessory) => accessory.UUID === zoneUuid(platform, syntheticController.controller_id, ZONE_RELAY_ID));
 

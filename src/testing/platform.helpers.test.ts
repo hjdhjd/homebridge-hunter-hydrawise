@@ -26,10 +26,8 @@ describe("RetrieveRecorder", () => {
 
     recorder.programDefault("statusschedule.php", { body: { nextpoll: 42 }, kind: "response" });
 
-    const response = await recorder.retrieve("statusschedule.php", { controller_id: "500001" });
-
-    assert.ok(response, "a programmed response should be returned");
-    assert.deepEqual(await response.body.json(), { nextpoll: 42 }, "the response body should answer the programmed data");
+    assert.deepEqual(await recorder.retrieve("statusschedule.php", { controller_id: "500001" }), { body: { nextpoll: 42 }, status: "parsed" },
+      "a programmed response answers its body as parsed");
     assert.equal(recorder.callsTo("statusschedule.php").length, 1, "the call should be recorded");
     assert.equal(recorder.calls[0]?.params?.["controller_id"], "500001", "the recorded call should carry the params");
   });
@@ -42,21 +40,19 @@ describe("RetrieveRecorder", () => {
     recorder.program("statusschedule.php", { kind: "null" });
     recorder.programDefault("statusschedule.php", { body: { nextpoll: 99 }, kind: "response" });
 
-    assert.deepEqual(await (await recorder.retrieve("statusschedule.php"))?.body.json(), { nextpoll: 1 }, "the first queued response is consumed first");
+    assert.deepEqual(await recorder.retrieve("statusschedule.php"), { body: { nextpoll: 1 }, status: "parsed" }, "the first queued response is consumed first");
     assert.equal(await recorder.retrieve("statusschedule.php"), null, "the second queued response is the null shape");
-    assert.deepEqual(await (await recorder.retrieve("statusschedule.php"))?.body.json(), { nextpoll: 99 }, "the drained queue falls to the default");
+    assert.deepEqual(await recorder.retrieve("statusschedule.php"), { body: { nextpoll: 99 }, status: "parsed" }, "the drained queue falls to the default");
   });
 
-  test("a malformed response rejects on body.json()", async () => {
+  test("a malformed response answers an unreadable read carrying its error", async () => {
 
     const recorder = new RetrieveRecorder();
 
     recorder.programDefault("statusschedule.php", { kind: "malformed" });
 
-    const response = await recorder.retrieve("statusschedule.php");
-
-    assert.ok(response, "a malformed response is still non-null");
-    await assert.rejects(() => response.body.json(), /Malformed response body/, "the malformed body should reject when parsed");
+    assert.deepEqual(await recorder.retrieve("statusschedule.php"), { error: new Error("Malformed response body."), status: "unreadable" },
+      "a malformed response is an answered request whose body could not be read");
   });
 });
 

@@ -13,23 +13,18 @@
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { Characteristic, Service, buildController, makeV2Facts, pollsCompleted, waitFor } from "./testing/platform.helpers.ts";
+import type { BuildControllerOptions, BuildControllerResult } from "./testing/platform.helpers.ts";
+import { Characteristic, Service, advanceThroughPolls, buildController, crossRevertDelay, makeV2Facts, pollSleep } from "./testing/platform.helpers.ts";
 import type { HydrawiseCommandOutcome, HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
 import { describe, test } from "node:test";
-import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
-import { logCount, loggedAt, triggerGet, triggerSet, waitUntil } from "homebridge-plugin-utils/testing";
-import type { BuildControllerResult } from "./testing/platform.helpers.ts";
+import { logCount, loggedAt, present, settle, settleUntil, triggerGet, triggerSet } from "homebridge-plugin-utils/testing";
+import { makeStatusSchedule, makeZone } from "./api.helpers.ts";
 import { HYDRAWISE_COMMAND_ATTEMPTS } from "./settings.ts";
 import type { Service as HapService } from "homebridge";
 import assert from "node:assert/strict";
 import { bareSensors } from "./api.fixtures.ts";
-import { setTimeout as delay } from "node:timers/promises";
 
 const SUSPEND_ALL_ON = "Enable.Device.Suspend.All.SN0A1B2C3D4";
-
-// How long, in milliseconds, a row gives a write that should have returned at once before it calls the write held. A write that returns at once settles within
-// a few turns, so the span separates the two however the machine is loaded.
-const SETTLE_MS = 500;
 
 // A zone running now, so the wire reads the account as not suspended and the Suspend All switch reads off with nothing pending.
 function runningZone(): HydrawiseZoneConfig {
@@ -43,29 +38,37 @@ function scheduledZone(): HydrawiseZoneConfig {
   return makeZone({ name: "Bravo", relay: 2, relay_id: 700002, run: 480, time: 68000, timestr: "16:00" });
 }
 
-// A fast-cadence status body carrying the given zones and a sensor block covering nothing.
+// A wire-realistic status body carrying the given zones and a sensor block covering nothing, so a row that wants a later poll steps the controller's clock across
+// the sleep the wire asks for.
 function schedule(zones: HydrawiseZoneConfig[]): StatusScheduleResponse {
 
-  return fastPolling(makeStatusSchedule({ relays: zones, sensors: bareSensors }));
+  return makeStatusSchedule({ relays: zones, sensors: bareSensors });
 }
 
-// A controller with the Suspend All switch, polling a running zone and a scheduled one, once its first poll has landed and the switch answers HomeKit.
-async function suspendAllController(options: Parameters<typeof buildController>[0] = {}): Promise<{ h: BuildControllerResult; valve: HapService;
+// The sleep between polls of that body, the one entry a controller with nothing else pending holds on its clock.
+const sleep = pollSleep(schedule([]));
+
+/* A controller with the Suspend All switch, polling a running zone and a scheduled one on a clock the row steps, once its first poll has landed and the switch
+ * answers HomeKit. The first poll goes out as the controller is built and lands within turns, so nothing waits on the clock for it.
+ */
+async function suspendAllController(options: BuildControllerOptions = {}): Promise<{ h: BuildControllerResult; valve: HapService;
   suspend: HapService; }> {
 
-  const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([ runningZone(), scheduledZone() ]),
-    kind: "response" }), signalAborted: false, userOptions: [SUSPEND_ALL_ON], ...options });
+  const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php",
+    { body: schedule([ runningZone(), scheduledZone() ]), kind: "response" }), signalAborted: false, userOptions: [SUSPEND_ALL_ON], ...options });
 
-  const valve = await waitFor(() => h.accessory.getServiceById(Service.Valve, "700002"), { description: "the valve for zone 700002 to appear" });
-  const suspend = await waitFor(() => h.accessory.getServiceById(Service.Switch, "All"), { description: "the suspend-all switch to appear" });
+  await settleUntil(() => (h.accessory.getServiceById(Service.Valve, "700002") !== undefined) && (h.accessory.getServiceById(Service.Switch, "All") !== undefined),
+    { description: "the valve for zone 700002 and the suspend-all switch to appear" });
 
-  return { h, suspend, valve };
+  return { h, suspend: present(h.accessory.getServiceById(Service.Switch, "All"), "the suspend-all switch"),
+    valve: present(h.accessory.getServiceById(Service.Valve, "700002"), "the valve for zone 700002") };
 }
 
-// The Suspend All commands the controller sent, in order, as the direction each went.
+// The Suspend All commands the controller sent, in order, as the direction each went: a suspension runs past the instant the controller's clock reads, and a
+// resume carries that instant itself.
 function suspendAlls(h: BuildControllerResult): string[] {
 
-  return h.commands.params.filter(params => params["action"] === "suspendall").map(params => (Number(params["custom"]) > (Date.now() / 1000)) ? "suspend" : "resume");
+  return h.commands.params.filter(params => params["action"] === "suspendall").map(params => (Number(params["custom"]) > (h.clock.now() / 1000)) ? "suspend" : "resume");
 }
 
 /* Put a Suspend All in flight and take the switch back while it is, answer the Suspend All with the given outcome, and tap the switch on again before the choice
@@ -104,7 +107,8 @@ describe("HydrawiseController command queue", () => {
     const held = h.commands.hold();
     const write = triggerSet(suspend.getCharacteristic(Characteristic.On), true).then(() => "returned");
 
-    assert.equal(await Promise.race([ write, delay(SETTLE_MS).then(() => "held") ]), "returned", "HomeKit's write returns without waiting on Hydrawise");
+    // A write that returns at once settles within a turn or two, while the command it answers stays held in flight until the row releases it.
+    assert.equal(await Promise.race([ write, settle(2).then(() => "held") ]), "returned", "HomeKit's write returns without waiting on Hydrawise");
 
     await held.reached;
     held.release();
@@ -168,7 +172,7 @@ describe("HydrawiseController command queue", () => {
 
     await triggerSet(suspend.getCharacteristic(Characteristic.On), true);
     await held.reached;
-    await pollsCompleted(h, h.retrieve.callsTo("statusschedule.php").length + 1);
+    await advanceThroughPolls(h, h.retrieve.callsTo("statusschedule.php").length + 1);
 
     // The wire still reports a zone running, which reads the account as not suspended, and every poll writes the switch from its reader.
     assert.equal(suspend.getCharacteristic(Characteristic.On).value, true, "the poll writes the pending choice rather than the wire's reading");
@@ -310,9 +314,12 @@ describe("HydrawiseController command queue", () => {
 
     first.release({ status: "timeout" });
     await resend.reached;
-    await delay(SETTLE_MS / 5);
+
+    // The queue sends on promises alone, so the turns that would carry the run out beside the resend pass here.
+    await settle();
 
     assert.deepEqual(h.commands.params.map(params => params["action"]), [ "suspendall", "suspendall" ], "the resend is the one command in flight, the run behind it");
+    assert.deepEqual([ h.clock.pending, h.clock.nextDeadline ], [ 1, sleep ], "with the next poll's sleep the one entry on the clock, so no send waits on a step");
 
     resend.release();
     await h.controller.commandsIdle;
@@ -328,6 +335,9 @@ describe("HydrawiseController command queue", () => {
 
     h.commands.program({ status: "timeout" }, { status: "timeout" });
 
+    // A snapshot requested before the tap, read from the controller's clock on that side of the command.
+    const requestedAt = Math.floor(h.clock.now() / 1000);
+
     await triggerSet(suspend.getCharacteristic(Characteristic.On), true);
     await h.controller.commandsIdle;
 
@@ -336,8 +346,10 @@ describe("HydrawiseController command queue", () => {
     assert.equal(logCount(h.entries, "info", "Suspending scheduled watering for all zones."), 1, "the confirmation is taken once");
     assert.equal(h.entries.filter(line => line.level === "warn").length, 0, "with nothing to warn about");
 
-    // The confirmation stamped the record, so a snapshot older than it leaves the switch on even though the wire reads the account as running.
-    h.controller.applyFacts({ facts: makeV2Facts(), fetchedAt: Math.floor(Date.now() / 1000) - 100 });
+    /* The confirmation stamped the record, so a snapshot requested before it leaves the switch on even though the wire reads the account as running. The clock has
+     * not moved since the tap, so the snapshot shares the confirmation's own second, the closest a snapshot can come and still not postdate the command.
+     */
+    h.controller.applyFacts({ facts: makeV2Facts(), fetchedAt: requestedAt });
 
     assert.equal(await triggerGet(suspend.getCharacteristic(Characteristic.On)), true, "the switch stays on");
   });
@@ -352,8 +364,9 @@ describe("HydrawiseController command queue", () => {
 
     await triggerSet(suspend.getCharacteristic(Characteristic.On), true);
     await h.controller.commandsIdle;
-    await waitUntil(() => suspend.getCharacteristic(Characteristic.On).value === false, { description: "the suspend-all switch to read off" });
+    await crossRevertDelay(h.clock);
 
+    assert.equal(suspend.getCharacteristic(Characteristic.On).value, false, "the switch is put back once the revert delay passes");
     assert.equal(h.commands.calls.length, HYDRAWISE_COMMAND_ATTEMPTS, "the command is sent as many times as an unanswered command earns and no more");
     assert.equal(logCount(h.entries, "warn", "All zones: Hydrawise did not answer the suspend command after " + HYDRAWISE_COMMAND_ATTEMPTS.toString() +
       " attempts, so it shows its last confirmed state."), 1, "the warning is said once, counting the attempts it made");
@@ -370,8 +383,9 @@ describe("HydrawiseController command queue", () => {
 
     await triggerSet(suspend.getCharacteristic(Characteristic.On), true);
     await h.controller.commandsIdle;
-    await waitUntil(() => suspend.getCharacteristic(Characteristic.On).value === false, { description: "the suspend-all switch to read off" });
+    await crossRevertDelay(h.clock);
 
+    assert.equal(suspend.getCharacteristic(Characteristic.On).value, false, "the switch is put back once the revert delay passes");
     assert.equal(h.commands.calls.length, 1, "a failure a resend would only meet again is not resent");
     assert.equal(logCount(h.entries, "error", "Unable to complete the suspend request."), 1, "and the switch says the command did not take");
   });
@@ -392,12 +406,15 @@ describe("HydrawiseController command queue", () => {
 
     held.release();
     await h.controller.commandsIdle;
-    await delay(SETTLE_MS / 5);
+
+    // The queue sends on promises alone, so the turns that would carry the waiting run out pass here.
+    await settle();
 
     assert.equal(h.commands.calls.length, 1, "the run still waiting its turn is never sent");
     assert.equal(logCount(h.entries, "info", "scheduled watering for all zones"), 0, "a confirmation landing after shutdown is not taken");
     assert.equal(h.entries.filter(line => [ "error", "warn" ].includes(line.level)).length, 0, "and nothing is said");
     assert.equal(suspend.getCharacteristic(Characteristic.On).value, true, "the switch is left where the tap put it");
+    assert.equal(h.clock.pending, 0, "with the poll's sleep ended by the shutdown and no write left armed on the clock to land later");
   });
 
   test("sends follow the order of the latest taps", async (t) => {
@@ -409,7 +426,7 @@ describe("HydrawiseController command queue", () => {
     // A held stop keeps the one command in flight while the taps below queue behind it. The valve's run, tapped first, is tapped again with a new length after the
     // Suspend All, which moves it behind the Suspend All.
     const held = h.commands.hold();
-    const alpha = await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001"), { description: "the valve for zone 700001 to appear" });
+    const alpha = present(h.accessory.getServiceById(Service.Valve, "700001"), "the valve for zone 700001, which the first poll hosts");
 
     await triggerSet(alpha.getCharacteristic(Characteristic.Active), Characteristic.Active.INACTIVE);
     await held.reached;
@@ -456,7 +473,7 @@ describe("HydrawiseController command queue", () => {
     await triggerSet(suspend.getCharacteristic(Characteristic.On), true);
 
     // The account reports the controller offline while the Suspend All waits its turn.
-    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: Math.floor(Date.now() / 1000) });
+    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: Math.floor(h.clock.now() / 1000) });
 
     held.release();
     await h.controller.commandsIdle;
@@ -502,7 +519,7 @@ describe("HydrawiseController valve commands", () => {
 
     // Every later poll reads this body, so the wire reports no zones from the moment the poll counted here completes.
     h.retrieve.programDefault("statusschedule.php", { body: schedule([]), kind: "response" });
-    await pollsCompleted(h, h.retrieve.callsTo("statusschedule.php").length + 1);
+    await advanceThroughPolls(h, h.retrieve.callsTo("statusschedule.php").length + 1);
 
     held.release();
     await h.controller.commandsIdle;
@@ -521,8 +538,9 @@ describe("HydrawiseController valve commands", () => {
 
     await triggerSet(valve.getCharacteristic(Characteristic.Active), Characteristic.Active.ACTIVE);
     await h.controller.commandsIdle;
-    await waitUntil(() => valve.getCharacteristic(Characteristic.Active).value === Characteristic.Active.INACTIVE, { description: "the valve to read inactive" });
+    await crossRevertDelay(h.clock);
 
+    assert.equal(valve.getCharacteristic(Characteristic.Active).value, Characteristic.Active.INACTIVE, "the valve is put back once the revert delay passes");
     assert.ok(loggedAt(h.entries, "error", "Bravo [Zone 2]: Unable to start this zone. Zone is disabled."), "the refusal names the zone and Hydrawise's reason");
     assert.ok(!loggedAt(h.entries, "info", "Manually started"), "and nothing is narrated as started");
     assert.notEqual(valve.getCharacteristic(Characteristic.InUse).value, Characteristic.InUse.IN_USE, "nor shown as running");
@@ -538,8 +556,9 @@ describe("HydrawiseController valve commands", () => {
 
     await triggerSet(valve.getCharacteristic(Characteristic.Active), Characteristic.Active.ACTIVE);
     await h.controller.commandsIdle;
-    await waitUntil(() => valve.getCharacteristic(Characteristic.Active).value === Characteristic.Active.INACTIVE, { description: "the valve to read inactive" });
+    await crossRevertDelay(h.clock);
 
+    assert.equal(valve.getCharacteristic(Characteristic.Active).value, Characteristic.Active.INACTIVE, "the valve is put back once the revert delay passes");
     assert.equal(h.commands.calls.length, 1, "a reply that could not be read is not resent");
     assert.equal(logCount(h.entries, "error", "Bravo [Zone 2]: Unable to start this zone. The answer from Hydrawise could not be read."), 1,
       "the zone's line names the zone and the reason");

@@ -1,9 +1,10 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * platform.helpers.ts: The plugin-specific test harness - the Homebridge runtime every suite runs on, the platform double for controller tests, real-platform
- * construction over HBPU's Homebridge API double, the recording MQTT client, the programmable retrieve recorder and command double, the undici MockAgent
- * installer and the body failure it can serve, and the buildController / buildPlatform construction workhorses. Every cast that bridges a double to a production
- * constructor's parameter type is confined to a workhorse, so test bodies stay cast-free.
+ * platform.helpers.ts: The plugin-specific test harness - the Homebridge runtime every suite runs on, the platform double for controller tests and real-platform
+ * construction over HBPU's Homebridge API double, each on a TestClock, the real platform's MQTT client built by HBPU's factory double, the recording MQTT client,
+ * the programmable retrieve recorder and command double, the undici MockAgent installer with the body failure and the held reply end it can serve, the
+ * buildController / buildPlatform construction workhorses, and the waits, clock steps and stamps a row reads a later state through. Every cast that bridges a
+ * double to a production constructor's parameter type is confined to a workhorse, so test bodies stay cast-free.
  *
  * Every accessory a suite reads is Homebridge's own PlatformAccessory over the hap-nodejs copy Homebridge loads, made through HBPU's Homebridge test double, so
  * HAP's own defaults, UUID validation, bridge and read and write paths apply to every row. Each accessory the harness builds reaches the double's bridge the way
@@ -11,7 +12,7 @@
  * registered. Every view of the accessory calls a suite reads is derived from the double's one record of them.
  *
  * The wire boundaries are by design. Controller tests never touch undici: the platform double's retrieve is a programmable recorder that records every call and
- * returns fixture-programmed response shapes, and its command is a double that records every command and answers a programmed outcome. Platform tests construct
+ * answers the fixture-programmed read of a body, and its command is a double that records every command and answers a programmed outcome. Platform tests construct
  * a REAL HydrawisePlatform and drive its retrieve() through a MockAgent installed as the global dispatcher after construction, so the real status-code
  * classification and error taxonomy run unchanged.
  */
@@ -21,16 +22,19 @@
 // the sunset deletes.
 import "homebridge-plugin-utils/polyfills";
 import type { API, PlatformAccessory } from "homebridge";
-import { AccessoryPersistence, FeatureOptions, TimerRegistry, acquireService, sanitizeName, setAccessoryName, systemClock } from "homebridge-plugin-utils";
+import { AccessoryPersistence, FeatureOptions, TimerRegistry, acquireService, sanitizeName, setAccessoryName } from "homebridge-plugin-utils";
 import type { Clock, HomebridgePluginLogging, Nullable, RateBudget } from "homebridge-plugin-utils";
-import { HYDRAWISE_API_BASE_URL, PLATFORM_NAME, PLUGIN_NAME } from "../settings.ts";
+import { HYDRAWISE_API_BASE_URL, HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_REVERT_DELAY, PLATFORM_NAME, PLUGIN_NAME } from "../settings.ts";
+import { HeldEnd, failingBodies } from "./network.helpers.ts";
 import type { HydrawiseAccessory, HydrawiseCommandOutcome, HydrawiseControllerConfig, HydrawiseControllerHardware, HydrawiseControllerIdentity,
-  HydrawiseControllerV2Facts, HydrawiseRainSensorFacts, HydrawiseV2Read, HydrawiseZoneConfig, HydrawiseZoneV2Facts } from "../types.ts";
+  HydrawiseControllerV2Facts, HydrawiseEndpoint, HydrawiseRainSensorFacts, HydrawiseV2Read, HydrawiseZoneConfig, HydrawiseZoneV2Facts,
+  StatusScheduleResponse } from "../types.ts";
+import type { HydrawiseBodyRead, HydrawisePlatformDefaults } from "../platform.ts";
 import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
-import { TestClock, TestMqttClient, capturingLog, loadHomebridge, present, waitUntil, watchServerWarnings } from "homebridge-plugin-utils/testing";
+import { TestClock, TestMqttClient, TestMqttClientFactory, advanceUntil, capturingLog, loadHomebridge, present, settle, settleUntil,
+  watchServerWarnings } from "homebridge-plugin-utils/testing";
 import type { TestHomebridgeApi, TestHomebridgeApiCall, TestLogEntry, TestPlatformAccessory } from "homebridge-plugin-utils/testing";
 import { featureOptionCategories, featureOptions } from "../options.ts";
-import type { Dispatcher } from "undici";
 import { HydrawiseController } from "../controller.ts";
 import type { HydrawiseOptions } from "../options.ts";
 import { HydrawisePlatform } from "../platform.ts";
@@ -68,17 +72,18 @@ export interface RecordedRetrieveCall {
   params: Record<string, string> | undefined;
 }
 
-/* A single programmed response for the retrieve recorder. "response" resolves body.json() to the given body; "null" returns null (the recoverable-error shape
- * the callers treat as a failed poll or command); "malformed" returns a response whose body.json() rejects (the malformed-body shape behind bug 10).
+/* A single programmed response for the retrieve recorder. "response" answers the given body as parsed; "null" answers null (the recoverable-error shape the
+ * callers treat as a failed poll or command); "malformed" answers an unreadable read carrying its error (the malformed-body shape behind bug 10).
  */
 export type ProgrammedResponse =
-  { body: unknown; kind: "response"; statusCode?: number } |
-  { kind: "malformed"; statusCode?: number } |
+  { body: unknown; kind: "response" } |
+  { kind: "malformed" } |
   { kind: "null" };
 
-/* The programmable retrieve recorder that stands in for the platform's retrieve(). It records every call and answers with a per-endpoint FIFO queue of programmed
- * responses, falling back to a per-endpoint steady default (so a live polling loop keeps receiving the same shape once its queue drains) and finally to null.
- * body.json() returns a fresh deep clone per call, so production's reassign-and-trim of this.status never leaks back into the program.
+/* The programmable retrieve recorder that stands in for the platform's retrieve(), answering what the platform's own retrieve() answers. It records every call
+ * and answers with a per-endpoint FIFO queue of programmed responses, falling back to a per-endpoint steady default (so a live polling loop keeps receiving the
+ * same shape once its queue drains) and finally to null. A parsed body is a fresh deep clone per call, so production's reassign-and-trim of this.status never
+ * leaks back into the program.
  */
 export class RetrieveRecorder {
 
@@ -107,8 +112,10 @@ export class RetrieveRecorder {
     return this.calls.filter(call => call.endpoint === endpoint);
   }
 
-  // The retrieve replacement handed to the platform double. Records the call, then materializes the next programmed response.
-  public readonly retrieve = async (endpoint: string, params?: Record<string, string>): Promise<Nullable<Dispatcher.ResponseData<unknown>>> => {
+  /* The retrieve replacement handed to the platform double. Records the call, then materializes the next programmed response. It is typed by indexed access
+   * against the real method, as the command double is, so a recorder and a controller that disagree on what retrieve() answers fail to compile.
+   */
+  public readonly retrieve: HydrawisePlatform["retrieve"] = async (endpoint, params) => {
 
     this.calls.push({ endpoint, params });
 
@@ -117,25 +124,23 @@ export class RetrieveRecorder {
     return this.materialize(chosen);
   };
 
-  // Turn a programmed response into the response shape the callers consume (a body with an async json()), or null. The cast is confined here: the callers touch
-  // only body.json() and the null check, so the minimal shape is a faithful stand-in for the full ResponseData.
-  private materialize(response: ProgrammedResponse): Nullable<Dispatcher.ResponseData<unknown>> {
+  // Turn a programmed response into what retrieve() answers: null, the body read as parsed, or an unreadable read carrying the error a malformed body meets.
+  private materialize(response: ProgrammedResponse): Nullable<HydrawiseBodyRead> {
 
-    if(response.kind === "null") {
+    switch(response.kind) {
 
-      return null;
+      case "malformed":
+
+        return { error: new Error("Malformed response body."), status: "unreadable" };
+
+      case "null":
+
+        return null;
+
+      case "response":
+
+        return { body: structuredClone(response.body), status: "parsed" };
     }
-
-    if(response.kind === "malformed") {
-
-      return { body: { json: async (): Promise<unknown> => { throw new Error("Malformed response body."); } }, statusCode: response.statusCode ?? 200 } as
-        unknown as Dispatcher.ResponseData<unknown>;
-    }
-
-    const body = response.body;
-
-    return { body: { json: async (): Promise<unknown> => structuredClone(body) }, statusCode: response.statusCode ?? 200 } as unknown as
-      Dispatcher.ResponseData<unknown>;
   }
 }
 
@@ -245,14 +250,14 @@ export type RecordedReconcileCall = Parameters<HydrawisePlatform["reconcileZoneA
 
 // The platform double's read surface, as the controller and its configure chain consume it. The construction-boundary cast to HydrawisePlatform happens in
 // buildController. The api is HBPU's Homebridge API double, through which the controller reaches HAP and its persistence saves, and whose record of those saves
-// is what the harness reads back. reconcileZoneAccessories is typed by indexed access against the real method, so a signature drift is a compile error here
-// rather than a silent mismatch.
+// is what the harness reads back. reconcileZoneAccessories and retrieve are typed by indexed access against the real methods, so a signature drift is a compile
+// error here rather than a silent mismatch.
 export interface TestPlatform {
 
   api: TestHomebridgeApi;
 
   // The time source every wait and stamp a controller takes reads, standing in for the production platform's own clock. Typed as the production Clock because that is
-  // the whole of what a controller consumes; a test that drives time holds its own TestClock handle.
+  // the whole of what a controller consumes; a row steps it through the result's clock, the same TestClock typed as one.
   clock: Clock;
   command: CommandRecorder["command"];
   config: HydrawiseOptions;
@@ -264,7 +269,7 @@ export interface TestPlatform {
   // HBPU's real AccessoryPersistence over the API double, every mark a controller makes going through it as it goes through the platform's own in production.
   persistence: AccessoryPersistence;
   reconcileZoneAccessories: HydrawisePlatform["reconcileZoneAccessories"];
-  retrieve: RetrieveRecorder["retrieve"];
+  retrieve: HydrawisePlatform["retrieve"];
   signal: AbortSignal;
   timers: TimerRegistry;
 }
@@ -274,11 +279,11 @@ export interface TestPlatform {
 // lets a controller construct fully while its polling loop exits silently), and the feature-option strings.
 export interface MakeTestPlatformOptions {
 
-  /* The clock the platform double publishes, defaulting to the system clock. The suites' polling rows run on real time through the fast cadence, so a virtual clock
-   * as the default would hold every one of them at its first sleep; a row that drives time itself passes a TestClock and advances it. The MQTT double arms its
-   * end's grace on the same clock, as the platform's client does, so a row that advances a TestClock while the end is open advances the grace with it.
+  /* The clock the platform double publishes, a fresh TestClock unless the row hands one in, so every poll after the first, every revert and every retry waits until
+   * the row steps it. A row hands in a TestClock of its own only to seed an instant, the calendar day it renders or the wire time it compares against. The MQTT
+   * double arms its end's grace on the same clock, as the platform's client does, so a row that advances the clock while the end is open advances the grace with it.
    */
-  clock?: Clock;
+  clock?: TestClock;
   config?: Partial<HydrawiseOptions>;
   hasV2Client?: boolean;
   mqtt?: boolean;
@@ -292,8 +297,8 @@ export interface MakeTestPlatformResult {
 
   abort: (reason?: string) => Promise<void>;
 
-  // The clock the platform double publishes: the caller's own when it passed one, and the system clock otherwise.
-  clock: Clock;
+  // The clock the platform double publishes, as the TestClock it is: the caller's own when it passed one and a fresh one otherwise, so a row steps it with no cast.
+  clock: TestClock;
 
   // The command double, which records every command the controller sent and answers what a row programmed.
   commands: CommandRecorder;
@@ -320,7 +325,8 @@ export interface MakeTestPlatformResult {
 /* Build a platform double around a REAL FeatureOptions engine seeded with the supplied userOptions, so the production feature-option logic (test / logFeature)
  * runs unchanged. A capturing log records every line and keeps a writable debug slot so a test can interpose on the debug channel; a recording MQTT double
  * captures subscriptions and publishes; the retrieve recorder stands in for the network. The signal starts pre-aborted by default so a constructed controller's
- * loop exits at once; pass signalAborted false for a live-loop test and abort it via the returned lever.
+ * loop exits at once; pass signalAborted false for a live-loop test and abort it via the returned lever. The double publishes a fresh TestClock unless the caller
+ * passes one of its own, and the result hands back whichever it publishes as a TestClock, so a row steps it with no cast.
  */
 export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTestPlatformResult {
 
@@ -332,7 +338,7 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
     signalController.abort("pre-aborted");
   }
 
-  const clock = options.clock ?? systemClock;
+  const clock = options.clock ?? new TestClock();
   const mqtt = options.mqtt ? new TestMqttClient({ clock, log }) : null;
 
   /* The REAL timer registry, not a double. A double stands in for an I/O surface - the recording MQTT client for a network client, the retrieve recorder for the
@@ -517,6 +523,9 @@ export interface BuildControllerResult extends MakeTestPlatformResult {
  * The controller accessory is minted as the platform mints one, under its display name alone, so its information service carries no ConfiguredName until the
  * controller's setup gives it one at construction, from the name the service carries, and that add is a save of its own ahead of the first poll's. A seeded
  * accessory keeps whatever ConfiguredName its seed wrote.
+ *
+ * The controller runs on a fresh TestClock unless the caller passes one of its own, and the result hands back whichever it runs on as a TestClock, as
+ * makeTestPlatform hands it back, so a row steps it with no cast.
  */
 export function buildController(options: BuildControllerOptions = {}): BuildControllerResult {
 
@@ -707,32 +716,6 @@ export function installV2Client(platform: HydrawisePlatform, client: TestV2Clien
 }
 
 /**
- * Run ONE refresh tick against the platform's installed client, exactly as the recurring loop's body runs it.
- *
- * This exists because the loop sleeps a quarter hour between ticks, and the real platform runs on the system clock and takes no other, so nothing a suite holds can
- * advance that sleep. Driving the tick directly is what lets a test observe the SECOND tick's behavior, above all that a failed fetch ends only its own tick and
- * leaves the loop able to distribute on the next one. It is the production method, not a reimplementation of it: what the loop adds around this call is the sleep,
- * which is what these tests deliberately do not wait on.
- *
- * The cast is confined here for the same reason every other private reach in this module is.
- *
- * @param platform - The constructed HydrawisePlatform, whose client the tick will ask.
- *
- * @returns A promise resolving, once the tick has fetched and distributed, to how long in milliseconds the loop would sleep before its next tick.
- */
-export async function refreshV2FactsOnce(platform: HydrawisePlatform): Promise<number> {
-
-  const slot = platform as unknown as { refreshV2Facts: (client: TestV2Client) => Promise<number>; v2Client?: TestV2Client };
-
-  if(!slot.v2Client) {
-
-    throw new Error("refreshV2FactsOnce: the platform has no account-credentialed client installed.");
-  }
-
-  return slot.refreshV2Facts(slot.v2Client);
-}
-
-/**
  * Build a recording double of the account-credentialed client, answering a programmed read and counting how many times it was asked. The count is what the
  * single-start and cadence assertions read: a second refresh loop, or a discovery re-entry that started one, shows up here as extra calls.
  *
@@ -784,12 +767,18 @@ export function makeZoneV2Facts(overrides: Partial<HydrawiseZoneV2Facts> = {}): 
   return { name: overrides.name ?? null, sensorStopped: overrides.sensorStopped ?? null, suspendedUntil: overrides.suspendedUntil ?? null };
 }
 
-// Options for buildPlatform: the platform config the real HydrawisePlatform reads through its bracket-access parameter. The account credentials travel as feature
-// options rather than properties, because that is their only home, so a test that wants them supplies the entries the engine reads.
+/* Options for buildPlatform: the platform config the real HydrawisePlatform reads through its bracket-access parameter, and the injectable defaults it takes as
+ * its fourth argument. The account credentials travel as feature options rather than properties, because that is their only home, so a test that wants them
+ * supplies the entries the engine reads. A clock left unnamed is a fresh TestClock, so every wait and deadline the platform schedules stands until the row steps
+ * it, and a factory left unnamed is the create of the HBPU factory double the harness builds for the platform, so no row reaches a broker unless it hands the
+ * platform HBPU's own factory.
+ */
 export interface BuildPlatformOptions {
 
   apiKey?: string;
+  clock?: TestClock;
   debug?: boolean;
+  mqttFactory?: HydrawisePlatformDefaults["mqttFactory"];
   mqttTopic?: string;
   mqttUrl?: string;
   options?: string[];
@@ -801,6 +790,9 @@ export interface BuildPlatformResult {
 
   api: TestHomebridgeApi;
 
+  // The clock the platform was built on, as the TestClock it is: the caller's own when it passed one and a fresh one otherwise.
+  clock: TestClock;
+
   // Emit a Homebridge lifecycle event on the API double, which is how a test fires DID_FINISH_LAUNCHING (to run the private configureHydrawise) and SHUTDOWN (to
   // drive teardown) explicitly.
   emit: (event: string) => void;
@@ -811,6 +803,10 @@ export interface BuildPlatformResult {
   // The UUIDs whose registration should throw, so a test can drive production's promotion-failure containment. Empty by default, which leaves every registration
   // reaching the API double.
   failRegistrationUuids: Set<string>;
+
+  // HBPU's MQTT factory double the harness built for this platform, on its clock: every call the platform made to it, the configuration and the init it handed
+  // in, and the double each call answered, null where MQTT is off. A row that hands the platform a factory of its own leaves this one uncalled.
+  mqttFactory: TestMqttClientFactory;
   platform: HydrawisePlatform;
 
   // Every accessory a registration the API double accepted carried, in call order.
@@ -820,7 +816,7 @@ export interface BuildPlatformResult {
   unregistered: () => PlatformAccessory[];
 
   // The accessories each cache save the API double accepted carried, one list per save. The read closes the platform's save window first, so a mark made on the
-  // platform's real clock is saved before it is counted rather than a second after.
+  // platform's clock is saved before it is counted rather than once a step of that clock crosses the window.
   updated: () => (readonly PlatformAccessory[])[];
 }
 
@@ -841,10 +837,12 @@ function rejectNamed(failUuids: ReadonlySet<string>, accessories: readonly Platf
 /* Construct a REAL HydrawisePlatform against HBPU's Homebridge API double - the platform-test workhorse. The construction-boundary casts (log, config, api)
  * bridge the doubles and the config literal to the production constructor's parameter types: Homebridge's Logging is a callable with prefix / success / log
  * members, so the plain-object capturing log bridges by cast rather than being reshaped into a callable, and the API double answers only the part of Homebridge's
- * API a plugin reaches. The platform's constructor runs its full networking and MQTT setup; a test installs a MockAgent afterward to drive retrieve().
+ * API a plugin reaches. The platform's constructor runs its full networking and MQTT setup; a test installs a MockAgent afterward to drive retrieve(). The
+ * platform runs on the TestClock the caller passes, or on a fresh one, and the result hands back whichever it runs on as a TestClock.
  */
 export function buildPlatform(options: BuildPlatformOptions = {}): BuildPlatformResult {
 
+  const clock = options.clock ?? new TestClock();
   const log = capturingLog();
   const api = buildApi();
   const failRegistrationUuids = new Set<string>();
@@ -870,9 +868,14 @@ export function buildPlatform(options: BuildPlatformOptions = {}): BuildPlatform
     options: options.options ?? []
   };
 
+  /* HBPU's factory double, one per platform, so a row reads the calls its own platform made. Its own clock is the platform's, the one a double's grace falls back
+   * to when an init names none, and the platform names its clock in every init besides.
+   */
+  const mqttFactory = new TestMqttClientFactory({ clock });
+
   // The construction-boundary casts (log, config, api) bridge the doubles and the config literal to the production constructor's parameter types.
   const platform = new HydrawisePlatform(log as unknown as ConstructorParameters<typeof HydrawisePlatform>[0],
-    config as unknown as ConstructorParameters<typeof HydrawisePlatform>[1], api as unknown as API);
+    config as unknown as ConstructorParameters<typeof HydrawisePlatform>[1], api as unknown as API, { clock, mqttFactory: options.mqttFactory ?? mqttFactory.create });
 
   const updated = (): (readonly PlatformAccessory[])[] => {
 
@@ -881,7 +884,7 @@ export function buildPlatform(options: BuildPlatformOptions = {}): BuildPlatform
     return callsOf(api, "update");
   };
 
-  return { api, emit: (event: string): void => void api.emit(event), entries: log.entries, failRegistrationUuids, platform,
+  return { api, clock, emit: (event: string): void => void api.emit(event), entries: log.entries, failRegistrationUuids, mqttFactory, platform,
     registered: () => callsOf(api, "register").flat(), unregistered: () => callsOf(api, "unregister").flat(), updated };
 }
 
@@ -896,36 +899,51 @@ export interface MockDispatcherHandle extends AsyncDisposable {
   agent: MockAgent;
 }
 
-/* An interceptor that ends every reply the MockAgent serves with an error in place of its end, once the reply's start and its bytes have arrived, so the reply's
- * body fails partway through its read. The MockAgent writes a reply's start, data and end in one pass, so no reply it serves can meet a deadline during the body
- * read without this.
+/**
+ * Match a request's path against one Hydrawise endpoint by substring, so the api_key query string the request carries is ignored. Every reply on the key-based
+ * API, whether this harness programs it or a row intercepts it itself, and every end the harness holds addresses its endpoint through this one match, so a hold
+ * and the replies beside it can never disagree on which requests they name.
+ *
+ * @param endpoint - The endpoint filename to match.
+ *
+ * @returns The match, answering whether a request's path addresses the endpoint.
  */
-function failingBodies(error: Error): Dispatcher.DispatcherComposeInterceptor {
+export function addressesEndpoint(endpoint: HydrawiseEndpoint): (path: string) => boolean {
 
-  return (dispatch) => (options, handler): boolean => dispatch(options, {
+  return (requestPath: string): boolean => requestPath.includes(endpoint);
+}
 
-    onRequestStart: (controller, context: unknown): void => handler.onRequestStart?.(controller, context),
-    onResponseData: (controller, chunk): void => handler.onResponseData?.(controller, chunk),
-    onResponseEnd: (controller): void => handler.onResponseError?.(controller, error),
-    onResponseError: (controller, cause): void => handler.onResponseError?.(controller, cause),
-    onResponseStart: (controller, statusCode, headers, statusMessage): void => handler.onResponseStart?.(controller, statusCode, headers, statusMessage)
-  });
+/**
+ * Hold back the end of every reply on one Hydrawise endpoint until the row releases it, matched as the replies this harness programs are matched. The row builds
+ * it and hands it to the installer, as a held command is handed to the command double, and the installer releases it when it is disposed. Every other endpoint
+ * answers whole, so discovery's controller list arrives entire while a row holds the status fetch.
+ *
+ * @param endpoint - The endpoint whose replies the hold keeps from ending.
+ *
+ * @returns The hold.
+ */
+export function heldEndFor(endpoint: HydrawiseEndpoint): HeldEnd {
+
+  return new HeldEnd(addressesEndpoint(endpoint));
 }
 
 /* Install a MockAgent as undici's global dispatcher, snapshotting the dispatcher in place so dispose restores it exactly. undici's request() reads the global
  * dispatcher fresh per call, so a MockAgent installed after the platform's constructor already armed a real Pool intercepts every retrieve() from that point.
  * The returned handle is an AsyncDisposable bound with `await using`, so the prior dispatcher is restored and the agent closed at scope exit regardless of throw.
  *
- * A body error makes every reply fail partway through its body with that error, which is how a row stands up a deadline met while a reply is being read.
+ * A body error makes every reply fail partway through its body with that error, which is how a row stands up a deadline met while a reply is being read. A held
+ * end keeps the replies on its endpoint mid-read until the row releases it, which is how a row lets a deadline or a shutdown arrive while the body is still being
+ * read; the dispose releases it before the agent closes, so no reply is left unfinished behind the row.
  */
-export function installMockDispatcher({ bodyError }: { bodyError?: Error } = {}): MockDispatcherHandle {
+export function installMockDispatcher({ bodyError, heldEnd }: { bodyError?: Error; heldEnd?: HeldEnd } = {}): MockDispatcherHandle {
 
   const prior = getGlobalDispatcher();
   const agent = new MockAgent();
+  const interceptors = [ ...(bodyError ? [failingBodies(bodyError)] : []), ...(heldEnd ? [heldEnd.interceptor()] : []) ];
 
   // Disable net connect so any unintercepted request fails loudly rather than reaching the real Hydrawise API.
   agent.disableNetConnect();
-  setGlobalDispatcher(bodyError ? agent.compose(failingBodies(bodyError)) : agent);
+  setGlobalDispatcher(interceptors.length ? agent.compose(interceptors) : agent);
 
   return {
 
@@ -933,6 +951,7 @@ export function installMockDispatcher({ bodyError }: { bodyError?: Error } = {})
     async [Symbol.asyncDispose](): Promise<void> {
 
       setGlobalDispatcher(prior);
+      heldEnd?.release();
 
       await agent.close();
     }
@@ -948,9 +967,9 @@ export function installMockDispatcher({ bodyError }: { bodyError?: Error } = {})
  * @param body     - The JSON body to answer with.
  * @param statusCode - The HTTP status to answer with. Defaults to 200.
  */
-export function programJsonReply(agent: MockAgent, endpoint: string, body: object | string, statusCode = 200): void {
+export function programJsonReply(agent: MockAgent, endpoint: HydrawiseEndpoint, body: object | string, statusCode = 200): void {
 
-  agent.get(HYDRAWISE_ORIGIN).intercept({ method: "GET", path: (path: string): boolean => path.includes(endpoint) }).reply(statusCode, body).persist();
+  agent.get(HYDRAWISE_ORIGIN).intercept({ method: "GET", path: addressesEndpoint(endpoint) }).reply(statusCode, body).persist();
 }
 
 /**
@@ -964,11 +983,11 @@ export function programJsonReply(agent: MockAgent, endpoint: string, body: objec
  *
  * @returns A reader for the number of requests served so far.
  */
-export function programCountedReply(agent: MockAgent, endpoint: string, body: object): () => number {
+export function programCountedReply(agent: MockAgent, endpoint: HydrawiseEndpoint, body: object): () => number {
 
   let served = 0;
 
-  agent.get(HYDRAWISE_ORIGIN).intercept({ method: "GET", path: (path: string): boolean => path.includes(endpoint) })
+  agent.get(HYDRAWISE_ORIGIN).intercept({ method: "GET", path: addressesEndpoint(endpoint) })
     .reply(200, (): object => {
 
       served++;
@@ -988,41 +1007,113 @@ export function programCountedReply(agent: MockAgent, endpoint: string, body: ob
  * @param statusCode - The HTTP status to answer with.
  * @param body       - The reply body. Defaults to an empty string.
  */
-export function programStatusReply(agent: MockAgent, endpoint: string, statusCode: number, body: string | object = ""): void {
+export function programStatusReply(agent: MockAgent, endpoint: HydrawiseEndpoint, statusCode: number, body: string | object = ""): void {
 
-  agent.get(HYDRAWISE_ORIGIN).intercept({ method: "GET", path: (path: string): boolean => path.includes(endpoint) }).reply(statusCode, body);
+  agent.get(HYDRAWISE_ORIGIN).intercept({ method: "GET", path: addressesEndpoint(endpoint) }).reply(statusCode, body);
 }
 
 /**
- * Wait for a read to answer a value, and hand that value back. This is the value-consuming form of the library's waitUntil, on its cadence and its deadline: a
- * wait whose result is not used calls waitUntil directly, and a wait that goes on to use what it waited for calls this.
+ * Wait for a read to answer a value the queue settles with no step of the clock, and hand that value back. This is the value-consuming form of HBPU's settleUntil,
+ * on its turn budget, for a value already in place or one the queue puts there within turns, what the first poll and construction establish among them; a value
+ * a later poll, tick or retry produces is read through advanceFor instead.
  *
  * @param read    - Answers the awaited value, or undefined while it is not yet available.
- * @param options - waitUntil's own options: what the wait is for, and optionally its poll interval and deadline.
+ * @param options - settleUntil's own options: what the wait is for, and optionally its turn budget.
  *
  * @returns The value the read answered when the wait was satisfied.
  *
- * @throws If the read answers nothing but undefined within the deadline.
+ * @throws If the turn budget is spent while the read answers nothing but undefined.
  */
-export async function waitFor<T extends object>(read: () => T | undefined, options: Parameters<typeof waitUntil>[1]): Promise<T> {
+export async function settleFor<T extends object>(read: () => T | undefined, options: Parameters<typeof settleUntil>[1]): Promise<T> {
 
   let value: T | undefined;
 
   // The predicate keeps the value it read, so the value handed back is the one that satisfied the wait rather than a second read taken a turn later.
-  await waitUntil(() => (value = read()) !== undefined, options);
+  await settleUntil(() => (value = read()) !== undefined, options);
 
   return present(value, options.description);
 }
 
-/* Wait until the controller has completed the given number of status polls. The wait bounds on the call AFTER the counted ones, which guarantees the last counted
- * poll ran its whole projection before the caller reads a count or a save, and its deadline grows with the count, one second per poll plus one, because every
- * poll counted costs a wire call and a projection on the suite's fast cadence and a fixed deadline would hold only for the first few.
+/**
+ * Step a TestClock from deadline to deadline until a read answers a value, and hand that value back. This is the clock-step form of settleFor, on HBPU's
+ * advanceUntil and its step budget, for a value a later poll, tick or retry on that clock produces.
+ *
+ * @param clock   - The clock the subject waits on.
+ * @param read    - Answers the awaited value, or undefined while it is not yet available.
+ * @param options - advanceUntil's own options: what the walk is for, and optionally its step budget.
+ *
+ * @returns The value the read answered when the walk was satisfied.
+ *
+ * @throws If the step budget is spent, or the clock has nothing left to step to, while the read answers nothing but undefined.
+ */
+export async function advanceFor<T extends object>(clock: TestClock, read: () => T | undefined, options: Parameters<typeof advanceUntil>[2]): Promise<T> {
+
+  let value: T | undefined;
+
+  // The predicate keeps the value it read, so the value handed back is the one that satisfied the walk rather than a second read taken a turn later.
+  await advanceUntil(clock, () => (value = read()) !== undefined, options);
+
+  return present(value, options.description);
+}
+
+/* Step the controller's clock until the controller has completed the given number of status polls. The walk bounds on the call AFTER the counted ones, which
+ * guarantees the last counted poll ran its whole projection before the caller reads a count or a save. Each step crosses the next deadline on the clock, the
+ * poll's own sleep among them, so the walk asks the poll count rather than the cadence, and a row states no schedule of its own.
  *
  * @param h     - The built controller whose retrieve recorder counts the polls.
  * @param count - The number of polls that must have completed.
  */
-export async function pollsCompleted(h: BuildControllerResult, count: number): Promise<void> {
+export async function advanceThroughPolls(h: BuildControllerResult, count: number): Promise<void> {
 
-  await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length > count,
-    { description: "status poll " + String(count + 1) + " to begin", timeoutMs: (count + 1) * 1000 });
+  await advanceUntil(h.clock, () => h.retrieve.callsTo("statusschedule.php").length > count, { description: "status poll " + String(count + 1) + " to begin" });
+}
+
+/**
+ * Cross the revert delay on a TestClock, and let the write the crossing released run. The delay is the beat after which a control is written back to what it
+ * reads, a control whose command did not take put back among them.
+ *
+ * @param clock - The clock the write waits on: a controller's, or the one a command queue's own registry runs on.
+ */
+export async function crossRevertDelay(clock: TestClock): Promise<void> {
+
+  clock.advance(HYDRAWISE_REVERT_DELAY);
+  await settle();
+}
+
+/**
+ * The sleep a controller's poll loop takes after a good poll, in milliseconds on the controller's clock: the cadence the body asks for, padded by the jitter the
+ * loop adds to stay clear of the rate limits. It is stated here rather than read from the loop, so a row stepping across it holds the loop to that cadence.
+ *
+ * @param status - The body the good poll answered.
+ *
+ * @returns The sleep before the next poll.
+ */
+export function pollSleep(status: StatusScheduleResponse): number {
+
+  return (status.nextpoll + HYDRAWISE_API_JITTER) * 1000;
+}
+
+/**
+ * The backoff a controller's poll loop takes after a failed poll that follows a good one, in milliseconds on the controller's clock: the sleep the good poll's
+ * body asks for, held to twice the retry interval, so a failure never waits longer than that. It is stated here for the reason pollSleep is.
+ *
+ * @param status - The body the last good poll answered.
+ *
+ * @returns The backoff before the retry.
+ */
+export function pollBackoff(status: StatusScheduleResponse): number {
+
+  return Math.min(status.nextpoll + HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL * 2) * 1000;
+}
+
+/**
+ * Read a clock's current instant as a whole second, the unit every facts snapshot's stamp and every command's instant speak.
+ *
+ * @param clock - The clock to read.
+ *
+ * @returns The clock's current instant, floored to the second.
+ */
+export function seconds(clock: Clock): number {
+
+  return Math.floor(clock.now() / 1000);
 }

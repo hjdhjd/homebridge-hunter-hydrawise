@@ -8,13 +8,13 @@
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { Characteristic, Service, buildController, makeV2Facts, pollsCompleted, restoreCached, seedEstablished } from "./testing/platform.helpers.ts";
+import { Characteristic, Service, advanceThroughPolls, buildController, makeV2Facts, restoreCached, seedEstablished } from "./testing/platform.helpers.ts";
 import { HAPStatus, getServiceName } from "homebridge-plugin-utils";
 import type { HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
-import { TestClock, advanceThroughSchedule, hapStatus, loggedAt, present, settle, triggerGet, triggerSet, waitUntil } from "homebridge-plugin-utils/testing";
 import { UNSCHEDULED_SENTINEL, bareSensors, rainSensors, syntheticController } from "./api.fixtures.ts";
+import { advanceThroughSchedule, advanceUntil, hapStatus, loggedAt, present, settle, settleUntil, triggerGet, triggerSet } from "homebridge-plugin-utils/testing";
 import { describe, test } from "node:test";
-import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
+import { makeStatusSchedule, makeZone } from "./api.helpers.ts";
 import { rainSensorSubtype, zoneAccessoryId } from "./types.ts";
 import { HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
 import assert from "node:assert/strict";
@@ -67,22 +67,12 @@ function hostedZone(): HydrawiseZoneConfig {
   return makeZone({ name: "Side Yard", relay: 2, relay_id: HOSTED_RELAY_ID, run: 480, time: 68000, timestr: "16:00" });
 }
 
-// A fast-cadence schedule around the given zones with a bare sensor block, so a live-loop test cycles in roughly 250ms.
-function schedule(zones: HydrawiseZoneConfig[]): StatusScheduleResponse {
-
-  return fastPolling(makeStatusSchedule({ relays: zones, sensors: bareSensors }));
-}
-
-/* A cadence deliberately slower than the fast one, in seconds. It leaves a gap after each poll's projection wide enough for a test to change what the NEXT poll
- * will see - a feature option, the programmed body - before that poll fetches. The fast cadence leaves no usable gap: its next fetch is already away by the
- * time an effect of the previous poll is observable.
+/* A wire-realistic schedule around the given zones and sensor block, a bare one unless a row names another. Each poll after the first waits on the controller's
+ * clock until the row steps it, so a row changes what the next poll will see - a feature option, the programmed body - before that poll fetches.
  */
-const PACED_POLL_SECONDS = 0.3;
+function schedule(zones: HydrawiseZoneConfig[], sensors: StatusScheduleResponse["sensors"] = bareSensors): StatusScheduleResponse {
 
-// A paced-cadence schedule around the given zones and sensor block.
-function pacedSchedule(zones: HydrawiseZoneConfig[], sensors: StatusScheduleResponse["sensors"]): StatusScheduleResponse {
-
-  return makeStatusSchedule({ nextpoll: PACED_POLL_SECONDS, relays: zones, sensors });
+  return makeStatusSchedule({ relays: zones, sensors });
 }
 
 describe("HydrawiseController standalone zones", () => {
@@ -102,7 +92,7 @@ describe("HydrawiseController standalone zones", () => {
     }, signalAborted: false, userOptions: [STANDALONE_ON] });
 
     t.after(() => h.abort());
-    await waitUntil(() => h.zoneAccessories.get(STANDALONE_RELAY_ID)?.getServiceById(Service.Valve, STANDALONE_SUBTYPE) !== undefined,
+    await settleUntil(() => h.zoneAccessories.get(STANDALONE_RELAY_ID)?.getServiceById(Service.Valve, STANDALONE_SUBTYPE) !== undefined,
       { description: "the standalone zone's valve on its own accessory to appear" });
 
     // Both sides of the move: the valve is on the zone accessory AND the cached one is gone from the controller accessory.
@@ -117,7 +107,7 @@ describe("HydrawiseController standalone zones", () => {
       { body: schedule([ standaloneZone(), hostedZone() ]), kind: "response" }), signalAborted: false, userOptions: [STANDALONE_ON] });
 
     t.after(() => h.abort());
-    await waitUntil(() => h.zoneAccessories.get(STANDALONE_RELAY_ID)?.getServiceById(Service.Valve, STANDALONE_SUBTYPE) !== undefined,
+    await settleUntil(() => h.zoneAccessories.get(STANDALONE_RELAY_ID)?.getServiceById(Service.Valve, STANDALONE_SUBTYPE) !== undefined,
       { description: "the standalone zone's valve on its own accessory to appear" });
 
     const zoneAccessory = present(h.zoneAccessories.get(STANDALONE_RELAY_ID), "the standalone zone's own accessory");
@@ -137,7 +127,7 @@ describe("HydrawiseController standalone zones", () => {
       { body: schedule([ standaloneZone(), hostedZone() ]), kind: "response" }), signalAborted: false, userOptions: [STANDALONE_ON] });
 
     t.after(() => h.abort());
-    await waitUntil(() => h.zoneAccessories.get(STANDALONE_RELAY_ID)?.getServiceById(Service.Valve, STANDALONE_SUBTYPE) !== undefined,
+    await settleUntil(() => h.zoneAccessories.get(STANDALONE_RELAY_ID)?.getServiceById(Service.Valve, STANDALONE_SUBTYPE) !== undefined,
       { description: "the standalone zone's valve on its own accessory to appear" });
 
     const irrigation = h.accessory.getService(Service.IrrigationSystem);
@@ -154,7 +144,7 @@ describe("HydrawiseController standalone zones", () => {
       { body: schedule([ standaloneZone(SCHEDULED), hostedZone() ]), kind: "response" }), signalAborted: false, userOptions: [STANDALONE_ON] });
 
     t.after(() => h.abort());
-    await waitUntil(() => h.zoneAccessories.get(STANDALONE_RELAY_ID)?.getServiceById(Service.Valve, STANDALONE_SUBTYPE) !== undefined,
+    await settleUntil(() => h.zoneAccessories.get(STANDALONE_RELAY_ID)?.getServiceById(Service.Valve, STANDALONE_SUBTYPE) !== undefined,
       { description: "the standalone zone's valve on its own accessory to appear" });
 
     const valve = h.zoneAccessories.get(STANDALONE_RELAY_ID)?.getServiceById(Service.Valve, STANDALONE_SUBTYPE);
@@ -171,18 +161,17 @@ describe("HydrawiseController standalone zones", () => {
 
   test("a standalone zone beside a rain sensor whose read refuses answers its valve read and sends its write", async (t) => {
 
-    const clock = new TestClock();
-    const h = buildController({ clock, hasV2Client: true, program: (recorder) => recorder.programDefault("statusschedule.php",
+    const h = buildController({ hasV2Client: true, program: (recorder) => recorder.programDefault("statusschedule.php",
       { body: schedule([ standaloneZone(SCHEDULED), hostedZone() ]), kind: "response" }), signalAborted: false, userOptions: [STANDALONE_ON] });
 
     t.after(() => h.abort());
 
-    await advanceThroughSchedule(clock, []);
+    await advanceThroughSchedule(h.clock, []);
 
     // The reading lands a whole lifetime old, so a second more leaves it past its lifetime with no poll or refresh in between to re-judge anything.
     h.controller.applyFacts({ facts: makeV2Facts({ rainSensors: [[ SENSOR_ID, { name: "Hunter Rain Freeze Sensor", tripped: true } ]] }),
-      fetchedAt: Math.floor(clock.now() / 1000) - HYDRAWISE_V2_FACTS_TTL });
-    clock.advance(1000);
+      fetchedAt: Math.floor(h.clock.now() / 1000) - HYDRAWISE_V2_FACTS_TTL });
+    h.clock.advance(1000);
 
     const sensor = present(h.accessory.getServiceById(Service.ContactSensor, rainSensorSubtype(SENSOR_ID)), "the rain sensor on the controller's accessory");
     const valve = present(h.zoneAccessories.get(STANDALONE_RELAY_ID)?.getServiceById(Service.Valve, STANDALONE_SUBTYPE), "the standalone valve");
@@ -208,7 +197,7 @@ describe("HydrawiseController standalone zones", () => {
     userOptions: [ STANDALONE_ON, "Disable.Device." + HOSTED_SUBTYPE, "Enable.Device.Name." + STANDALONE_SUBTYPE + "=" + OVERRIDE_NAME ] });
 
     t.after(() => h.abort());
-    await waitUntil(() => h.reconciles.length >= 1, { description: "the first zone accessory reconcile" });
+    await settleUntil(() => h.reconciles.length >= 1, { description: "the first zone accessory reconcile" });
 
     const request = h.reconciles[0];
 
@@ -229,11 +218,11 @@ describe("HydrawiseController standalone zones", () => {
     userOptions: ["Enable.Device.Standalone." + CONTROLLER_SERIAL] });
 
     t.after(() => h.abort());
-    await waitUntil(() => h.reconciles.length >= 1, { description: "the first zone accessory reconcile" });
+    await settleUntil(() => h.reconciles.length >= 1, { description: "the first zone accessory reconcile" });
 
     assert.deepEqual(h.reconciles[0]?.zones.map(zone => zone.identity.relayId).toSorted(), [ STANDALONE_RELAY_ID, HOSTED_RELAY_ID ],
       "a controller-scoped entry carries every zone on the controller into the request");
-    await waitUntil(() => h.zoneAccessories.size === 2, { description: "the second zone accessory" });
+    await settleUntil(() => h.zoneAccessories.size === 2, { description: "the second zone accessory" });
 
     assert.equal(h.zoneAccessories.size, 2, "both zones end up on accessories of their own");
   });
@@ -245,11 +234,11 @@ describe("HydrawiseController standalone zones", () => {
       { body: schedule([ standaloneZone(), hostedZone() ]), kind: "response" }), signalAborted: false, userOptions: ["Enable.Device.Standalone"] });
 
     t.after(() => h.abort());
-    await waitUntil(() => h.reconciles.length >= 1, { description: "the first zone accessory reconcile" });
+    await settleUntil(() => h.reconciles.length >= 1, { description: "the first zone accessory reconcile" });
 
     assert.deepEqual(h.reconciles[0]?.zones.map(zone => zone.identity.relayId).toSorted(), [ STANDALONE_RELAY_ID, HOSTED_RELAY_ID ],
       "a global entry carries every zone into the request");
-    await waitUntil(() => h.zoneAccessories.size === 2, { description: "the second zone accessory" });
+    await settleUntil(() => h.zoneAccessories.size === 2, { description: "the second zone accessory" });
 
     assert.equal(h.zoneAccessories.size, 2, "both zones end up on accessories of their own");
   });
@@ -260,7 +249,7 @@ describe("HydrawiseController standalone zones", () => {
       { body: schedule([standaloneZone()]), kind: "response" }), signalAborted: false, userOptions: [STANDALONE_ON] });
 
     t.after(() => h.abort());
-    await waitUntil(() => h.zoneAccessories.get(STANDALONE_RELAY_ID)?.getServiceById(Service.Valve, STANDALONE_SUBTYPE) !== undefined,
+    await settleUntil(() => h.zoneAccessories.get(STANDALONE_RELAY_ID)?.getServiceById(Service.Valve, STANDALONE_SUBTYPE) !== undefined,
       { description: "the standalone zone's valve on its own accessory to appear" });
 
     const info = h.zoneAccessories.get(STANDALONE_RELAY_ID)?.getService(Service.AccessoryInformation);
@@ -280,7 +269,7 @@ describe("HydrawiseController standalone zones", () => {
 
     t.after(() => h.abort());
 
-    await pollsCompleted(h, 1);
+    await advanceThroughPolls(h,1);
     await h.abort();
 
     const zoneAccessory = present(h.zoneAccessories.get(STANDALONE_RELAY_ID), "the standalone zone's own accessory");
@@ -312,7 +301,7 @@ describe("HydrawiseController standalone zones", () => {
 
     assert.equal(information.testCharacteristic(Characteristic.ConfiguredName), false, "the cached information service carries no ConfiguredName");
 
-    await pollsCompleted(h, 1);
+    await advanceThroughPolls(h,1);
     await h.abort();
 
     assert.equal(information.testCharacteristic(Characteristic.ConfiguredName), true, "the first binding adds a ConfiguredName");
@@ -343,7 +332,7 @@ describe("HydrawiseController standalone zones", () => {
     restoreCached(api, restored);
     h.zoneAccessories.set(STANDALONE_RELAY_ID, restored);
 
-    await pollsCompleted(h, 1);
+    await advanceThroughPolls(h,1);
     await h.abort();
 
     assert.equal(information.getCharacteristic(Characteristic.ConfiguredName).value, HOME_APP_NAME, "the first binding keeps the Home app's ConfiguredName");
@@ -361,7 +350,7 @@ describe("HydrawiseController standalone zones", () => {
     }, signalAborted: false, userOptions: [ STANDALONE_ON, SYNC_NAME_ON ] });
 
     t.after(() => h.abort());
-    await waitUntil(() => h.zoneAccessories.get(STANDALONE_RELAY_ID)?.displayName === WIRE_RENAMED_SANITIZED,
+    await advanceUntil(h.clock, () => h.zoneAccessories.get(STANDALONE_RELAY_ID)?.displayName === WIRE_RENAMED_SANITIZED,
       { description: "the standalone accessory to take the renamed wire name" });
 
     // The two-poll shape is the point: the accessory was established under the first name, so a rename landing here proves the synchronization runs every poll
@@ -373,7 +362,7 @@ describe("HydrawiseController standalone zones", () => {
 
     assert.equal(getServiceName(zoneAccessory.getService(Service.AccessoryInformation)), WIRE_RENAMED_SANITIZED, "and on the information service's own name");
 
-    await pollsCompleted(h, 4);
+    await advanceThroughPolls(h,4);
     await h.abort();
 
     // The first poll's save carries the accessory as it is established, its valve attached and its information stamped, and the rename's carries it once more.
@@ -387,12 +376,12 @@ describe("HydrawiseController standalone zones", () => {
      * valve alone, and the tile's watch puts the name back on the event loop's next turn, before any poll. A rename made in the Home app never reaches
      * Homebridge's cache on its own, so the restore leaves the cache already right and saves nothing, and the poll after it finds every name in place.
      */
-    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([standaloneZone()]), kind: "response" }),
-      signalAborted: false, userOptions: [ STANDALONE_ON, SYNC_NAME_ON ] });
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule([standaloneZone()]),
+      kind: "response" }), signalAborted: false, userOptions: [ STANDALONE_ON, SYNC_NAME_ON ] });
 
     t.after(() => h.abort());
 
-    await pollsCompleted(h, 2);
+    await advanceThroughPolls(h, 2);
 
     const zoneAccessory = present(h.zoneAccessories.get(STANDALONE_RELAY_ID), "the standalone zone's own accessory");
     const information = present(zoneAccessory.getService(Service.AccessoryInformation), "the zone accessory's information service");
@@ -406,7 +395,7 @@ describe("HydrawiseController standalone zones", () => {
     assert.equal(h.retrieve.callsTo("statusschedule.php").length, polls, "no poll ran across the rename");
     assert.equal(getServiceName(information), WIRE_NAME_SANITIZED, "the tile takes the zone accessory's own name back at once");
 
-    await pollsCompleted(h, h.retrieve.callsTo("statusschedule.php").length);
+    await advanceThroughPolls(h,h.retrieve.callsTo("statusschedule.php").length);
     await h.abort();
 
     assert.equal(getServiceName(valve), WIRE_NAME_SANITIZED, "the valve kept its name throughout");
@@ -422,7 +411,7 @@ describe("HydrawiseController standalone zones", () => {
     }, signalAborted: false, userOptions: [ STANDALONE_ON, "Disable.Device.SyncName." + STANDALONE_SUBTYPE ] });
 
     t.after(() => h.abort());
-    await pollsCompleted(h, 3);
+    await advanceThroughPolls(h,3);
     await h.abort();
 
     // The accessory was created under the first poll's name and is never re-touched, so the rename does not reach it, and only its establishment saves it.
@@ -449,7 +438,7 @@ describe("HydrawiseController standalone zones", () => {
     restoreCached(api, restored);
     h.zoneAccessories.set(STANDALONE_RELAY_ID, restored);
 
-    await pollsCompleted(h, 1);
+    await advanceThroughPolls(h,1);
 
     const valve = restored.getServiceById(Service.Valve, STANDALONE_SUBTYPE);
 
@@ -480,11 +469,11 @@ describe("HydrawiseController standalone zones", () => {
     restoreCached(api, restored);
     h.zoneAccessories.set(STANDALONE_RELAY_ID, restored);
 
-    await pollsCompleted(h, 1);
+    await advanceThroughPolls(h,1);
 
     assert.equal(h.flushes().filter(batch => batch.includes(restored)).length, 1, "the first binding saves the host once");
 
-    await pollsCompleted(h, 2);
+    await advanceThroughPolls(h,2);
     await h.abort();
 
     assert.equal(h.flushes().filter(batch => batch.includes(restored)).length, 1, "and the poll after it saves nothing on the host");
@@ -506,7 +495,7 @@ describe("HydrawiseController standalone zones", () => {
     restoreCached(api, stale);
     h.zoneAccessories.set(HOSTED_RELAY_ID, stale);
 
-    await waitUntil(() => h.accessory.getServiceById(Service.Valve, HOSTED_SUBTYPE) !== undefined, { description: "the hosted zone's valve to appear" });
+    await settleUntil(() => h.accessory.getServiceById(Service.Valve, HOSTED_SUBTYPE) !== undefined, { description: "the hosted zone's valve to appear" });
 
     assert.ok(h.accessory.getServiceById(Service.Valve, HOSTED_SUBTYPE), "a zone absent from the hosting map gets its valve on the controller accessory");
     assert.equal(h.zoneAccessories.has(HOSTED_RELAY_ID), false, "and it is no longer named in the request the reconcile answers");
@@ -520,7 +509,7 @@ describe("HydrawiseController standalone zones", () => {
     t.after(() => h.abort());
 
     // Bounding on the third call guarantees poll 2 fully ran, which is the same window the roster suite's flush-count expectation is measured over.
-    await pollsCompleted(h, 2);
+    await advanceThroughPolls(h,2);
     await h.abort();
 
     assert.ok(h.reconciles.length >= 1, "the reconcile is still called every poll");
@@ -535,24 +524,24 @@ describe("HydrawiseController standalone zones", () => {
   test("a zone promoted on the poll that first reports it sensor-stopped logs no rain transition", async (t) => {
 
     const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php",
-      { body: pacedSchedule([standaloneZone(SCHEDULED)], rainSensors), kind: "response" }), signalAborted: false });
+      { body: schedule([standaloneZone(SCHEDULED)], rainSensors), kind: "response" }), signalAborted: false });
 
     t.after(() => h.abort());
 
     // Poll 1 hosts the zone on the controller accessory against a normal schedule, which seeds its stored rain state false.
-    await waitUntil(() => h.accessory.getServiceById(Service.Valve, STANDALONE_SUBTYPE) !== undefined, { description: "the standalone zone's valve to appear" });
+    await settleUntil(() => h.accessory.getServiceById(Service.Valve, STANDALONE_SUBTYPE) !== undefined, { description: "the standalone zone's valve to appear" });
 
     /* Opt the zone in through the platform double's REAL feature-options engine - the same instance the controller consults on every poll - so the promotion
      * arrives at a controller that ALREADY holds a hint entry for this zone. Building a second controller would seed a fresh ledger and quietly defeat the
-     * existing-entry premise this assertion exists to exercise. The paced cadence is what lets the option and the body change together: the gap after one poll's
-     * projection is wide enough to make both changes before the next poll fetches.
+     * existing-entry premise this assertion exists to exercise. The next poll waits on the controller's clock until the row steps it, so the option and the body
+     * change together before that poll fetches.
      */
     h.platform.featureOptions.configuredOptions = [ ...h.platform.featureOptions.configuredOptions, STANDALONE_ON ];
-    h.retrieve.programDefault("statusschedule.php", { body: pacedSchedule([standaloneZone(SENSOR_STOPPED)], rainSensors), kind: "response" });
+    h.retrieve.programDefault("statusschedule.php", { body: schedule([standaloneZone(SENSOR_STOPPED)], rainSensors), kind: "response" });
 
     // Poll 2 promotes the zone and reports it sensor-stopped in the same pass, so the valve is re-acquired on a new host while the live sensor state differs
     // from the value stored for the zone. Observing the valve is what proves the promotion happened rather than the scenario passing vacuously.
-    await waitUntil(() => h.zoneAccessories.get(STANDALONE_RELAY_ID)?.getServiceById(Service.Valve, STANDALONE_SUBTYPE) !== undefined,
+    await advanceUntil(h.clock, () => h.zoneAccessories.get(STANDALONE_RELAY_ID)?.getServiceById(Service.Valve, STANDALONE_SUBTYPE) !== undefined,
       { description: "the standalone zone's valve on its own accessory to appear" });
 
     assert.ok(h.zoneAccessories.get(STANDALONE_RELAY_ID)?.getServiceById(Service.Valve, STANDALONE_SUBTYPE), "the valve genuinely landed on the standalone host");
@@ -561,9 +550,9 @@ describe("HydrawiseController standalone zones", () => {
 
     // Clearing the stop is the positive control: the line firing here proves Log.Zone is live for this zone and that the promotion poll stored the live
     // stopped state rather than leaving the seeded false standing.
-    h.retrieve.programDefault("statusschedule.php", { body: pacedSchedule([standaloneZone(SCHEDULED)], rainSensors), kind: "response" });
+    h.retrieve.programDefault("statusschedule.php", { body: schedule([standaloneZone(SCHEDULED)], rainSensors), kind: "response" });
 
-    await waitUntil(() => loggedAt(h.entries, "info", "Rain sensor appears to be allowing irrigation"),
+    await advanceUntil(h.clock, () => loggedAt(h.entries, "info", "Rain sensor appears to be allowing irrigation"),
       { description: "an info line containing \"Rain sensor appears to be allowing irrigation\"" });
 
     assert.ok(loggedAt(h.entries, "info", "Rain sensor appears to be allowing irrigation"), "the sensor clearing after the promotion does narrate its transition");

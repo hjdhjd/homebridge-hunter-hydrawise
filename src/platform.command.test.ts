@@ -10,17 +10,17 @@
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and message_type, so camelcase is disabled here to let these literals mirror the wire verbatim.
 /* eslint-disable camelcase */
 import type { BuildPlatformResult, MockDispatcherHandle } from "./testing/platform.helpers.ts";
-import { Characteristic, HYDRAWISE_ORIGIN, Service, budgetsOf, buildPlatform, installMockDispatcher, programCountedReply, programJsonReply,
-  programStatusReply } from "./testing/platform.helpers.ts";
+import { Characteristic, HYDRAWISE_ORIGIN, Service, addressesEndpoint, budgetsOf, buildPlatform, heldEndFor, installMockDispatcher, programCountedReply,
+  programJsonReply, programStatusReply } from "./testing/platform.helpers.ts";
+import { HYDRAWISE_API_TIMEOUT, HYDRAWISE_COMMAND_BUDGET_CALLS, HYDRAWISE_COMMAND_BUDGET_WINDOW } from "./settings.ts";
 import { describe, test } from "node:test";
-import { errnoError, linesAt, logCount, loggedAt, present, triggerSet, waitUntil } from "homebridge-plugin-utils/testing";
+import { errnoError, linesAt, logCount, loggedAt, present, settle, settleUntil, triggerSet } from "homebridge-plugin-utils/testing";
 import { makeCustomerDetails, normalSchedule } from "./api.helpers.ts";
-import { HYDRAWISE_COMMAND_BUDGET_CALLS } from "./settings.ts";
+import type { HydrawiseCommandOutcome } from "./types.ts";
 import type { HydrawiseController } from "./controller.ts";
 import { HydrawiseReservedNames } from "./types.ts";
 import type { PlatformAccessory } from "homebridge";
 import assert from "node:assert/strict";
-import { setTimeout as delay } from "node:timers/promises";
 import { errors } from "undici";
 import { syntheticController } from "./api.fixtures.ts";
 
@@ -37,10 +37,6 @@ const UNREADABLE = "The answer from Hydrawise could not be read.";
 
 // The parameters every command below carries. Their content is immaterial to the outcome, which the reply alone decides.
 const PARAMS = { action: "stop", controller_id: "500001", relay_id: "700001" };
-
-// How long, in milliseconds, a command is given to reach the wire, or to misbehave by reaching it, before an assertion reads where it is. A correct wait is measured
-// in seconds of budget window, and a request the MockAgent serves lands within a few microtasks, so the span separates the two however the machine is loaded.
-const SETTLE_MS = 50;
 
 describe("HydrawisePlatform command", () => {
 
@@ -106,15 +102,36 @@ describe("HydrawisePlatform command", () => {
 
   test("a deadline met while the reply is read is a timeout", async (t) => {
 
-    const { emit, entries, platform } = buildPlatform();
+    const { clock, emit, entries, platform } = buildPlatform();
+    const heldEnd = heldEndFor("setzone.php");
 
     t.after(() => emit(SHUTDOWN));
 
-    // The deadline's own shape: the reason AbortSignal.timeout() aborts with, which undici hands to the body it was reading.
-    await using dispatcher = installMockDispatcher({ bodyError: new DOMException("The operation was aborted due to timeout", "TimeoutError") });
+    // The reply's bytes arrive and its end is held, so the platform is still reading it when the row steps the clock across the request's deadline.
+    await using dispatcher = installMockDispatcher({ heldEnd });
     programJsonReply(dispatcher.agent, "setzone.php", { message: "Running zone", message_type: "info" });
 
-    assert.deepEqual(await platform.command({ params: PARAMS }), { status: "timeout" }, "a reply the deadline cut off mid-read timed out, so it may be resent");
+    const outcomes: HydrawiseCommandOutcome[] = [];
+    const commanding = platform.command({ params: PARAMS });
+
+    void commanding.then((outcome): void => {
+
+      outcomes.push(outcome);
+    });
+
+    await heldEnd.reached;
+
+    // The outcome is read through the turns that follow each step rather than awaited, so a deadline left off the platform's clock cannot answer in real time
+    // inside the row's own timeout.
+    clock.advance((HYDRAWISE_API_TIMEOUT * 1000) - 1);
+
+    assert.equal(await Promise.race([ commanding.then(() => "answered"), settle().then(() => "pending") ]), "pending",
+      "a millisecond short of the deadline the reply is still being read");
+
+    clock.advance(1);
+    await settleUntil(() => outcomes.length === 1, { description: "the command to answer once its deadline cut off the reply's read" });
+
+    assert.deepEqual(outcomes, [{ status: "timeout" }], "a reply the deadline cut off mid-read timed out, so it may be resent");
     assert.equal(entries.filter(line => line.level === "error").length, 0, "and the request log, which counted the request as answered, says nothing");
   });
 
@@ -143,13 +160,13 @@ describe("HydrawisePlatform command", () => {
     t.after(() => emit(SHUTDOWN));
     await using dispatcher = installMockDispatcher();
     programStatusReply(dispatcher.agent, "setzone.php", 429);
-    dispatcher.agent.get(HYDRAWISE_ORIGIN).intercept({ method: "GET", path: (path: string): boolean => path.includes("setzone.php") })
+    dispatcher.agent.get(HYDRAWISE_ORIGIN).intercept({ method: "GET", path: addressesEndpoint("setzone.php") })
       .replyWithError(new errors.ConnectTimeoutError());
 
     const unmarked = new TypeError("fetch failed");
 
     unmarked.cause = { code: "EPIPE", message: "broken pipe" };
-    dispatcher.agent.get(HYDRAWISE_ORIGIN).intercept({ method: "GET", path: (path: string): boolean => path.includes("setzone.php") }).replyWithError(unmarked);
+    dispatcher.agent.get(HYDRAWISE_ORIGIN).intercept({ method: "GET", path: addressesEndpoint("setzone.php") }).replyWithError(unmarked);
 
     assert.deepEqual(await platform.command({ params: PARAMS }), { reason: RATE_LIMIT, status: "failed" }, "a reached rate limit fails the command, naming the limit");
     assert.deepEqual(await platform.command({ params: PARAMS }), { reason: "Connection timed out.", status: "failed" },
@@ -166,7 +183,7 @@ describe("HydrawisePlatform command", () => {
 
     t.after(() => emit(SHUTDOWN));
     await using dispatcher = installMockDispatcher();
-    dispatcher.agent.get(HYDRAWISE_ORIGIN).intercept({ method: "GET", path: (path: string): boolean => path.includes("setzone.php") })
+    dispatcher.agent.get(HYDRAWISE_ORIGIN).intercept({ method: "GET", path: addressesEndpoint("setzone.php") })
       .replyWithError(new errors.HeadersTimeoutError());
 
     assert.deepEqual(await platform.command({ params: PARAMS }), { status: "timeout" }, "a command no answer reached in time timed out");
@@ -205,7 +222,7 @@ describe("HydrawisePlatform command", () => {
 
   test("a command withdrawn while it waits for admission takes no slot and reaches nothing", async (t) => {
 
-    const { emit, entries, platform } = buildPlatform();
+    const { clock, emit, entries, platform } = buildPlatform();
 
     t.after(() => emit(SHUTDOWN));
     await using dispatcher = installMockDispatcher();
@@ -223,9 +240,13 @@ describe("HydrawisePlatform command", () => {
     const withdrawal = new AbortController();
     const waiting = platform.command({ params: PARAMS, signal: withdrawal.signal });
 
-    await delay(SETTLE_MS);
+    // A request the MockAgent serves lands within a turn of being sent, so the turns settled here let a command the ceiling failed to hold reach the wire, while a
+    // held one is parked on the platform's clock until the window the ceiling's slots were spent in has passed.
+    await settle(2);
 
     assert.equal(served(), HYDRAWISE_COMMAND_BUDGET_CALLS, "the command is waiting for the command ceiling rather than on the wire");
+    assert.equal(clock.pending, 1, "its wait for a slot is the one entry on the platform's clock");
+    assert.equal(clock.nextDeadline, HYDRAWISE_COMMAND_BUDGET_WINDOW * 1000, "and it lasts until the spent slots leave the ceiling's window");
 
     withdrawal.abort();
 
@@ -242,17 +263,21 @@ describe("HydrawisePlatform command", () => {
     t.after(() => emit(SHUTDOWN));
     await using dispatcher = installMockDispatcher();
 
-    // A reply that takes a moment to arrive, so the withdrawal below lands while the admitted request is on the wire.
-    dispatcher.agent.get(HYDRAWISE_ORIGIN).intercept({ method: "GET", path: (path: string): boolean => path.includes("setzone.php") })
-      .reply(200, { message: "", message_type: "info" }).delay(SETTLE_MS * 4);
-
     const withdrawal = new AbortController();
+
+    // The reply is composed as the request reaches the MockAgent, so the withdrawal inside it lands while the admitted request is on the wire and before its answer.
+    dispatcher.agent.get(HYDRAWISE_ORIGIN).intercept({ method: "GET", path: addressesEndpoint("setzone.php") })
+      .reply(async (): Promise<{ data: object; statusCode: number }> => {
+
+        withdrawal.abort();
+
+        return { data: { message: "", message_type: "info" }, statusCode: 200 };
+      });
+
     const admitted = platform.command({ params: PARAMS, signal: withdrawal.signal });
 
-    await delay(SETTLE_MS);
-    withdrawal.abort();
-
     assert.deepEqual(await admitted, { status: "confirmed" }, "a command already on the wire carries on to Hydrawise's answer");
+    assert.equal(withdrawal.signal.aborted, true, "though the withdrawal landed while it was there");
   });
 });
 
@@ -271,7 +296,7 @@ describe("HydrawisePlatform command through a controller", () => {
     built.emit(DID_FINISH_LAUNCHING);
 
     // The first poll's walk builds the zone valves, and a tap made after it is one the controller answers for.
-    await waitUntil(() => built.registered()[0]?.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
+    await settleUntil(() => built.registered()[0]?.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
 
     return { accessory: present(built.registered()[0], "the controller accessory"),
       controller: present(built.platform.configuredDevices[built.platform.hap.uuid.generate(syntheticController.controller_id.toString())], "the built controller") };

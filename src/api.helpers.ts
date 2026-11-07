@@ -10,10 +10,6 @@
 import type { CustomerDetailsResponse, HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
 import { bareSensors, normalZoneMatrix, rainSensors, sentinelZoneMatrix, syntheticController, syntheticCustomerDetails } from "./api.fixtures.ts";
 
-// The steady-state polling cadence, in seconds, the fastPolling helper stamps so a live-loop test cycles in roughly 250ms - (nextpoll + jitter) * 1000 with the
-// jitter constant of 0.2 - rather than the wire-realistic 60-second interval.
-const FAST_POLL_SECONDS = 0.05;
-
 /**
  * Build a single zone in the statusschedule wire shape. The defaults describe a zone running now (`time` of 1 with a positive remaining `run`); pass overrides
  * to model a scheduled or active-soon zone. A suspended zone is not reachable through this factory's fields alone - that state is classified from a
@@ -109,17 +105,4 @@ export function allSuspended(): StatusScheduleResponse {
 
   return makeStatusSchedule({ relays: structuredClone(sentinelZoneMatrix) as HydrawiseZoneConfig[],
     sensors: structuredClone(bareSensors) });
-}
-
-/**
- * Stamp a fast poll cadence onto a base schedule so a live-loop test cycles deterministically in roughly 250ms rather than waiting the wire-realistic 60
- * seconds. Returns a fresh clone, leaving the base untouched.
- *
- * @param base - The schedule whose cadence to accelerate.
- *
- * @returns A fresh clone of `base` with its nextpoll set to the fast cadence.
- */
-export function fastPolling(base: StatusScheduleResponse): StatusScheduleResponse {
-
-  return { ...structuredClone(base), nextpoll: FAST_POLL_SECONDS };
 }

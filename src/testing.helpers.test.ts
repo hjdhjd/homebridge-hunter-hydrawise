@@ -22,8 +22,10 @@ import assert from "node:assert/strict";
  */
 const EXPECTED_FUNCTION_EXPORTS = [
 
+  "HeldEnd",
   "assertSameShape",
-  "declareKeysOf"
+  "declareKeysOf",
+  "failingBodies"
 ] as const;
 
 describe("testing.helpers barrel", () => {

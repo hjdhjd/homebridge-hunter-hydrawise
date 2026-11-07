@@ -3,31 +3,39 @@
  * platform.budgets.test.ts: The rate ceilings retrieve() enforces, exercised against a REAL platform whose undici traffic runs through a MockAgent
  * installed as the global dispatcher after construction. Asserts the capacities the platform constructs its budgets at, which budget each endpoint draws against,
  * and - the assertion the whole mechanism rests on - that both draws are AWAITED, by saturating a ceiling and proving the blocked call put nothing on the wire before
- * shutdown resolved it to the quiet null every caller of retrieve() expects.
+ * shutdown resolved it to the quiet null every caller of retrieve() expects. A command admitted after a wait longer than a request's deadline still confirms, which
+ * is what holds the deadline to the moment the request is admitted.
  *
  * Draw ORDER (the command ceiling before the account ceiling) is deliberately not asserted here. The budgets are independent objects, so no order between them
  * is observable from outside without a production test hook this suite refuses to add; the order is a structural property of two adjacent awaits and is verified
  * by reading the diff, while what these tests verify is that each ceiling is independently enforced by an awaited draw.
+ *
+ * Every platform here runs on a TestClock nothing steps unless a row does, so a correctly awaited draw stays parked on that clock however long a row settles, and
+ * the check can never fail against a correct implementation. A draw that was dispatched instead of awaited reaches the wire within a turn or two, which the turns
+ * each blocked row settles are enough to catch, and the parked wait on the clock is the positive witness that the window was there to cross.
  */
-import { HYDRAWISE_API_BUDGET_CALLS, HYDRAWISE_COMMAND_BUDGET_CALLS, HYDRAWISE_COMMAND_ENDPOINT } from "./settings.ts";
+
+// The Hydrawise API wire shapes use snake_case keys such as message_type, so camelcase is disabled here to let these literals mirror the wire verbatim.
+/* eslint-disable camelcase */
+import { HYDRAWISE_API_BUDGET_CALLS, HYDRAWISE_API_BUDGET_WINDOW, HYDRAWISE_COMMAND_BUDGET_CALLS, HYDRAWISE_COMMAND_BUDGET_WINDOW,
+  HYDRAWISE_COMMAND_ENDPOINT } from "./settings.ts";
 import { budgetsOf, buildPlatform, installMockDispatcher, programCountedReply } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
+import { loggedAt, settle, settleUntil } from "homebridge-plugin-utils/testing";
+import type { HydrawiseCommandOutcome } from "./types.ts";
 import assert from "node:assert/strict";
-import { setTimeout as delay } from "node:timers/promises";
 
 // APIEvent.SHUTDOWN's string value, the event the platform binds its teardown to. Firing it aborts the shutdown signal, which is what releases a caller waiting on
 // a saturated budget.
 const SHUTDOWN = "shutdown";
 
-/* How long, in milliseconds, a blocked call is given to misbehave before the assertion that it has not. A correctly awaited draw is waiting out a trailing window
- * measured in tens or hundreds of seconds, so it cannot reach the wire inside this span no matter how the machine is loaded - the check can never fail against a
- * correct implementation. A draw that was dispatched instead of awaited reaches the wire within a microtask or two, which is what this span is long enough to
- * catch. Both properties come from the same asymmetry, which is why the number is a settle window rather than a race.
- */
-const SETTLE_MS = 50;
-
 // The reply body every counted intercept answers with. Its content is immaterial to these tests: what matters is only whether a reply was served at all.
 const REPLY_BODY = { message: "" };
+
+// The reply a command's admission row is answered with, the verdict Hydrawise gives a command it accepted, and the parameters the command carries, which are
+// immaterial to its admission.
+const CONFIRMATION = { message: "", message_type: "info" };
+const PARAMS = { action: "stop", controller_id: "500001", relay_id: "700001" };
 
 // A call count comfortably below either ceiling, used where a test needs several successful calls without saturating anything. The assertions it feeds are written
 // against the ceiling constants minus this number, never against a bare literal, so a changed ceiling moves the expectation with it.
@@ -62,10 +70,7 @@ describe("HydrawisePlatform rate budgets", () => {
 
       // The calls run one after another rather than in parallel, because what is being asserted is how many slots a SEQUENCE of admitted calls consumes.
       // eslint-disable-next-line no-await-in-loop
-      const response = await platform.retrieve("statusschedule.php");
-
-      // eslint-disable-next-line no-await-in-loop
-      await response?.body.json();
+      await platform.retrieve("statusschedule.php");
     }
 
     const budgets = budgetsOf(platform);
@@ -83,9 +88,8 @@ describe("HydrawisePlatform rate budgets", () => {
     await using dispatcher = installMockDispatcher();
 
     const served = programCountedReply(dispatcher.agent, HYDRAWISE_COMMAND_ENDPOINT, REPLY_BODY);
-    const response = await platform.retrieve(HYDRAWISE_COMMAND_ENDPOINT);
 
-    await response?.body.json();
+    await platform.retrieve(HYDRAWISE_COMMAND_ENDPOINT);
 
     const budgets = budgetsOf(platform);
 
@@ -96,7 +100,7 @@ describe("HydrawisePlatform rate budgets", () => {
 
   test("a call blocked at the saturated account ceiling puts nothing on the wire and resolves to null on shutdown", async () => {
 
-    const { emit, entries, platform } = buildPlatform();
+    const { clock, emit, entries, platform } = buildPlatform();
 
     await using dispatcher = installMockDispatcher();
 
@@ -106,10 +110,7 @@ describe("HydrawisePlatform rate budgets", () => {
     for(let call = 0; call < HYDRAWISE_API_BUDGET_CALLS; call++) {
 
       // eslint-disable-next-line no-await-in-loop
-      const response = await platform.retrieve("statusschedule.php");
-
-      // eslint-disable-next-line no-await-in-loop
-      await response?.body.json();
+      await platform.retrieve("statusschedule.php");
     }
 
     assert.equal(served(), HYDRAWISE_API_BUDGET_CALLS, "the ceiling's worth of calls should all have reached the wire");
@@ -119,9 +120,11 @@ describe("HydrawisePlatform rate budgets", () => {
     // answers this caller with the quiet null every other teardown path answers with.
     const blocked = platform.retrieve("statusschedule.php");
 
-    await delay(SETTLE_MS);
+    await settle(2);
 
     assert.equal(served(), HYDRAWISE_API_BUDGET_CALLS, "the blocked call is still waiting out the window rather than having reached the wire");
+    assert.equal(clock.pending, 1, "its wait for a slot is the one entry on the platform's clock");
+    assert.equal(clock.nextDeadline, HYDRAWISE_API_BUDGET_WINDOW * 1000, "and it lasts until the spent slots leave the account ceiling's window");
 
     emit(SHUTDOWN);
 
@@ -133,7 +136,7 @@ describe("HydrawisePlatform rate budgets", () => {
 
   test("a command blocked at the saturated command ceiling puts nothing on the wire and resolves to null on shutdown", async () => {
 
-    const { emit, entries, platform } = buildPlatform();
+    const { clock, emit, entries, platform } = buildPlatform();
 
     await using dispatcher = installMockDispatcher();
 
@@ -144,10 +147,7 @@ describe("HydrawisePlatform rate budgets", () => {
     for(let call = 0; call < HYDRAWISE_COMMAND_BUDGET_CALLS; call++) {
 
       // eslint-disable-next-line no-await-in-loop
-      const response = await platform.retrieve(HYDRAWISE_COMMAND_ENDPOINT);
-
-      // eslint-disable-next-line no-await-in-loop
-      await response?.body.json();
+      await platform.retrieve(HYDRAWISE_COMMAND_ENDPOINT);
     }
 
     const accountBeforeBlocking = budgetsOf(platform).account.available;
@@ -157,12 +157,14 @@ describe("HydrawisePlatform rate budgets", () => {
 
     const blocked = platform.retrieve(HYDRAWISE_COMMAND_ENDPOINT);
 
-    await delay(SETTLE_MS);
+    await settle(2);
 
     // Two independent witnesses that the command draw held this call, either of which a dispatched-instead-of-awaited command draw would break: the request never
     // reached the wire, and the call never got as far as the account draw that sits behind the command draw and would have admitted it at once.
     assert.equal(served(), HYDRAWISE_COMMAND_BUDGET_CALLS, "the blocked command is still waiting out the window rather than having reached the wire");
     assert.equal(budgetsOf(platform).account.available, accountBeforeBlocking, "the blocked command never reached the account draw, so it consumed no account slot");
+    assert.equal(clock.pending, 1, "its wait for a slot is the one entry on the platform's clock");
+    assert.equal(clock.nextDeadline, HYDRAWISE_COMMAND_BUDGET_WINDOW * 1000, "and it lasts until the spent slots leave the command ceiling's window");
 
     emit(SHUTDOWN);
 
@@ -170,5 +172,43 @@ describe("HydrawisePlatform rate budgets", () => {
     assert.equal(served(), HYDRAWISE_COMMAND_BUDGET_CALLS, "the blocked command put no request on the wire");
     assert.equal(entries.filter(line => line.level === "error").length, 0, "a shutdown reached while waiting for a slot is orderly teardown, so nothing is logged " +
       "at error level");
+  });
+
+  test("a command admitted after a wait longer than a request's deadline still confirms, because its deadline is armed only at admission", async (t) => {
+
+    const { clock, emit, entries, platform } = buildPlatform();
+
+    t.after(() => emit(SHUTDOWN));
+    await using dispatcher = installMockDispatcher();
+
+    const served = programCountedReply(dispatcher.agent, HYDRAWISE_COMMAND_ENDPOINT, CONFIRMATION);
+
+    /* Spend every slot the command ceiling grants, so the next command waits out the ceiling's whole window. The window is longer than a request is given to
+     * answer, so a deadline armed ahead of admission would run out during the wait, and the request it bounds would be cut off before it was sent.
+     */
+    for(let call = 0; call < HYDRAWISE_COMMAND_BUDGET_CALLS; call++) {
+
+      // eslint-disable-next-line no-await-in-loop
+      await platform.command({ params: PARAMS });
+    }
+
+    const outcomes: HydrawiseCommandOutcome[] = [];
+
+    void platform.command({ params: PARAMS }).then((outcome): void => {
+
+      outcomes.push(outcome);
+    });
+
+    await settle(2);
+
+    assert.equal(served(), HYDRAWISE_COMMAND_BUDGET_CALLS, "the command waits for the command ceiling");
+    assert.equal(clock.nextDeadline, HYDRAWISE_COMMAND_BUDGET_WINDOW * 1000, "and the first entry on the platform's clock is its wait for a slot, no deadline ahead");
+
+    clock.advance(HYDRAWISE_COMMAND_BUDGET_WINDOW * 1000);
+    await settleUntil(() => outcomes.length === 1, { description: "the command admitted at the end of the window to be answered" });
+
+    assert.deepEqual(outcomes, [{ status: "confirmed" }], "the command admitted after the wait confirms");
+    assert.equal(served(), HYDRAWISE_COMMAND_BUDGET_CALLS + 1, "on the one request it put on the wire once admitted");
+    assert.ok(!loggedAt(entries, "error", "taking too long"), "and no deadline ran out while it waited");
   });
 });

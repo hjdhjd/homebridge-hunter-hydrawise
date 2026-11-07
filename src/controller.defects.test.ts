@@ -8,12 +8,13 @@
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { Characteristic, Service, buildController, makeV2Facts, makeZoneV2Facts } from "./testing/platform.helpers.ts";
-import { HYDRAWISE_API_JITTER, HYDRAWISE_API_NEXTPOLL_MAX, HYDRAWISE_API_RETRY_INTERVAL } from "./settings.ts";
+import { Characteristic, Service, advanceThroughPolls, buildController, makeV2Facts, makeZoneV2Facts, pollBackoff, pollSleep,
+  seconds } from "./testing/platform.helpers.ts";
+import { HYDRAWISE_API_NEXTPOLL_MAX, HYDRAWISE_API_RETRY_INTERVAL } from "./settings.ts";
 import type { HydrawiseControllerV2Facts, HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
-import { TestClock, advanceThroughSchedule, assertNoUnhandledRejections, expectAt, formatLogEntry, loggedAt, present, triggerSet,
-  waitUntil } from "homebridge-plugin-utils/testing";
-import { allSuspended, fastPolling, makeStatusSchedule, makeZone, rainStopped } from "./api.helpers.ts";
+import { advanceThroughSchedule, advanceUntil, assertNoUnhandledRejections, expectAt, formatLogEntry, loggedAt, present, settle, settleUntil,
+  triggerSet } from "homebridge-plugin-utils/testing";
+import { allSuspended, makeStatusSchedule, makeZone, rainStopped } from "./api.helpers.ts";
 import { bareSensors, sentinelZoneMatrix } from "./api.fixtures.ts";
 import { describe, test } from "node:test";
 import type { BuildControllerResult } from "./testing/platform.helpers.ts";
@@ -21,10 +22,12 @@ import type { TestLogEntry } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
 import { stripVTControlCharacters } from "node:util";
 
-// Compose a fast-cadence single-zone schedule.
+/* Compose a wire-realistic schedule from a zone list. The first poll goes out as the controller is built and lands within turns, so a first-poll state is read
+ * with no step of the clock, and a row that wants a later poll, or the retry after a failed one, steps the controller's clock across the wait the loop arms.
+ */
 function schedule(zones: HydrawiseZoneConfig[], sensors: StatusScheduleResponse["sensors"] = bareSensors): StatusScheduleResponse {
 
-  return fastPolling(makeStatusSchedule({ relays: zones, sensors }));
+  return makeStatusSchedule({ relays: zones, sensors });
 }
 
 function scheduledZone(): HydrawiseZoneConfig {
@@ -52,8 +55,9 @@ describe("HydrawiseController updateState defect assertions", () => {
     // The valve appears on poll 1 and is pruned once the zone vanishes. The program-mode aggregate projects over the current poll's enabled zones only, rather
     // than over all retained zone state, so a vanished zone's frozen flags can never select the program mode for a multi-zone controller. Here, with one zone,
     // the empty projection's 0 === 0 equality selects NO_PROGRAM_SCHEDULED.
-    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
-    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") === undefined, { description: "the valve for zone 700001 to be removed" });
+    await settleUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
+    await advanceUntil(h.clock, () => h.accessory.getServiceById(Service.Valve, "700001") === undefined,
+      { description: "the valve for zone 700001 to be removed" });
 
     const irrigation = h.accessory.getService(Service.IrrigationSystem);
 
@@ -75,7 +79,7 @@ describe("HydrawiseController updateState defect assertions", () => {
     t.after(() => h.abort());
 
     // Poll 1 seeds the valve; a manual start marks the zone manual and sets the program mode to manual mode.
-    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
+    await settleUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
 
     const firstValve = h.accessory.getServiceById(Service.Valve, "700001");
 
@@ -85,8 +89,9 @@ describe("HydrawiseController updateState defect assertions", () => {
 
     // Poll 2 drops the zone (valve pruned; the empty domain recomputes the program mode to no-program-scheduled), and the prune drops the zone's hint entry with
     // it. The default poll brings the zone back still running.
-    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") === undefined, { description: "the valve for zone 700001 to be removed" });
-    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
+    await advanceUntil(h.clock, () => h.accessory.getServiceById(Service.Valve, "700001") === undefined,
+      { description: "the valve for zone 700001 to be removed" });
+    await advanceUntil(h.clock, () => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
 
     const reappeared = h.accessory.getServiceById(Service.Valve, "700001");
     const irrigation = h.accessory.getService(Service.IrrigationSystem);
@@ -96,7 +101,7 @@ describe("HydrawiseController updateState defect assertions", () => {
 
     // The reappeared entry starts fresh with isManual false - the prune dropped the stale entry when the zone vanished - so the aggregate guard fires and
     // recomputes: one running, non-rain-stopped zone selects program-scheduled, even as the valve reports in use.
-    await waitUntil(() => reappeared.getCharacteristic(Characteristic.InUse).value === Characteristic.InUse.IN_USE,
+    await advanceUntil(h.clock, () => reappeared.getCharacteristic(Characteristic.InUse).value === Characteristic.InUse.IN_USE,
       { description: "the reappeared valve to read in use" });
     assert.equal(irrigation.getCharacteristic(Characteristic.ProgramMode).value, Characteristic.ProgramMode.PROGRAM_SCHEDULED,
       "the fresh entry lets the aggregate recompute to program-scheduled");
@@ -123,7 +128,7 @@ describe("HydrawiseController updateState defect assertions", () => {
       // differs from the stale first, and statusschedule.php has been called three times (poll 1, the malformed attempt, and the recovering retry) before it. A loop
       // that swallowed the malformed body instead would republish the stale status as the second publish after only two calls, converging by the third publish.
       // Every read is of the controller topic, so the availability word beside it cannot shift which publish is which.
-      await waitUntil(() => mqtt.publishedTo("controller").length >= 2, { description: "the second MQTT publish" });
+      await advanceUntil(h.clock, () => mqtt.publishedTo("controller").length >= 2, { description: "the second MQTT publish" });
 
       const first = expectAt(mqtt.publishedTo("controller"), 0, "MQTT publish").payload;
 
@@ -152,7 +157,7 @@ describe("HydrawiseController updateState defect assertions", () => {
 
       // A valid-JSON body missing relays fails the shape guard and throws through the same path as a parse failure, so the loop retries. The second publish is the
       // recovered default, reached after three statusschedule.php calls - the same distinguishing shape the malformed-body scenario asserts.
-      await waitUntil(() => mqtt.publishedTo("controller").length >= 2, { description: "the second MQTT publish" });
+      await advanceUntil(h.clock, () => mqtt.publishedTo("controller").length >= 2, { description: "the second MQTT publish" });
 
       const first = expectAt(mqtt.publishedTo("controller"), 0, "MQTT publish").payload;
 
@@ -194,7 +199,7 @@ describe("HydrawiseController updateState defect assertions", () => {
 
         const mqtt = present(h.mqtt, "the MQTT recorder");
 
-        await waitUntil(() => mqtt.publishedTo("controller").length >= 2, { description: "the second MQTT publish" });
+        await advanceUntil(h.clock, () => mqtt.publishedTo("controller").length >= 2, { description: "the second MQTT publish" });
 
         assert.notEqual(mqtt.publishedTo("controller")[1]?.payload, expectAt(mqtt.publishedTo("controller"), 0, "MQTT publish").payload,
           "the refused poll retries; the second publish is the recovered status, not the stale prior poll");
@@ -226,7 +231,7 @@ describe("HydrawiseController updateState defect assertions", () => {
 
       const mqtt = present(h.mqtt, "the MQTT recorder");
 
-      await waitUntil(() => mqtt.publishedTo("controller").length >= 1, { description: "the first MQTT publish" });
+      await settleUntil(() => mqtt.publishedTo("controller").length >= 1, { description: "the first MQTT publish" });
 
       assert.ok(h.accessory.getServiceById(Service.Valve, "700001"), "the adopted body's zone is projected");
       assert.ok(!loggedAt(h.entries, "error", "Unable to retrieve the current status"), "and the body at the edge logged no failure");
@@ -253,7 +258,7 @@ describe("HydrawiseController updateState defect assertions", () => {
     t.after(() => h.abort());
 
     // The recovering poll is the fourth fetch, so its start guarantees every refused attempt has settled and released its lines.
-    await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 4, { description: "the recovering poll", timeoutMs: 3000 });
+    await advanceThroughPolls(h, 3);
 
     assert.deepEqual(statusFailures(h).map(entry => entry.level), [ "error", "debug" ], "the first unreadable body is reported at error and its repeat at debug");
 
@@ -276,7 +281,7 @@ describe("HydrawiseController updateState defect assertions", () => {
 
     t.after(() => h.abort());
 
-    await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 4, { description: "the recovering poll", timeoutMs: 3000 });
+    await advanceThroughPolls(h, 3);
 
     assert.deepEqual(statusFailures(h).map(entry => entry.level), [ "error", "error" ], "a mis-shaped body after an unreadable one is a new reason, reported in full");
   });
@@ -294,19 +299,19 @@ describe("HydrawiseController updateState defect assertions", () => {
 
     t.after(() => h.abort());
 
-    await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 5, { description: "the recovering poll", timeoutMs: 3000 });
+    await advanceThroughPolls(h, 4);
 
     assert.deepEqual(statusFailures(h).map(entry => entry.level), [ "error", "error" ], "an adopted poll between unreadable bodies reports the later one in full");
   });
 
   test("all zones suspended aggregates to program-scheduled with the suspend switch on", async (t) => {
 
-    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: fastPolling(allSuspended()), kind: "response" }),
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: allSuspended(), kind: "response" }),
       signalAborted: false, userOptions: ["Enable.Device.Suspend.All.SN0A1B2C3D4"] });
 
     t.after(() => h.abort());
 
-    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700019") !== undefined, { description: "the valve for zone 700019 to appear" });
+    await settleUntil(() => h.accessory.getServiceById(Service.Valve, "700019") !== undefined, { description: "the valve for zone 700019 to appear" });
 
     const irrigation = h.accessory.getService(Service.IrrigationSystem);
     const suspend = h.accessory.getServiceById(Service.Switch, "All");
@@ -320,12 +325,12 @@ describe("HydrawiseController updateState defect assertions", () => {
 
   test("all zones rain-stopped aggregates to no-program-scheduled with the suspend switch off", async (t) => {
 
-    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: fastPolling(rainStopped()), kind: "response" }),
+    const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: rainStopped(), kind: "response" }),
       signalAborted: false, userOptions: ["Enable.Device.Suspend.All.SN0A1B2C3D4"] });
 
     t.after(() => h.abort());
 
-    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700019") !== undefined, { description: "the valve for zone 700019 to appear" });
+    await settleUntil(() => h.accessory.getServiceById(Service.Valve, "700019") !== undefined, { description: "the valve for zone 700019 to appear" });
 
     const irrigation = h.accessory.getService(Service.IrrigationSystem);
     const suspend = h.accessory.getServiceById(Service.Switch, "All");
@@ -348,16 +353,16 @@ describe("HydrawiseController updateState defect assertions", () => {
      * about the rest, which is exactly where a threading mistake would hide. ProgramMode is the observable end of that chain; the ledger itself is private.
      */
     const h = buildController({ hasV2Client: true,
-      program: (recorder) => recorder.programDefault("statusschedule.php", { body: fastPolling(rainStopped()), kind: "response" }), signalAborted: false });
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: rainStopped(), kind: "response" }), signalAborted: false });
 
     t.after(() => h.abort());
 
     // The facts land before the first poll completes, so that poll's own walk classifies against them rather than against a snapshot that arrived too late.
     h.controller.applyFacts({ facts: makeV2Facts({ zones: sentinelZoneMatrix.map(zone => [ zone.relay_id, makeZoneV2Facts({ sensorStopped: false }) ]) }),
-      fetchedAt: Math.floor(Date.now() / 1000) });
+      fetchedAt: seconds(h.clock) });
 
-    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700019") !== undefined, { description: "the valve for zone 700019 to appear" });
-    await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 2, { description: "the second status poll" });
+    await settleUntil(() => h.accessory.getServiceById(Service.Valve, "700019") !== undefined, { description: "the valve for zone 700019 to appear" });
+    await advanceThroughPolls(h, 1);
 
     const irrigation = h.accessory.getService(Service.IrrigationSystem);
 
@@ -377,9 +382,9 @@ describe("HydrawiseController updateState defect assertions", () => {
 
     t.after(() => h.abort());
 
-    // Poll 1 succeeds (running, active); poll 2 returns null so getStatus throws and the isFirstRun-false ~250ms backoff arm runs; the recovering default poll
-    // brings the zone back scheduled and inactive. Waiting for the valve to go inactive proves the recovery poll landed.
-    await waitUntil(() => {
+    // Poll 1 succeeds (running, active); poll 2 returns null so getStatus throws and the isFirstRun-false backoff arm, the cadence clamped at twice the retry
+    // interval, runs; the recovering default poll brings the zone back scheduled and inactive. Stepping until the valve reads inactive proves the recovery poll landed.
+    await advanceUntil(h.clock, () => {
 
       const valve = h.accessory.getServiceById(Service.Valve, "700001");
 
@@ -391,16 +396,15 @@ describe("HydrawiseController updateState defect assertions", () => {
 
   test("a steady-state poll failure waits out its sleep and its backoff on the platform's clock, at the wire's own cadence", async (t) => {
 
-    /* Every wait the loop takes reads the platform's clock: the sleep between polls and the backoff after a failed one alike. The cadence here is the wire's own
-     * minute rather than the suite's fast one, so a wait left on real time would hold the next poll a minute away and the count below would never move. Each wait
-     * is derived from the fixture's own cadence and the production constants, so the assertions read the numbers the loop chose rather than restating them.
+    /* Every wait the loop takes reads the platform's clock: the sleep between polls and the backoff after a failed one alike. The cadence is the wire's own
+     * minute, so a wait left on real time would hold the next poll a minute away and the count below would never move. Each wait is derived from the fixture's
+     * own cadence and the production constants, so the assertions read the numbers the loop chose rather than restating them.
      */
-    const clock = new TestClock();
     const status = makeStatusSchedule();
-    const sleep = (status.nextpoll + HYDRAWISE_API_JITTER) * 1000;
-    const backoff = Math.min(status.nextpoll + HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL * 2) * 1000;
+    const sleep = pollSleep(status);
+    const backoff = pollBackoff(status);
 
-    const h = buildController({ clock, program: (recorder) => {
+    const h = buildController({ program: (recorder) => {
 
       recorder.program("statusschedule.php", { body: status, kind: "response" });
       recorder.program("statusschedule.php", { kind: "null" });
@@ -411,30 +415,41 @@ describe("HydrawiseController updateState defect assertions", () => {
 
     const polls = (): number => h.retrieve.callsTo("statusschedule.php").length;
 
-    await advanceThroughSchedule(clock, []);
+    await advanceThroughSchedule(h.clock, []);
     assert.equal(polls(), 1, "the first poll runs at construction, with no wait ahead of it");
 
-    await advanceThroughSchedule(clock, [sleep]);
+    await advanceThroughSchedule(h.clock, [sleep]);
     assert.equal(polls(), 2, "the sleep between polls elapses on the clock, and the poll that fails follows it");
 
-    await advanceThroughSchedule(clock, [backoff]);
+    await advanceThroughSchedule(h.clock, [backoff]);
     assert.equal(polls(), 3, "the backoff after the failure elapses on the clock too, and the poll that recovers follows it");
 
-    assert.deepEqual(clock.requested, [ sleep, backoff, sleep ], "the clock carried the sleep, the backoff, and the sleep after the recovery, in that order");
+    assert.deepEqual(h.clock.requested, [ sleep, backoff, sleep ], "the clock carried the sleep, the backoff, and the sleep after the recovery, in that order");
   });
 
   test("a first-poll failure runs the fixed backoff arm and ends quietly on abort", async () => {
 
     await assertNoUnhandledRejections(async () => {
 
-      const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { kind: "null" }), signalAborted: false });
+      const h = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { kind: "null" }),
+        signalAborted: false });
 
-      // The very first poll returns null, so getStatus throws and retry evaluates the isFirstRun-true fixed backoff (HYDRAWISE_API_RETRY_INTERVAL) synchronously
-      // before suspending. A prompt abort ends that wait; because backoff() ran before delay() suspended, the arm is exercised without waiting out that interval.
-      await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 1, { description: "the first status poll" });
+      /* The very first poll returns null, so getStatus throws and retry evaluates the isFirstRun-true fixed backoff (HYDRAWISE_API_RETRY_INTERVAL) and arms it on
+       * the platform's clock, the one wait standing there. A prompt abort ends that wait, so stepping the clock across the whole interval afterwards moves no
+       * further poll.
+       */
+      await settleUntil(() => h.clock.pending === 1, { description: "the first poll's backoff to be armed" });
+
+      assert.equal(h.retrieve.callsTo("statusschedule.php").length, 1, "the first poll runs at construction and fails");
+      assert.deepEqual(h.clock.requested, [HYDRAWISE_API_RETRY_INTERVAL * 1000], "the backoff it arms is the fixed first-run interval");
 
       await h.abort();
 
+      h.clock.advance(HYDRAWISE_API_RETRY_INTERVAL * 1000);
+      await settle();
+
+      assert.deepEqual([ h.clock.now(), h.clock.pending ], [ HYDRAWISE_API_RETRY_INTERVAL * 1000, 0 ],
+        "the abort released the backoff, and its whole interval has passed on the clock");
       assert.equal(h.retrieve.callsTo("statusschedule.php").length, 1, "the loop should make exactly one poll before the abort ends the backoff wait");
       assert.ok(!loggedAt(h.entries, "error", "stopped unexpectedly"), "a shutdown abort should unwind the loop without a fault report");
     });
@@ -469,16 +484,16 @@ describe("HydrawiseController suspend switch with account facts", () => {
      * exactly that during a commanded suspend-all. Built on the all-suspended fixture instead, this assertion would pass against unmodified code.
      */
     const h = buildController({ hasV2Client: true,
-      program: (recorder) => recorder.programDefault("statusschedule.php", { body: fastPolling(rainStopped()), kind: "response" }),
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: rainStopped(), kind: "response" }),
       signalAborted: false, userOptions: ["Enable.Device.Suspend.All.SN0A1B2C3D4"] });
 
     t.after(() => h.abort());
 
-    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700019") !== undefined, { description: "the valve for zone 700019 to appear" });
+    await settleUntil(() => h.accessory.getServiceById(Service.Valve, "700019") !== undefined, { description: "the valve for zone 700019 to appear" });
 
     assert.equal(suspendSwitch(h).getCharacteristic(Characteristic.On).value, false, "the key-based heuristic reads this shape as not suspended");
 
-    h.controller.applyFacts({ facts: allZonesSuspended(), fetchedAt: Math.floor(Date.now() / 1000) });
+    h.controller.applyFacts({ facts: allZonesSuspended(), fetchedAt: seconds(h.clock) });
 
     assert.equal(suspendSwitch(h).getCharacteristic(Characteristic.On).value, true, "the account facts resolve what the wire alone could not");
   });
@@ -497,9 +512,9 @@ describe("HydrawiseController suspend switch with account facts", () => {
 
     t.after(() => h.abort());
 
-    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700019") !== undefined, { description: "the valve for zone 700019 to appear" });
+    await settleUntil(() => h.accessory.getServiceById(Service.Valve, "700019") !== undefined, { description: "the valve for zone 700019 to appear" });
 
-    h.controller.applyFacts({ facts: allZonesSuspended(), fetchedAt: Math.floor(Date.now() / 1000) });
+    h.controller.applyFacts({ facts: allZonesSuspended(), fetchedAt: seconds(h.clock) });
 
     assert.equal(suspendSwitch(h).getCharacteristic(Characteristic.On).value, false, "a zone the user forced into a run means the account is not all-suspended");
   });
@@ -507,18 +522,18 @@ describe("HydrawiseController suspend switch with account facts", () => {
   test("a zone the snapshot does not name leaves the account short of all-suspended", async (t) => {
 
     const h = buildController({ hasV2Client: true,
-      program: (recorder) => recorder.programDefault("statusschedule.php", { body: fastPolling(rainStopped()), kind: "response" }),
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: rainStopped(), kind: "response" }),
       signalAborted: false, userOptions: ["Enable.Device.Suspend.All.SN0A1B2C3D4"] });
 
     t.after(() => h.abort());
 
-    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700019") !== undefined, { description: "the valve for zone 700019 to appear" });
+    await settleUntil(() => h.accessory.getServiceById(Service.Valve, "700019") !== undefined, { description: "the valve for zone 700019 to appear" });
 
     // Every zone but one is reported suspended. The omitted zone is an unknown rather than an implicit suspension, so the account is not all-suspended.
     const partial = makeV2Facts({ zones: sentinelZoneMatrix.filter(zone => zone.relay_id !== 700019)
       .map(zone => [ zone.relay_id, makeZoneV2Facts({ suspendedUntil: SUSPENDED_UNTIL }) ]) });
 
-    h.controller.applyFacts({ facts: partial, fetchedAt: Math.floor(Date.now() / 1000) });
+    h.controller.applyFacts({ facts: partial, fetchedAt: seconds(h.clock) });
 
     assert.equal(suspendSwitch(h).getCharacteristic(Characteristic.On).value, false, "one unaccounted zone is enough to fall short of all-suspended");
   });
@@ -535,12 +550,12 @@ describe("HydrawiseController suspend switch with account facts", () => {
      */
     const h = buildController({ hasV2Client: true, program: (recorder) => {
 
-      recorder.programDefault("statusschedule.php", { body: fastPolling(allSuspended()), kind: "response" });
+      recorder.programDefault("statusschedule.php", { body: allSuspended(), kind: "response" });
     }, signalAborted: false, userOptions: ["Enable.Device.Suspend.All.SN0A1B2C3D4"] });
 
     t.after(() => h.abort());
 
-    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700019") !== undefined, { description: "the valve for zone 700019 to appear" });
+    await settleUntil(() => h.accessory.getServiceById(Service.Valve, "700019") !== undefined, { description: "the valve for zone 700019 to appear" });
 
     const service = h.accessory.getServiceById(Service.Switch, "All");
 
@@ -552,7 +567,7 @@ describe("HydrawiseController suspend switch with account facts", () => {
 
     // A fetch that was already in flight when that command landed answers with facts that predate it, and so cannot know about it.
     h.controller.applyFacts({ facts: makeV2Facts({ zones: sentinelZoneMatrix.map(zone => [ zone.relay_id, makeZoneV2Facts() ]) }),
-      fetchedAt: Math.floor(Date.now() / 1000) - 100 });
+      fetchedAt: seconds(h.clock) - 100 });
 
     assert.equal(suspendSwitch(h).getCharacteristic(Characteristic.On).value, true, "a snapshot older than the command is ignored and the switch stays on");
   });
@@ -560,12 +575,12 @@ describe("HydrawiseController suspend switch with account facts", () => {
   test("the two key-based topology assertions are untouched by an install without credentials", async (t) => {
 
     // The parity restatement: with no credentials nothing above applies at all, and the heuristic answers from the wire alone for both topologies.
-    const suspended = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: fastPolling(allSuspended()),
+    const suspended = buildController({ program: (recorder) => recorder.programDefault("statusschedule.php", { body: allSuspended(),
       kind: "response" }), signalAborted: false, userOptions: ["Enable.Device.Suspend.All.SN0A1B2C3D4"] });
 
     t.after(() => suspended.abort());
 
-    await waitUntil(() => suspended.accessory.getServiceById(Service.Valve, "700019") !== undefined,
+    await settleUntil(() => suspended.accessory.getServiceById(Service.Valve, "700019") !== undefined,
       { description: "the valve for zone 700019 on the suspended controller to appear" });
     assert.equal(suspendSwitch(suspended).getCharacteristic(Characteristic.On).value, true, "an all-sentinel account still reads as suspended");
   });
@@ -583,17 +598,17 @@ describe("HydrawiseController program mode reads the sensor, not the classificat
      * facts are configured.
      */
     const h = buildController({ hasV2Client: true,
-      program: (recorder) => recorder.programDefault("statusschedule.php", { body: fastPolling(rainStopped()), kind: "response" }), signalAborted: false });
+      program: (recorder) => recorder.programDefault("statusschedule.php", { body: rainStopped(), kind: "response" }), signalAborted: false });
 
     t.after(() => h.abort());
 
     const zones = sentinelZoneMatrix.map(zone => [ zone.relay_id,
       { name: null, sensorStopped: true, suspendedUntil: (zone.relay_id === 700019) ? SUSPENDED_UNTIL : null } ] as const);
 
-    h.controller.applyFacts({ facts: makeV2Facts({ zones }), fetchedAt: Math.floor(Date.now() / 1000) });
+    h.controller.applyFacts({ facts: makeV2Facts({ zones }), fetchedAt: seconds(h.clock) });
 
-    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700019") !== undefined, { description: "the valve for zone 700019 to appear" });
-    await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 2, { description: "the second status poll" });
+    await settleUntil(() => h.accessory.getServiceById(Service.Valve, "700019") !== undefined, { description: "the valve for zone 700019 to appear" });
+    await advanceThroughPolls(h, 1);
 
     const irrigation = h.accessory.getService(Service.IrrigationSystem);
 

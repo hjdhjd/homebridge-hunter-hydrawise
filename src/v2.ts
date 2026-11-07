@@ -2,12 +2,12 @@
  *
  * v2.ts: Hydrawise v2 GraphQL API client.
  */
+import type { Clock, HomebridgePluginLogging, Nullable, RateBudget } from "homebridge-plugin-utils";
 import { HYDRAWISE_TRANSPORT_FAULT_SENTENCES, HYDRAWISE_V2_CLIENT_ID, HYDRAWISE_V2_CLIENT_SECRET, HYDRAWISE_V2_GRAPH_ENDPOINT, HYDRAWISE_V2_RATE_LIMIT_REASON,
   HYDRAWISE_V2_REFRESH_THRESHOLD, HYDRAWISE_V2_TIMEOUT, HYDRAWISE_V2_TOKEN_ENDPOINT, PLUGIN_NAME } from "./settings.ts";
-import type { HomebridgePluginLogging, Nullable, RateBudget } from "homebridge-plugin-utils";
 import type { HydrawiseControllerV2Facts, HydrawiseV2Account, HydrawiseV2ErrorPath, HydrawiseV2Grant, HydrawiseV2GraphError, HydrawiseV2GraphResponse, HydrawiseV2Read,
   HydrawiseV2TokenResponse, HydrawiseV2TokenState } from "./types.ts";
-import { classifyTransportError, composeSignals, createApiDispatcher } from "homebridge-plugin-utils";
+import { armDeadline, classifyTransportError, composeSignals, createApiDispatcher } from "homebridge-plugin-utils";
 import type { Dispatcher } from "undici";
 import { controllerV2Facts } from "./types.ts";
 import { request } from "undici";
@@ -89,6 +89,10 @@ type HydrawiseV2TransportResult<T> =
   { data: Nullable<T>; errors: readonly HydrawiseV2GraphError[]; outcome: "answered" } |
   { failure: Nullable<HydrawiseV2Failure>; outcome: "failed" | "throttled" };
 
+// What one request to the account API came to once its body was read or drained under the request's own deadline: the parsed body of a success status, or the
+// status alone for any other, its body drained. A request that could not be made or a body that could not be read throws instead, for the caller to classify.
+type HydrawiseV2Exchange<T> = { body: T; outcome: "read" } | { outcome: "refused"; statusCode: number };
+
 /* Construction options for the v2 client.
  *
  * The dispatcher arrives as a FACTORY rather than a dispatcher because this client re-arms its connection pool after a timeout. A factory keeps that self-heal
@@ -96,10 +100,13 @@ type HydrawiseV2TransportResult<T> =
  * constructor builds.
  *
  * The budget is likewise injected rather than built here, because pacing is an account-wide concern the platform owns. Every read and every token grant draw it.
+ * The clock is the platform's own, the time source every request deadline is armed on and the token's expiry is read against, so the client keeps the platform's
+ * one timeline rather than a time source of its own.
  */
 export interface HydrawiseV2ClientOptions {
 
   budget: RateBudget;
+  clock: Clock;
   dispatcherFactory?: () => Dispatcher;
   log: HomebridgePluginLogging;
   password: string;
@@ -122,6 +129,7 @@ export interface HydrawiseV2ClientOptions {
 export class HydrawiseV2Client {
 
   private readonly budget: RateBudget;
+  private readonly clock: Clock;
   private currentDispatcher: Dispatcher;
   private readonly dispatcherFactory: () => Dispatcher;
   private readonly log: HomebridgePluginLogging;
@@ -134,6 +142,7 @@ export class HydrawiseV2Client {
   constructor(options: HydrawiseV2ClientOptions) {
 
     this.budget = options.budget;
+    this.clock = options.clock;
     this.log = options.log;
     this.password = options.password;
     this.signal = options.signal;
@@ -308,31 +317,28 @@ export class HydrawiseV2Client {
         return { failure: null, outcome: grant.status };
       }
 
-      const response = await request(HYDRAWISE_V2_GRAPH_ENDPOINT, { body: JSON.stringify({ query }), dispatcher: this.currentDispatcher,
-        headers: { "authorization": "Bearer " + grant.accessToken, "content-type": "application/json" }, method: "POST", signal: this.requestSignal() });
+      // Every field on the envelope is optional by design, so the exchange's cast cannot manufacture a field this method or a caller would wrongly trust as present.
+      const answer = await this.exchange<HydrawiseV2GraphResponse<T>>(HYDRAWISE_V2_GRAPH_ENDPOINT, { body: JSON.stringify({ query }),
+        headers: { "authorization": "Bearer " + grant.accessToken, "content-type": "application/json" } });
 
-      if((response.statusCode < 200) || (response.statusCode >= 300)) {
+      if(answer.outcome === "refused") {
 
-        // The pool holds a single connection, and a body nobody reads holds that connection until it is consumed, so an unread body would stall the next request.
-        await response.body.dump();
-
-        if(response.statusCode === 429) {
+        if(answer.statusCode === 429) {
 
           return { failure: RATE_LIMITED, outcome: "throttled" };
         }
 
         // The server refused this token, and without this it would be presented again until it reached its renewal window. The next tick runs the password grant.
         // Nothing retries inside this tick, because a retry would spend a grant and a read against a ceiling that is the tick's to pace.
-        if(response.statusCode === 401) {
+        if(answer.statusCode === 401) {
 
           this.resetToken();
         }
 
-        return { failure: statusFailure(response.statusCode), outcome: "failed" };
+        return { failure: statusFailure(answer.statusCode), outcome: "failed" };
       }
 
-      // Every field on this shape is optional by design, so the cast cannot manufacture a field this method or a caller would wrongly trust as present.
-      const body = await response.body.json() as HydrawiseV2GraphResponse<T>;
+      const body = answer.body;
       const errors = body.errors ?? [];
 
       if(errors.length && !body.data) {
@@ -397,20 +403,18 @@ export class HydrawiseV2Client {
         params.set("username", this.username);
       }
 
-      const response = await request(HYDRAWISE_V2_TOKEN_ENDPOINT, { body: params.toString(), dispatcher: this.currentDispatcher,
-        headers: { "content-type": "application/x-www-form-urlencoded" }, method: "POST", signal: this.requestSignal() });
+      // Every field on this shape is optional, for the same reason the GraphQL envelope's are: an untrusted OAuth response cannot promise the wire keeps its shape.
+      const answer = await this.exchange<HydrawiseV2TokenResponse>(HYDRAWISE_V2_TOKEN_ENDPOINT, { body: params.toString(),
+        headers: { "content-type": "application/x-www-form-urlencoded" } });
 
-      if((response.statusCode < 200) || (response.statusCode >= 300)) {
+      if(answer.outcome === "refused") {
 
-        // The pool holds a single connection, and a body nobody reads holds that connection until it is consumed, so an unread body would stall the next request.
-        await response.body.dump();
-
-        const throttled = response.statusCode === 429;
+        const throttled = answer.statusCode === 429;
 
         // Trouble on Hydrawise's side says nothing about the credentials, so it is reported as what it is rather than as a password to check.
-        if(throttled || (response.statusCode >= 500)) {
+        if(throttled || (answer.statusCode >= 500)) {
 
-          this.report(TOKEN_FAILURE_SENTENCE, throttled ? RATE_LIMITED : statusFailure(response.statusCode));
+          this.report(TOKEN_FAILURE_SENTENCE, throttled ? RATE_LIMITED : statusFailure(answer.statusCode));
 
           if(renewing?.refreshToken) {
 
@@ -423,6 +427,7 @@ export class HydrawiseV2Client {
           return { status: throttled ? "throttled" : "failed" };
         }
 
+        // The refused renewal's exchange has already released its deadline, so the password grant it falls back to runs under a deadline of its own.
         if(renewing?.refreshToken) {
 
           return await this.acquireToken(null);
@@ -433,8 +438,7 @@ export class HydrawiseV2Client {
         return this.resetToken();
       }
 
-      // Every field on this shape is optional, for the same reason the GraphQL envelope's are: an untrusted OAuth response cannot promise the wire keeps its shape.
-      const grant = await response.body.json() as HydrawiseV2TokenResponse;
+      const grant = answer.body;
 
       if(!grant.access_token?.length) {
 
@@ -520,17 +524,34 @@ export class HydrawiseV2Client {
     this.currentDispatcher = this.dispatcherFactory();
   }
 
-  // The signal one request runs under: its own timeout composed with the plugin's lifetime, so a slow request aborts on the timeout and an in-flight request aborts
-  // on shutdown, both through one signal handed to undici. The timeout is armed here, after the budget has admitted the call, so waiting for a slot never eats into
-  // the time the request itself is allowed.
-  private requestSignal(): AbortSignal {
+  /* One request to the account API under a deadline of its own, held over the request and its body's read or drain and released when this call returns. A body
+   * whose status is not a success is drained rather than left unread, because the pool holds a single connection and a body nobody reads holds that connection
+   * until it is consumed, which would stall the next request.
+   *
+   * The deadline is armed on the platform's clock as the request is made, after the budget has admitted the call and, for a read, after its token is in hand, so
+   * waiting for a slot or a grant never eats into the time the request itself is allowed. It is composed with the plugin's lifetime, so a slow request aborts on
+   * the deadline and an in-flight request aborts on shutdown, both through one signal handed to undici.
+   */
+  private async exchange<T>(endpoint: string, { body, headers }: { body: string; headers: Record<string, string> }): Promise<HydrawiseV2Exchange<T>> {
 
-    return composeSignals(AbortSignal.timeout(HYDRAWISE_V2_TIMEOUT * 1000), this.signal);
+    using deadline = armDeadline(HYDRAWISE_V2_TIMEOUT * 1000, { clock: this.clock });
+
+    const signal = composeSignals(deadline.signal, this.signal);
+    const response = await request(endpoint, { body, dispatcher: this.currentDispatcher, headers, method: "POST", signal });
+
+    if((response.statusCode < 200) || (response.statusCode >= 300)) {
+
+      await response.body.dump();
+
+      return { outcome: "refused", statusCode: response.statusCode };
+    }
+
+    return { body: await response.body.json() as T, outcome: "read" };
   }
 
-  // The current time in epoch seconds, the unit the token's stated lifetime and its stored expiry both speak.
+  // The current time in epoch seconds, read from the platform's clock, the unit the token's stated lifetime and its stored expiry both speak.
   private now(): number {
 
-    return Math.floor(Date.now() / 1000);
+    return Math.floor(this.clock.now() / 1000);
   }
 }

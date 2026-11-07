@@ -11,7 +11,8 @@
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id, so camelcase is disabled here to let the zone fixtures mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { Characteristic, Service, buildController, makeV2Facts, makeZoneV2Facts, pollsCompleted, seedEstablished, waitFor } from "./testing/platform.helpers.ts";
+import { Characteristic, Service, advanceThroughPolls, buildController, makeV2Facts, makeZoneV2Facts, seconds, seedEstablished,
+  settleFor } from "./testing/platform.helpers.ts";
 import { FeatureOptions, ServiceEventTypes, acquireService, getServiceName, setAccessoryName, setServiceName } from "homebridge-plugin-utils";
 import { HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
 import { HYDRAWISE_CONTROLLER_FALLBACK_NAME, HYDRAWISE_ZONE_FALLBACK_NAME, HydrawiseReservedNames, scheduleStatus } from "./types.ts";
@@ -19,10 +20,10 @@ import type { Service as HapService, PlatformAccessory } from "homebridge";
 import type { HydrawiseAccessory, HydrawiseAccessoryContext, HydrawiseControllerIdentity, HydrawiseControllerV2Facts, HydrawiseZoneConfig,
   HydrawiseZoneIdentity, StatusScheduleResponse } from "./types.ts";
 import type { HydrawiseControllerOption, HydrawiseControllerValueOption, HydrawiseZoneOption, HydrawiseZoneValueOption } from "./options.ts";
+import { advanceUntil, logCount, present, settle, settleUntil, triggerSet } from "homebridge-plugin-utils/testing";
 import { describe, test } from "node:test";
-import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
 import { featureOptionCategories, featureOptions } from "./options.ts";
-import { logCount, present, settle, triggerSet, waitUntil } from "homebridge-plugin-utils/testing";
+import { makeStatusSchedule, makeZone } from "./api.helpers.ts";
 import type { BuildControllerResult } from "./testing/platform.helpers.ts";
 import assert from "node:assert/strict";
 import { bareSensors } from "./api.fixtures.ts";
@@ -119,22 +120,19 @@ function rosterOf(h: BuildControllerResult): HydrawiseZoneIdentity[] {
   return (h.accessory.context as HydrawiseAccessoryContext).zones ?? [];
 }
 
-// The current whole second, the unit a facts snapshot's own stamp speaks.
-function nowSeconds(): number {
-
-  return Math.floor(Date.now() / 1000);
-}
-
 // One refresh tick's facts for the zone under test, carrying the account's name and nothing else to say.
 function v2Facts(name: string): HydrawiseControllerV2Facts {
 
   return makeV2Facts({ zones: [[ ZONE_RELAY_ID, makeZoneV2Facts({ name }) ]] });
 }
 
-// A one-zone, fast-cadence schedule with a bare sensor block, so a live-loop test cycles in roughly 250ms.
+/* A one-zone, wire-realistic schedule with a bare sensor block. The first poll goes out as the controller is built and lands within turns, and each poll after it
+ * waits on the controller's clock until the row steps it, so a row changes what the next poll will see - a feature option, the programmed body, the facts - before
+ * that poll fetches.
+ */
 function schedule(name: string): StatusScheduleResponse {
 
-  return fastPolling(makeStatusSchedule({ relays: [zone(name)], sensors: bareSensors }));
+  return makeStatusSchedule({ relays: [zone(name)], sensors: bareSensors });
 }
 
 // The zone under test, named as the wire reports it. It is scheduled well beyond the active-zone window, so a poll settles its valve without also driving a start
@@ -154,10 +152,10 @@ function secondZone(): HydrawiseZoneConfig {
   return makeZone({ name: SECOND_WIRE_NAME, relay: 2, relay_id: SECOND_RELAY_ID, run: 480, time: 68000, timestr: "16:00" });
 }
 
-// A fast-cadence schedule around any zones, for the rows that host more than the one zone the single-zone schedule above carries.
+// The same wire-realistic schedule around any zones, for the rows that host more than the one zone the single-zone schedule above carries.
 function zonesSchedule(zones: HydrawiseZoneConfig[]): StatusScheduleResponse {
 
-  return fastPolling(makeStatusSchedule({ relays: zones, sensors: bareSensors }));
+  return makeStatusSchedule({ relays: zones, sensors: bareSensors });
 }
 
 /* Seed a cached valve already bearing a name, the shape Homebridge restores when an accessory returns from its cache carrying a rename the user made in the Home
@@ -173,10 +171,10 @@ function seedNamedValve(name: string): (accessory: PlatformAccessory) => void {
   };
 }
 
-// Wait for the zone's valve to exist, then hand it back.
+// Wait for the zone's valve to exist, which the poll that hosts it puts in place with no step of the clock, then hand it back.
 async function valveOf(h: BuildControllerResult): Promise<HapService> {
 
-  return waitFor(() => h.accessory.getServiceById(Service.Valve, ZONE_SUBTYPE), { description: "the zone valve to appear" });
+  return settleFor(() => h.accessory.getServiceById(Service.Valve, ZONE_SUBTYPE), { description: "the zone valve to appear" });
 }
 
 // The name the valve presents to HomeKit, read through the same helper production reads it through.
@@ -234,13 +232,11 @@ function identityOf(h: BuildControllerResult): HydrawiseControllerIdentity | und
   return (h.accessory.context as HydrawiseAccessoryContext).controller;
 }
 
-// Let at least one complete polling pass run past the current one, so an assertion about what a later poll did or did not do has a poll to describe. Bounding on
-// the second call ahead guarantees the intervening pass ran its zone loop to completion before we read.
+// Step the controller's clock until at least one complete polling pass has run past the current one, so an assertion about what a later poll did or did not do has
+// a poll to describe. Bounding on the second call ahead guarantees the intervening pass ran its zone loop to completion before we read.
 async function pollPast(h: BuildControllerResult): Promise<void> {
 
-  const seen = h.retrieve.callsTo("statusschedule.php").length;
-
-  await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= (seen + 2), { description: "the second status poll past the one in flight" });
+  await advanceThroughPolls(h, pollsBegun(h) + 1);
 }
 
 // Rename a service in the Home app, the way a HomeKit controller's write reaches it, and let the event loop's next turn pass, which is when a watch restores.
@@ -264,7 +260,7 @@ function signalRegistrations(h: BuildControllerResult): number {
   return getEventListeners(h.platform.signal, "abort").length;
 }
 
-// The number of status polls the controller has begun, which a row hands to pollsCompleted to read its next sample at the same point of the loop.
+// The number of status polls the controller has begun, which a row hands to advanceThroughPolls to read its next sample at the same point of the loop.
 function pollsBegun(h: BuildControllerResult): number {
 
   return h.retrieve.callsTo("statusschedule.php").length;
@@ -332,7 +328,7 @@ describe("zone names the plugin owns", () => {
 
     const valve = await valveOf(h);
 
-    await waitUntil(() => nameOf(valve) === WIRE_NAME, { description: "the valve to take the wire name" });
+    await settleUntil(() => nameOf(valve) === WIRE_NAME, { description: "the valve to take the wire name" });
 
     assert.equal(nameOf(valve), WIRE_NAME, "a Home-app rename yields to the name Hydrawise reports");
   });
@@ -346,7 +342,7 @@ describe("zone names the plugin owns", () => {
 
     const valve = await valveOf(h);
 
-    await waitUntil(() => nameOf(valve) === OVERRIDE_NAME, { description: "the valve to take the override name" });
+    await settleUntil(() => nameOf(valve) === OVERRIDE_NAME, { description: "the valve to take the override name" });
 
     assert.equal(nameOf(valve), OVERRIDE_NAME, "a Home-app rename yields to the configured override");
   });
@@ -365,7 +361,7 @@ describe("zone names the plugin owns", () => {
 
     const valve = await valveOf(h);
 
-    await waitUntil(() => nameOf(valve) === WIRE_RENAMED, { description: "the valve to take the renamed wire name" });
+    await advanceUntil(h.clock, () => nameOf(valve) === WIRE_RENAMED, { description: "the valve to take the renamed wire name" });
 
     assert.equal(nameOf(valve), WIRE_RENAMED, "a Hydrawise-side rename lands on the next poll");
   });
@@ -432,7 +428,7 @@ describe("zone name synchronization saves", () => {
 
     h.platform.featureOptions.configuredOptions = ["Enable.Device.Name." + ZONE_SUBTYPE + "=" + OVERRIDE_NAME];
 
-    await waitUntil(() => nameOf(valve) === OVERRIDE_NAME, { description: "the valve to take the override name" });
+    await advanceUntil(h.clock, () => nameOf(valve) === OVERRIDE_NAME, { description: "the valve to take the override name" });
     await pollPast(h);
     await h.abort();
 
@@ -577,14 +573,14 @@ describe("the zone name option's declared scope", () => {
 
     const valve = await valveOf(h);
 
-    h.controller.applyFacts({ facts: v2Facts(ACCOUNT_NAME), fetchedAt: nowSeconds() });
+    h.controller.applyFacts({ facts: v2Facts(ACCOUNT_NAME), fetchedAt: seconds(h.clock) });
 
     assert.equal(nameOf(valve), OVERRIDE_NAME, "the user's own name outranks everything, account name included");
 
     // Drop the override and let a poll re-resolve. The account's name is what remains, and it beats the truncated form the wire is still reporting.
     h.platform.featureOptions.configuredOptions = [SYNC_NAME_ON];
 
-    await waitUntil(() => nameOf(valve) === ACCOUNT_NAME, { description: "the valve to take the account name" });
+    await advanceUntil(h.clock, () => nameOf(valve) === ACCOUNT_NAME, { description: "the valve to take the account name" });
 
     assert.equal(nameOf(valve), ACCOUNT_NAME, "with no override, the account's full name beats the wire's truncated one");
   });
@@ -609,11 +605,11 @@ describe("the zone name option's declared scope", () => {
 
     const valve = await valveOf(h);
 
-    h.controller.applyFacts({ facts: v2Facts(ACCOUNT_NAME), fetchedAt: nowSeconds() });
+    h.controller.applyFacts({ facts: v2Facts(ACCOUNT_NAME), fetchedAt: seconds(h.clock) });
 
-    await waitUntil(() => nameOf(valve) === ACCOUNT_NAME, { description: "the valve to take the account name" });
+    await advanceUntil(h.clock, () => nameOf(valve) === ACCOUNT_NAME, { description: "the valve to take the account name" });
 
-    h.controller.applyFacts({ facts: v2Facts(ACCOUNT_NAME), fetchedAt: nowSeconds() - (HYDRAWISE_V2_FACTS_TTL + 1) });
+    h.controller.applyFacts({ facts: v2Facts(ACCOUNT_NAME), fetchedAt: seconds(h.clock) - (HYDRAWISE_V2_FACTS_TTL + 1) });
 
     await pollPast(h);
     await h.abort();
@@ -640,14 +636,14 @@ describe("the zone name option's declared scope", () => {
 
     const valve = await valveOf(h);
 
-    h.controller.applyFacts({ facts: v2Facts(ACCOUNT_NAME), fetchedAt: nowSeconds() });
+    h.controller.applyFacts({ facts: v2Facts(ACCOUNT_NAME), fetchedAt: seconds(h.clock) });
 
-    await waitUntil(() => nameOf(valve) === ACCOUNT_NAME, { description: "the valve to take the account name" });
+    await advanceUntil(h.clock, () => nameOf(valve) === ACCOUNT_NAME, { description: "the valve to take the account name" });
 
     // The facts age out and the wire reports a different name, so nothing is left that the held name can be the untruncated form OF.
-    h.controller.applyFacts({ facts: v2Facts(ACCOUNT_NAME), fetchedAt: nowSeconds() - (HYDRAWISE_V2_FACTS_TTL + 1) });
+    h.controller.applyFacts({ facts: v2Facts(ACCOUNT_NAME), fetchedAt: seconds(h.clock) - (HYDRAWISE_V2_FACTS_TTL + 1) });
 
-    await waitUntil(() => nameOf(valve) === WIRE_UNRELATED, { description: "the valve to take the unrelated wire name" });
+    await advanceUntil(h.clock, () => nameOf(valve) === WIRE_UNRELATED, { description: "the valve to take the unrelated wire name" });
 
     assert.equal(nameOf(valve), WIRE_UNRELATED, "a wire rename outside the truncation relationship reaches the valve rather than being held");
   });
@@ -666,10 +662,10 @@ describe("the zone name option's declared scope", () => {
 
     const valve = await valveOf(h);
 
-    h.controller.applyFacts({ facts: v2Facts(ACCOUNT_NAME), fetchedAt: nowSeconds() });
+    h.controller.applyFacts({ facts: v2Facts(ACCOUNT_NAME), fetchedAt: seconds(h.clock) });
 
     // The roster rewrite goes through the same change-gated persistence any Hydrawise-side rename does, so it lands on the poll that first sees the new name.
-    await waitUntil(() => rosterOf(h)[0]?.name === ACCOUNT_NAME, { description: "the persisted roster to carry the account name" });
+    await advanceUntil(h.clock, () => rosterOf(h)[0]?.name === ACCOUNT_NAME, { description: "the persisted roster to carry the account name" });
 
     assert.equal(rosterOf(h)[0]?.name, ACCOUNT_NAME, "the roster persists the account's name");
     assert.equal(nameOf(valve), OVERRIDE_NAME, "while the valve the user looks at still carries their own");
@@ -765,7 +761,7 @@ describe("the name carry across a restart", () => {
 
     assert.equal(identityOf(h)?.name, CONTROLLER_ACCOUNT_EXTENDED, "the restored identity is in place before the first poll runs");
 
-    await waitUntil(() => nameOf(irrigationOf(h)) === CONTROLLER_ACCOUNT_EXTENDED, { description: "the irrigation system to take the extended account name" });
+    await settleUntil(() => nameOf(irrigationOf(h)) === CONTROLLER_ACCOUNT_EXTENDED, { description: "the irrigation system to take the extended account name" });
 
     const malformed = buildController({ hasV2Client: true,
       program: (recorder) => recorder.programDefault("statusschedule.php", { body: schedule(WIRE_NAME), kind: "response" }),
@@ -790,15 +786,15 @@ describe("the name carry across a restart", () => {
 
     const valve = await valveOf(h);
 
-    h.controller.applyFacts({ facts: makeV2Facts({ zones: [[ ZONE_RELAY_ID, makeZoneV2Facts({ name: null }) ]] }), fetchedAt: nowSeconds() });
+    h.controller.applyFacts({ facts: makeV2Facts({ zones: [[ ZONE_RELAY_ID, makeZoneV2Facts({ name: null }) ]] }), fetchedAt: seconds(h.clock) });
 
     await pollPast(h);
 
     assert.equal(nameOf(valve), ACCOUNT_NAME, "a facts entry carrying no name leaves the carried name standing");
 
-    h.controller.applyFacts({ facts: v2Facts(ACCOUNT_RENAMED), fetchedAt: nowSeconds() });
+    h.controller.applyFacts({ facts: v2Facts(ACCOUNT_RENAMED), fetchedAt: seconds(h.clock) });
 
-    await waitUntil(() => nameOf(valve) === ACCOUNT_RENAMED, { description: "the valve to take the renamed account name" });
+    await advanceUntil(h.clock, () => nameOf(valve) === ACCOUNT_RENAMED, { description: "the valve to take the renamed account name" });
 
     assert.equal(nameOf(valve), ACCOUNT_RENAMED, "and a facts entry that does carry one replaces it outright");
   });
@@ -819,7 +815,7 @@ describe("the name carry across a restart", () => {
 
     const valve = await valveOf(h);
 
-    await waitUntil(() => nameOf(irrigationOf(h)) === CONTROLLER_WIRE_NAME, { description: "the irrigation system to take the wire name" });
+    await settleUntil(() => nameOf(irrigationOf(h)) === CONTROLLER_WIRE_NAME, { description: "the irrigation system to take the wire name" });
     await pollPast(h);
     await h.abort();
 
@@ -865,9 +861,9 @@ describe("controller naming", () => {
 
     assert.equal(nameOf(irrigation), CONTROLLER_WIRE_NAME, "the controller starts out carrying the name the key-based wire reports");
 
-    h.controller.applyFacts({ facts: controllerV2Facts(CONTROLLER_ACCOUNT_NAME), fetchedAt: nowSeconds() });
+    h.controller.applyFacts({ facts: controllerV2Facts(CONTROLLER_ACCOUNT_NAME), fetchedAt: seconds(h.clock) });
 
-    await waitUntil(() => nameOf(irrigation) === CONTROLLER_ACCOUNT_NAME, { description: "the irrigation system to take the account name" });
+    await settleUntil(() => nameOf(irrigation) === CONTROLLER_ACCOUNT_NAME, { description: "the irrigation system to take the account name" });
 
     assert.equal(nameOf(irrigation), CONTROLLER_ACCOUNT_NAME, "the irrigation system service adopts the account's name on the next poll");
     assert.equal(h.accessory.displayName, CONTROLLER_ACCOUNT_NAME, "the accessory's own display name follows it");
@@ -885,10 +881,10 @@ describe("controller naming", () => {
 
     const irrigation = irrigationOf(h);
 
-    h.controller.applyFacts({ facts: controllerV2Facts(CONTROLLER_ACCOUNT_NAME), fetchedAt: nowSeconds() });
+    h.controller.applyFacts({ facts: controllerV2Facts(CONTROLLER_ACCOUNT_NAME), fetchedAt: seconds(h.clock) });
 
     // The identity is what tells the opt-out from a failure to learn the name at all: synchronization governs what HomeKit is SHOWN, never what the plugin knows.
-    await waitUntil(() => identityOf(h)?.name === CONTROLLER_ACCOUNT_NAME, { description: "the persisted identity to carry the account name" });
+    await settleUntil(() => identityOf(h)?.name === CONTROLLER_ACCOUNT_NAME, { description: "the persisted identity to carry the account name" });
 
     await pollPast(h);
     await h.abort();
@@ -916,11 +912,11 @@ describe("controller naming", () => {
 
     const irrigation = irrigationOf(h);
 
-    await waitUntil(() => nameOf(irrigation) === CONTROLLER_OVERRIDE_NAME, { description: "the irrigation system to take the override name" });
+    await settleUntil(() => nameOf(irrigation) === CONTROLLER_OVERRIDE_NAME, { description: "the irrigation system to take the override name" });
 
-    h.controller.applyFacts({ facts: controllerV2Facts(CONTROLLER_ACCOUNT_NAME), fetchedAt: nowSeconds() });
+    h.controller.applyFacts({ facts: controllerV2Facts(CONTROLLER_ACCOUNT_NAME), fetchedAt: seconds(h.clock) });
 
-    await waitUntil(() => identityOf(h)?.name === CONTROLLER_ACCOUNT_NAME, { description: "the persisted identity to carry the account name" });
+    await settleUntil(() => identityOf(h)?.name === CONTROLLER_ACCOUNT_NAME, { description: "the persisted identity to carry the account name" });
     await pollPast(h);
 
     assert.equal(nameOf(irrigation), CONTROLLER_OVERRIDE_NAME, "the user's own name outranks the account's everywhere HomeKit shows it");
@@ -940,7 +936,7 @@ describe("controller naming", () => {
 
     const valve = await valveOf(h);
 
-    await waitUntil(() => nameOf(irrigationOf(h)) === CONTROLLER_OVERRIDE_NAME, { description: "the irrigation system to take the override name" });
+    await settleUntil(() => nameOf(irrigationOf(h)) === CONTROLLER_OVERRIDE_NAME, { description: "the irrigation system to take the override name" });
     await pollPast(h);
     await h.abort();
 
@@ -960,7 +956,7 @@ describe("controller naming", () => {
 
     const valve = await valveOf(h);
 
-    await waitUntil(() => nameOf(irrigationOf(h)) === CONTROLLER_OVERRIDE_NAME, { description: "the irrigation system to take the override name" });
+    await settleUntil(() => nameOf(irrigationOf(h)) === CONTROLLER_OVERRIDE_NAME, { description: "the irrigation system to take the override name" });
 
     assert.equal(nameOf(valve), OVERRIDE_NAME, "the zone carries the name written for the zone");
     assert.equal(nameOf(irrigationOf(h)), CONTROLLER_OVERRIDE_NAME, "and the controller the name written for the controller");
@@ -979,7 +975,7 @@ describe("controller naming", () => {
 
     // Construction saves the ConfiguredName the controller's setup gives its information service, and the first poll's marks - the roster and schedule seeds and
     // the valve it attaches - reach the cache as one save after it, so a save past construction's and the first poll's can only be a rename.
-    await waitUntil(() => bare.flushes().length >= 2, { description: "the first poll's accessory flush, after construction's" });
+    await settleUntil(() => bare.flushes().length >= 2, { description: "the first poll's accessory flush, after construction's" });
 
     const bareFlushesAfterFirstPoll = bare.flushes().length;
 
@@ -1008,11 +1004,11 @@ describe("controller naming", () => {
      */
     assert.ok(CONTROLLER_ACCOUNT_EXTENDED.startsWith(CONTROLLER_WIRE_NAME), "the account's name must extend the wire's for the carry to be under test");
 
-    h.controller.applyFacts({ facts: controllerV2Facts(CONTROLLER_ACCOUNT_EXTENDED), fetchedAt: nowSeconds() });
+    h.controller.applyFacts({ facts: controllerV2Facts(CONTROLLER_ACCOUNT_EXTENDED), fetchedAt: seconds(h.clock) });
 
-    await waitUntil(() => nameOf(irrigation) === CONTROLLER_ACCOUNT_EXTENDED, { description: "the irrigation system to take the extended account name" });
+    await settleUntil(() => nameOf(irrigation) === CONTROLLER_ACCOUNT_EXTENDED, { description: "the irrigation system to take the extended account name" });
 
-    h.controller.applyFacts({ facts: controllerV2Facts(CONTROLLER_ACCOUNT_EXTENDED), fetchedAt: nowSeconds() - (HYDRAWISE_V2_FACTS_TTL + 1) });
+    h.controller.applyFacts({ facts: controllerV2Facts(CONTROLLER_ACCOUNT_EXTENDED), fetchedAt: seconds(h.clock) - (HYDRAWISE_V2_FACTS_TTL + 1) });
 
     await pollPast(h);
     await h.abort();
@@ -1032,7 +1028,7 @@ describe("controller naming", () => {
     const suspendSwitch = suspendSwitchOf(h);
 
     // Construction's ConfiguredName add and the first poll's marks reach the cache as one save each; what this asserts is the poll after them.
-    await waitUntil(() => h.flushes().length >= 2, { description: "the first poll's accessory flush, after construction's" });
+    await settleUntil(() => h.flushes().length >= 2, { description: "the first poll's accessory flush, after construction's" });
 
     const flushesAfterFirstPoll = h.flushes().length;
 
@@ -1063,7 +1059,7 @@ describe("controller naming", () => {
 
     const irrigation = irrigationOf(h);
 
-    await waitUntil(() => h.flushes().length >= 2, { description: "the first poll's accessory flush, after construction's" });
+    await settleUntil(() => h.flushes().length >= 2, { description: "the first poll's accessory flush, after construction's" });
     await pollPast(h);
 
     // The steady state: the seeding poll has paid its one write and the polls after it pay nothing.
@@ -1071,7 +1067,7 @@ describe("controller naming", () => {
 
     h.platform.featureOptions.configuredOptions = ["Enable.Device.Name." + CONTROLLER_SERIAL + "=" + CONTROLLER_OVERRIDE_NAME];
 
-    await waitUntil(() => nameOf(irrigation) === CONTROLLER_OVERRIDE_NAME, { description: "the irrigation system to take the override name" });
+    await advanceUntil(h.clock, () => nameOf(irrigation) === CONTROLLER_OVERRIDE_NAME, { description: "the irrigation system to take the override name" });
     await pollPast(h);
     await h.abort();
 
@@ -1194,10 +1190,10 @@ describe("controller naming", () => {
 
     const irrigation = irrigationOf(h);
 
-    await waitUntil(() => nameOf(irrigation) === CONTROLLER_FREE_FORM_SANITIZED, { description: "the irrigation system to take the sanitized free-form name" });
+    await settleUntil(() => nameOf(irrigation) === CONTROLLER_FREE_FORM_SANITIZED, { description: "the irrigation system to take the sanitized free-form name" });
 
     // Construction's ConfiguredName add and the first poll's marks reach the cache as one save each, so a save past them can only be a rename.
-    await waitUntil(() => h.flushes().length >= 2, { description: "the first poll's accessory flush, after construction's" });
+    await settleUntil(() => h.flushes().length >= 2, { description: "the first poll's accessory flush, after construction's" });
 
     const flushesAfterFirstPoll = h.flushes().length;
 
@@ -1233,9 +1229,9 @@ describe("controller naming", () => {
 
     assert.equal(nameOf(irrigationOf(h)), CONTROLLER_OVERRIDE_NAME, "the irrigation system service is created under the user's own name, before any poll");
 
-    h.controller.applyFacts({ facts: controllerV2Facts(CONTROLLER_ACCOUNT_NAME), fetchedAt: nowSeconds() });
+    h.controller.applyFacts({ facts: controllerV2Facts(CONTROLLER_ACCOUNT_NAME), fetchedAt: seconds(h.clock) });
 
-    await waitUntil(() => identityOf(h)?.name === CONTROLLER_ACCOUNT_NAME, { description: "the persisted identity to carry the account name" });
+    await settleUntil(() => identityOf(h)?.name === CONTROLLER_ACCOUNT_NAME, { description: "the persisted identity to carry the account name" });
     await pollPast(h);
     await h.abort();
 
@@ -1256,14 +1252,14 @@ describe("controller naming", () => {
 
     t.after(() => h.abort());
 
-    const zoneAccessory = await waitFor(() => h.zoneAccessories.get(ZONE_RELAY_ID), { description: "the zone's own accessory to appear" });
+    const zoneAccessory = await settleFor(() => h.zoneAccessories.get(ZONE_RELAY_ID), { description: "the zone's own accessory to appear" });
 
     await pollPast(h);
     await h.abort();
 
     assert.equal(h.reconciles[0]?.zones[0]?.displayName, OVERRIDE_NAME, "the zone's own accessory is requested under the user's name despite the opt-out");
     assert.equal(zoneAccessory.displayName, OVERRIDE_NAME, "and carries it");
-    assert.equal(nameOf(await waitFor(() => zoneAccessory.getServiceById(Service.Valve, ZONE_SUBTYPE),
+    assert.equal(nameOf(await settleFor(() => zoneAccessory.getServiceById(Service.Valve, ZONE_SUBTYPE),
       { description: "the zone valve on the zone's own accessory to appear" })), OVERRIDE_NAME, "and so is the valve it hosts");
   });
 
@@ -1280,13 +1276,13 @@ describe("controller naming", () => {
 
     t.after(() => h.abort());
 
-    h.controller.applyFacts({ facts: controllerV2Facts(CONTROLLER_ACCOUNT_NAME), fetchedAt: nowSeconds() });
+    h.controller.applyFacts({ facts: controllerV2Facts(CONTROLLER_ACCOUNT_NAME), fetchedAt: seconds(h.clock) });
 
-    await waitUntil(() => h.accessory.displayName === CONTROLLER_ACCOUNT_NAME, { description: "the accessory to take the account name" });
+    await settleUntil(() => h.accessory.displayName === CONTROLLER_ACCOUNT_NAME, { description: "the accessory to take the account name" });
 
-    h.controller.applyFacts({ facts: controllerV2Facts(UNUSABLE_NAME), fetchedAt: nowSeconds() });
+    h.controller.applyFacts({ facts: controllerV2Facts(UNUSABLE_NAME), fetchedAt: seconds(h.clock) });
 
-    await waitUntil(() => h.accessory.displayName === HYDRAWISE_CONTROLLER_FALLBACK_NAME, { description: "the accessory to take the controller word" });
+    await advanceUntil(h.clock, () => h.accessory.displayName === HYDRAWISE_CONTROLLER_FALLBACK_NAME, { description: "the accessory to take the controller word" });
     await pollPast(h);
     await h.abort();
 
@@ -1311,9 +1307,9 @@ describe("controller naming", () => {
     t.after(() => h.abort());
 
     const valve = await valveOf(h);
-    const zoneSwitch = await waitFor(() => h.accessory.getServiceById(Service.Switch, ZONE_SUSPEND_SUBTYPE), { description: "the zone suspension switch to appear" });
+    const zoneSwitch = await settleFor(() => h.accessory.getServiceById(Service.Switch, ZONE_SUSPEND_SUBTYPE), { description: "the zone suspension switch to appear" });
 
-    await waitUntil(() => nameOf(valve) === ZONE_FALLBACK_NAME, { description: "the valve to take the zone word and number" });
+    await advanceUntil(h.clock, () => nameOf(valve) === ZONE_FALLBACK_NAME, { description: "the valve to take the zone word and number" });
     await pollPast(h);
     await h.abort();
 
@@ -1341,9 +1337,9 @@ describe("the naming rule", () => {
 
     t.after(() => h.abort());
 
-    const host = await waitFor(() => h.zoneAccessories.get(ZONE_RELAY_ID), { description: "the zone's own accessory to appear" });
-    const valve = await waitFor(() => host.getServiceById(Service.Valve, ZONE_SUBTYPE), { description: "the zone valve on its own accessory to appear" });
-    const zoneSwitch = await waitFor(() => host.getServiceById(Service.Switch, ZONE_SUSPEND_SUBTYPE), { description: "the zone suspension switch to appear" });
+    const host = await settleFor(() => h.zoneAccessories.get(ZONE_RELAY_ID), { description: "the zone's own accessory to appear" });
+    const valve = await settleFor(() => host.getServiceById(Service.Valve, ZONE_SUBTYPE), { description: "the zone valve on its own accessory to appear" });
+    const zoneSwitch = await settleFor(() => host.getServiceById(Service.Switch, ZONE_SUSPEND_SUBTYPE), { description: "the zone suspension switch to appear" });
 
     await pollPast(h);
 
@@ -1426,7 +1422,7 @@ describe("the naming rule", () => {
     await renameInHomeApp(informationOf(h), HOME_APP_NAME);
 
     // The account's word that the controller is offline draws a line from the controller at once, written through the same prefixed logger as every line it writes.
-    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: nowSeconds() });
+    h.controller.applyFacts({ facts: makeV2Facts({ online: false }), fetchedAt: seconds(h.clock) });
 
     await h.abort();
 
@@ -1475,11 +1471,11 @@ describe("names HomeKit cannot carry", () => {
 
     const valve = await valveOf(h);
 
-    await waitUntil(() => nameOf(valve) === WIRE_NAME, { description: "the valve to take the wire's name", timeoutMs: 5000 });
+    await advanceUntil(h.clock, () => nameOf(valve) === WIRE_NAME, { description: "the valve to take the wire's name" });
 
     assert.equal(logCount(h.entries, "warn", ZONE_FALLBACK_WARNING), 1, "a valve created under the word and held there a second poll is warned about once");
 
-    await waitUntil(() => nameOf(valve) === ZONE_FALLBACK_NAME, { description: "the valve to return to the zone word", timeoutMs: 5000 });
+    await advanceUntil(h.clock, () => nameOf(valve) === ZONE_FALLBACK_NAME, { description: "the valve to return to the zone word" });
     await pollPast(h);
     await h.abort();
 
@@ -1495,14 +1491,14 @@ describe("names HomeKit cannot carry", () => {
     const h = buildController({ program: (recorder) => {
 
       recorder.program("statusschedule.php", { body: schedule(UNUSABLE_NAME), kind: "response" });
-      recorder.program("statusschedule.php", { body: fastPolling(makeStatusSchedule({ relays: [other], sensors: bareSensors })), kind: "response" });
+      recorder.program("statusschedule.php", { body: zonesSchedule([other]), kind: "response" });
       recorder.programDefault("statusschedule.php", { body: schedule(UNUSABLE_NAME), kind: "response" });
     }, signalAborted: false, userOptions: [SYNC_NAME_ON] });
 
     t.after(() => h.abort());
 
     await valveOf(h);
-    await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length >= 3, { description: "the poll that returns the zone", timeoutMs: 5000 });
+    await advanceThroughPolls(h, 2);
     await pollPast(h);
     await h.abort();
 
@@ -1626,7 +1622,7 @@ describe("names HomeKit cannot carry", () => {
     t.after(() => h.abort());
 
     const valve = await valveOf(h);
-    const zoneSwitch = await waitFor(() => h.accessory.getServiceById(Service.Switch, ZONE_SUSPEND_SUBTYPE), { description: "the zone suspension switch to appear" });
+    const zoneSwitch = await settleFor(() => h.accessory.getServiceById(Service.Switch, ZONE_SUSPEND_SUBTYPE), { description: "the zone suspension switch to appear" });
 
     await pollPast(h);
 
@@ -1687,7 +1683,7 @@ describe("name watches", () => {
 
     t.after(() => h.abort());
 
-    await waitFor(() => h.zoneAccessories.get(ZONE_RELAY_ID), { description: "the zone's own accessory to appear" });
+    await settleFor(() => h.zoneAccessories.get(ZONE_RELAY_ID), { description: "the zone's own accessory to appear" });
     await pollPast(h);
 
     const polls = pollsBegun(h);
@@ -1719,7 +1715,7 @@ describe("name watches", () => {
 
     const valve = await valveOf(h);
 
-    await waitUntil(() => nameOf(valve) === WIRE_RENAMED, { description: "the valve to take the renamed wire name" });
+    await advanceUntil(h.clock, () => nameOf(valve) === WIRE_RENAMED, { description: "the valve to take the renamed wire name" });
     await pollPast(h);
     await renameInHomeApp(valve, HOME_APP_NAME);
     await h.abort();
@@ -1742,7 +1738,7 @@ describe("name watches", () => {
 
     const polls = pollsBegun(h);
 
-    h.controller.applyFacts({ facts: v2Facts(ACCOUNT_NAME), fetchedAt: nowSeconds() });
+    h.controller.applyFacts({ facts: v2Facts(ACCOUNT_NAME), fetchedAt: seconds(h.clock) });
     await renameInHomeApp(valve, HOME_APP_NAME);
 
     const name = nameOf(valve);
@@ -1768,7 +1764,7 @@ describe("name watches", () => {
 
     const polls = pollsBegun(h);
 
-    h.controller.applyFacts({ facts: controllerV2Facts(CONTROLLER_ACCOUNT_NAME), fetchedAt: nowSeconds() });
+    h.controller.applyFacts({ facts: controllerV2Facts(CONTROLLER_ACCOUNT_NAME), fetchedAt: seconds(h.clock) });
     await renameInHomeApp(informationOf(h), HOME_APP_NAME);
 
     const name = nameOf(informationOf(h));
@@ -1793,7 +1789,7 @@ describe("name watches", () => {
 
     t.after(() => h.abort());
 
-    const host = await waitFor(() => h.zoneAccessories.get(ZONE_RELAY_ID), { description: "the zone's own accessory to appear" });
+    const host = await settleFor(() => h.zoneAccessories.get(ZONE_RELAY_ID), { description: "the zone's own accessory to appear" });
 
     await pollPast(h);
 
@@ -1824,7 +1820,7 @@ describe("name watches", () => {
 
     t.after(() => h.abort());
 
-    await waitFor(() => h.zoneAccessories.get(ZONE_RELAY_ID), { description: "the zone's own accessory to appear" });
+    await settleFor(() => h.zoneAccessories.get(ZONE_RELAY_ID), { description: "the zone's own accessory to appear" });
     await pollPast(h);
     await pollPast(h);
 
@@ -1844,7 +1840,7 @@ describe("name watches", () => {
 
     t.after(() => h.abort());
 
-    await waitFor(() => h.zoneAccessories.get(ZONE_RELAY_ID), { description: "the zone's own accessory to appear" });
+    await settleFor(() => h.zoneAccessories.get(ZONE_RELAY_ID), { description: "the zone's own accessory to appear" });
     await pollPast(h);
     await pollPast(h);
 
@@ -1864,13 +1860,13 @@ describe("name watches", () => {
     t.after(() => h.abort());
 
     await valveOf(h);
-    await pollsCompleted(h, pollsBegun(h));
+    await advanceThroughPolls(h, pollsBegun(h));
 
     const watched = signalRegistrations(h);
 
     h.platform.featureOptions.configuredOptions = [ SYNC_NAME_ON, SUSPEND_ZONE_ON, "Disable.Device." + ZONE_SUBTYPE ];
 
-    await pollsCompleted(h, pollsBegun(h) + 1);
+    await advanceThroughPolls(h, pollsBegun(h) + 1);
 
     assert.equal(h.accessory.getServiceById(Service.Valve, ZONE_SUBTYPE), undefined, "the poll removed the disabled zone's valve");
     assert.equal(h.accessory.getServiceById(Service.Switch, ZONE_SUSPEND_SUBTYPE), undefined, "and its companion switch");
@@ -1886,13 +1882,13 @@ describe("name watches", () => {
     t.after(() => h.abort());
 
     await valveOf(h);
-    await pollsCompleted(h, pollsBegun(h));
+    await advanceThroughPolls(h, pollsBegun(h));
 
     const watched = signalRegistrations(h);
 
     h.retrieve.programDefault("statusschedule.php", { body: zonesSchedule([secondZone()]), kind: "response" });
 
-    await pollsCompleted(h, pollsBegun(h) + 1);
+    await advanceThroughPolls(h, pollsBegun(h) + 1);
 
     assert.equal(h.accessory.getServiceById(Service.Valve, ZONE_SUBTYPE), undefined, "the poll removed the vanished zone's valve");
     assert.equal(h.accessory.getServiceById(Service.Switch, ZONE_SUSPEND_SUBTYPE), undefined, "and its companion switch");
@@ -1915,14 +1911,14 @@ describe("name watches", () => {
 
       t.after(() => h.abort());
 
-      await waitFor(() => h.accessory.getServiceById(Service.Switch, ZONE_SUSPEND_SUBTYPE), { description: "the zone suspension switch to appear" });
-      await pollsCompleted(h, pollsBegun(h));
+      await settleFor(() => h.accessory.getServiceById(Service.Switch, ZONE_SUSPEND_SUBTYPE), { description: "the zone suspension switch to appear" });
+      await advanceThroughPolls(h, pollsBegun(h));
 
       const watched = signalRegistrations(h);
 
       sweep(h);
 
-      await pollsCompleted(h, pollsBegun(h) + 1);
+      await advanceThroughPolls(h, pollsBegun(h) + 1);
 
       assert.equal(h.accessory.getServiceById(Service.Switch, ZONE_SUSPEND_SUBTYPE), undefined, "the poll swept the companion switch");
       assert.equal(listenersOn(await valveOf(h)), UNWATCHED_LISTENERS + 1, "while the valve beside it keeps its watch");
@@ -1938,14 +1934,14 @@ describe("name watches", () => {
 
     t.after(() => h.abort());
 
-    await waitFor(() => h.accessory.getServiceById(Service.Switch, ZONE_SUSPEND_SUBTYPE), { description: "the zone suspension switch to appear" });
-    await pollsCompleted(h, pollsBegun(h));
+    await settleFor(() => h.accessory.getServiceById(Service.Switch, ZONE_SUSPEND_SUBTYPE), { description: "the zone suspension switch to appear" });
+    await advanceThroughPolls(h, pollsBegun(h));
 
     const watched = signalRegistrations(h);
 
     h.platform.featureOptions.configuredOptions = [ SYNC_NAME_ON, SUSPEND_ZONE_ON, STANDALONE_ON ];
 
-    await pollsCompleted(h, pollsBegun(h) + 1);
+    await advanceThroughPolls(h, pollsBegun(h) + 1);
 
     const host = present(h.zoneAccessories.get(ZONE_RELAY_ID), "the zone's own accessory");
 
@@ -1971,9 +1967,9 @@ describe("name watches", () => {
 
     t.after(() => h.abort());
 
-    const host = await waitFor(() => h.zoneAccessories.get(ZONE_RELAY_ID), { description: "the zone's own accessory to appear" });
+    const host = await settleFor(() => h.zoneAccessories.get(ZONE_RELAY_ID), { description: "the zone's own accessory to appear" });
 
-    await pollsCompleted(h, pollsBegun(h));
+    await advanceThroughPolls(h, pollsBegun(h));
 
     const surfaces = [ host.getServiceById(Service.Valve, ZONE_SUBTYPE), host.getServiceById(Service.Switch, ZONE_SUSPEND_SUBTYPE),
       host.getService(Service.AccessoryInformation) ].map(service => present(service, "a surface of the zone's own accessory"));
@@ -1984,7 +1980,7 @@ describe("name watches", () => {
 
     h.platform.featureOptions.configuredOptions = [ SYNC_NAME_ON, SUSPEND_ZONE_ON ];
 
-    await pollsCompleted(h, pollsBegun(h) + 1);
+    await advanceThroughPolls(h, pollsBegun(h) + 1);
 
     assert.equal(h.zoneAccessories.has(ZONE_RELAY_ID), false, "the zone's own accessory is gone");
     assert.ok(surfaces.every(service => listenersOn(service) === UNWATCHED_LISTENERS), "and none of its surfaces keeps a watch");
@@ -2000,9 +1996,9 @@ describe("name watches", () => {
 
     t.after(() => h.abort());
 
-    const host = await waitFor(() => h.zoneAccessories.get(ZONE_RELAY_ID), { description: "the zone's own accessory to appear" });
+    const host = await settleFor(() => h.zoneAccessories.get(ZONE_RELAY_ID), { description: "the zone's own accessory to appear" });
 
-    await pollsCompleted(h, pollsBegun(h));
+    await advanceThroughPolls(h, pollsBegun(h));
 
     const surfaces = [ host.getServiceById(Service.Valve, ZONE_SUBTYPE), host.getServiceById(Service.Switch, ZONE_SUSPEND_SUBTYPE),
       host.getService(Service.AccessoryInformation) ].map(service => present(service, "a surface of the zone's own accessory"));
@@ -2010,7 +2006,7 @@ describe("name watches", () => {
 
     h.retrieve.programDefault("statusschedule.php", { body: zonesSchedule([secondZone()]), kind: "response" });
 
-    await pollsCompleted(h, pollsBegun(h) + 1);
+    await advanceThroughPolls(h, pollsBegun(h) + 1);
 
     assert.equal(h.zoneAccessories.get(ZONE_RELAY_ID), host, "the zone's own accessory is held, as the platform holds it through its grace");
     assert.ok(surfaces.every(service => listenersOn(service) === UNWATCHED_LISTENERS), "and none of its surfaces keeps a watch from the first poll that leaves it out");
@@ -2025,9 +2021,9 @@ describe("name watches", () => {
 
     t.after(() => h.abort());
 
-    const host = await waitFor(() => h.zoneAccessories.get(ZONE_RELAY_ID), { description: "the zone's own accessory to appear" });
+    const host = await settleFor(() => h.zoneAccessories.get(ZONE_RELAY_ID), { description: "the zone's own accessory to appear" });
 
-    await pollsCompleted(h, pollsBegun(h));
+    await advanceThroughPolls(h, pollsBegun(h));
 
     const surfaces = [ host.getServiceById(Service.Valve, ZONE_SUBTYPE), host.getServiceById(Service.Switch, ZONE_SUSPEND_SUBTYPE),
       host.getService(Service.AccessoryInformation) ].map(service => present(service, "a surface of the zone's own accessory"));
@@ -2044,7 +2040,7 @@ describe("name watches", () => {
       return hosts;
     };
 
-    await pollsCompleted(h, pollsBegun(h) + 1);
+    await advanceThroughPolls(h, pollsBegun(h) + 1);
 
     assert.ok(surfaces.every(service => listenersOn(service) === UNWATCHED_LISTENERS), "none of the unhosted accessory's surfaces keeps a watch");
     assert.equal(listenersOn(await valveOf(h)), UNWATCHED_LISTENERS + 1, "while the valve the controller accessory hosts for the poll carries one");

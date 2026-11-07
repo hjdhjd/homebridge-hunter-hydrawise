@@ -1,26 +1,37 @@
 /* Copyright(C) 2017-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * controller.onset.test.ts: HomeKit set-handler behavior on the HydrawiseController valves and the suspend switch, driven through the captured onSet
- * handlers. Covers the manual run and stop commands and their recorded setzone parameters, the system in-use collapse when the only running zone stops, the
- * command-failure revert and the shutdown lifetime it answers to, the zero-duration guard, and the suspend / resume commands including the floored suspend
- * timestamp assertion (the bug 14 fix). Every row reads what a command did once the controller's command queue has fallen idle.
+ * controller.onset.test.ts: HomeKit set-handler behavior on the HydrawiseController valves, the suspend switch and the irrigation system, driven through the
+ * captured onSet handlers. Covers the manual run and stop commands and their recorded setzone parameters, the system in-use collapse when the only running zone
+ * stops, the command-failure revert and the irrigation system's write revert with the shutdown lifetime each answers to, the zero-duration guard, and the suspend /
+ * resume commands including the floored suspend timestamp assertion (the bug 14 fix). Every row reads what a command did once the controller's command queue has
+ * fallen idle.
  */
 
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
 /* eslint-disable camelcase */
-import { Characteristic, Service, buildController, waitFor } from "./testing/platform.helpers.ts";
+import { Characteristic, Service, advanceThroughPolls, buildController, crossRevertDelay } from "./testing/platform.helpers.ts";
 import { HYDRAWISE_REVERT_DELAY, HYDRAWISE_SUSPEND_DURATION } from "./settings.ts";
 import type { HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
+import { advanceUntil, expectAt, loggedAt, present, settle, settleUntil, triggerSet } from "homebridge-plugin-utils/testing";
 import { describe, test } from "node:test";
-import { expectAt, loggedAt, triggerSet, waitUntil } from "homebridge-plugin-utils/testing";
-import { fastPolling, makeStatusSchedule, makeZone } from "./api.helpers.ts";
+import { makeStatusSchedule, makeZone } from "./api.helpers.ts";
+import type { BuildControllerResult } from "./testing/platform.helpers.ts";
+import type { Service as HapService } from "homebridge";
 import assert from "node:assert/strict";
 import { bareSensors } from "./api.fixtures.ts";
-import { setTimeout as delay } from "node:timers/promises";
 
+// A wire-realistic status body, so a row that wants a later poll steps the controller's clock across the sleep the wire asks for.
 function schedule(zones: HydrawiseZoneConfig[]): StatusScheduleResponse {
 
-  return fastPolling(makeStatusSchedule({ relays: zones, sensors: bareSensors }));
+  return makeStatusSchedule({ relays: zones, sensors: bareSensors });
+}
+
+// The valve the first poll hosts for zone 700001. The first poll goes out as the controller is built and lands within turns, so nothing waits on the clock for it.
+async function firstValve(h: BuildControllerResult): Promise<HapService> {
+
+  await settleUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
+
+  return present(h.accessory.getServiceById(Service.Valve, "700001"), "the valve for zone 700001");
 }
 
 function scheduledZone(): HydrawiseZoneConfig {
@@ -57,7 +68,7 @@ describe("HydrawiseController valve and suspend onSet", () => {
 
     t.after(() => h.abort());
 
-    const valve = await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001"), { description: "the valve for zone 700001 to appear" });
+    const valve = await firstValve(h);
 
     await triggerSet(valve.getCharacteristic(Characteristic.Active), Characteristic.Active.ACTIVE);
     await h.controller.commandsIdle;
@@ -79,7 +90,7 @@ describe("HydrawiseController valve and suspend onSet", () => {
 
     t.after(() => h.abort());
 
-    const valve = await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001"), { description: "the valve for zone 700001 to appear" });
+    const valve = await firstValve(h);
 
     await triggerSet(valve.getCharacteristic(Characteristic.Active), Characteristic.Active.INACTIVE);
     await h.controller.commandsIdle;
@@ -100,7 +111,7 @@ describe("HydrawiseController valve and suspend onSet", () => {
 
     t.after(() => h.abort());
 
-    const valve = await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001"), { description: "the valve for zone 700001 to appear" });
+    const valve = await firstValve(h);
 
     await triggerSet(valve.getCharacteristic(Characteristic.Active), Characteristic.Active.INACTIVE);
     await h.controller.commandsIdle;
@@ -122,7 +133,7 @@ describe("HydrawiseController valve and suspend onSet", () => {
 
     t.after(() => h.abort());
 
-    const valve = await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001"), { description: "the valve for zone 700001 to appear" });
+    const valve = await firstValve(h);
     const irrigation = h.accessory.getService(Service.IrrigationSystem);
 
     assert.ok(irrigation, "the irrigation system service should exist");
@@ -137,7 +148,7 @@ describe("HydrawiseController valve and suspend onSet", () => {
      */
     const afterStart = h.retrieve.callsTo("statusschedule.php").length;
 
-    await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length > (afterStart + 1), { description: "the second status poll past the start" });
+    await advanceThroughPolls(h, afterStart + 1);
 
     assert.equal(irrigation.getCharacteristic(Characteristic.ProgramMode).value, Characteristic.ProgramMode.PROGRAM_SCHEDULED_MANUAL_MODE,
       "a poll that still reports the zone running leaves the manual activation standing");
@@ -148,7 +159,7 @@ describe("HydrawiseController valve and suspend onSet", () => {
 
     const afterCompletion = h.retrieve.callsTo("statusschedule.php").length;
 
-    await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length > (afterCompletion + 1), { description: "the second status poll past the completion" });
+    await advanceThroughPolls(h, afterCompletion + 1);
 
     assert.equal(irrigation.getCharacteristic(Characteristic.ProgramMode).value, Characteristic.ProgramMode.PROGRAM_SCHEDULED,
       "the wire reporting the zone stopped clears the manual activation and returns program mode to the schedule");
@@ -172,13 +183,13 @@ describe("HydrawiseController valve and suspend onSet", () => {
 
     t.after(() => h.abort());
 
-    const valve = await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001"), { description: "the valve for zone 700001 to appear" });
+    const valve = await firstValve(h);
     const irrigation = h.accessory.getService(Service.IrrigationSystem);
 
     assert.ok(irrigation, "the irrigation system service should exist");
 
     // The vanish poll prunes the target's ledger entry and removes its valve, while the sibling keeps both of its own.
-    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") === undefined, { description: "the valve for zone 700001 to be removed" });
+    await advanceUntil(h.clock, () => h.accessory.getServiceById(Service.Valve, "700001") === undefined, { description: "the valve for zone 700001 to be removed" });
 
     assert.ok(h.accessory.getServiceById(Service.Valve, "700002"), "the sibling zone should still be published");
     await assert.doesNotReject(() => triggerSet(valve.getCharacteristic(Characteristic.Active), Characteristic.Active.ACTIVE),
@@ -187,7 +198,7 @@ describe("HydrawiseController valve and suspend onSet", () => {
     // Bounded on the poll after the one already in flight, so the aggregate read below is certainly a recomputation that ran after the mark.
     const afterStart = h.retrieve.callsTo("statusschedule.php").length;
 
-    await waitUntil(() => h.retrieve.callsTo("statusschedule.php").length > (afterStart + 1), { description: "the second status poll past the start" });
+    await advanceThroughPolls(h, afterStart + 1);
 
     assert.equal(irrigation.getCharacteristic(Characteristic.ProgramMode).value, Characteristic.ProgramMode.PROGRAM_SCHEDULED,
       "the aggregate recomputes over the sibling's domain alone, so the dropped zone recorded no manual activation");
@@ -207,11 +218,11 @@ describe("HydrawiseController valve and suspend onSet", () => {
 
     t.after(() => h.abort());
 
-    const valve = await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001"), { description: "the valve for zone 700001 to appear" });
+    const valve = await firstValve(h);
     const irrigation = h.accessory.getService(Service.IrrigationSystem);
 
     assert.ok(irrigation, "the irrigation system service should exist");
-    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") === undefined, { description: "the valve for zone 700001 to be removed" });
+    await advanceUntil(h.clock, () => h.accessory.getServiceById(Service.Valve, "700001") === undefined, { description: "the valve for zone 700001 to be removed" });
 
     assert.ok(h.accessory.getServiceById(Service.Valve, "700002"), "the sibling zone should still be published");
     await assert.doesNotReject(() => triggerSet(valve.getCharacteristic(Characteristic.Active), Characteristic.Active.INACTIVE),
@@ -230,7 +241,7 @@ describe("HydrawiseController valve and suspend onSet", () => {
 
     t.after(() => h.abort());
 
-    const valve = await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001"), { description: "the valve for zone 700001 to appear" });
+    const valve = await firstValve(h);
 
     h.commands.programDefault({ reason: "Hydrawise API rate limit has been exceeded.", status: "failed" });
 
@@ -242,8 +253,15 @@ describe("HydrawiseController valve and suspend onSet", () => {
 
     const pollsAtTap = h.retrieve.callsTo("statusschedule.php").length;
 
-    // The failed command schedules a HYDRAWISE_REVERT_DELAY write of what the valve reads, which flips the ACTIVE the tap stored back to INACTIVE.
-    await waitUntil(() => valve.getCharacteristic(Characteristic.Active).value === Characteristic.Active.INACTIVE, { description: "the valve to read inactive" });
+    // The failed command schedules a HYDRAWISE_REVERT_DELAY write of what the valve reads, which flips the ACTIVE the tap stored back to INACTIVE when the
+    // controller's clock crosses it, and not a millisecond before.
+    h.clock.advance(HYDRAWISE_REVERT_DELAY - 1);
+    await settle();
+
+    assert.equal(valve.getCharacteristic(Characteristic.Active).value, Characteristic.Active.ACTIVE, "a millisecond short of the delay, the tap's value stands");
+
+    h.clock.advance(1);
+    await settle();
 
     assert.equal(valve.getCharacteristic(Characteristic.Active).value, Characteristic.Active.INACTIVE, "a failed run should revert the valve to inactive");
     assert.ok(loggedAt(h.entries, "error", "Alpha [Zone 1]: Unable to start this zone. Hydrawise API rate limit has been exceeded."),
@@ -266,22 +284,29 @@ describe("HydrawiseController valve and suspend onSet", () => {
 
     t.after(() => h.abort());
 
-    const valve = await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001"), { description: "the valve for zone 700001 to appear" });
+    const valve = await firstValve(h);
     const active = valve.getCharacteristic(Characteristic.Active);
 
     h.commands.programDefault({ reason: "Hydrawise API rate limit has been exceeded.", status: "failed" });
 
-    /* Phase one: a failed command schedules a revert, and the platform shuts down while that revert is still pending. Every wait here is computed from the
-     * production delay rather than restating it - half of it lands the abort squarely inside the window, and a few multiples of it settle well past the beat the
-     * revert would have fired on.
+    /* Phase one: a failed command schedules a revert, and the platform shuts down while that revert is still pending. Every step here is computed from the
+     * production delay rather than restating it - half of it lands the abort squarely inside the window, and a few multiples of it cross well past the beat the
+     * revert would have fired on. The revert writes what the valve reads, which for this zone is the ACTIVE the tap stored, so the clock is what shows the revert
+     * left with the shutdown rather than landing on a value it could not move.
      */
     await triggerSet(active, Characteristic.Active.ACTIVE);
     await h.controller.commandsIdle;
-    await delay(HYDRAWISE_REVERT_DELAY / 2);
 
+    assert.equal(h.clock.nextDeadline, HYDRAWISE_REVERT_DELAY, "the failed command armed its revert, the next deadline on the controller's clock");
+
+    h.clock.advance(HYDRAWISE_REVERT_DELAY / 2);
     await h.abort();
+    await settle();
 
-    await delay(HYDRAWISE_REVERT_DELAY * 3);
+    assert.equal(h.clock.pending, 0, "the shutdown drained the revert with the platform's timers and ended the poll's sleep, so nothing is left to land");
+
+    h.clock.advance(HYDRAWISE_REVERT_DELAY * 3);
+    await settle();
 
     assert.equal(h.commands.calls.length, 1, "the failed command reached the wire, so a revert was genuinely scheduled");
     assert.equal(active.value, Characteristic.Active.ACTIVE, "a revert pending when the platform shuts down drains instead of landing");
@@ -289,10 +314,47 @@ describe("HydrawiseController valve and suspend onSet", () => {
     // Phase two: the platform is down, so the queue takes no new command at all, and the value HomeKit stored is left as it stands.
     await triggerSet(active, Characteristic.Active.INACTIVE);
     await h.controller.commandsIdle;
-    await delay(HYDRAWISE_REVERT_DELAY * 3);
+    h.clock.advance(HYDRAWISE_REVERT_DELAY * 3);
+    await settle();
 
     assert.equal(h.commands.calls.length, 1, "a set after shutdown sends nothing");
     assert.equal(active.value, Characteristic.Active.INACTIVE, "and nothing writes over what HomeKit stored");
+    assert.equal(h.clock.pending, 0, "with nothing armed on the clock to write over it later");
+  });
+
+  test("an irrigation system revert pending at shutdown drains, leaving the write HomeKit made", async (t) => {
+
+    const h = buildController({ program: (recorder) => {
+
+      recorder.programDefault("statusschedule.php", { body: schedule([scheduledZone()]), kind: "response" });
+    }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    await firstValve(h);
+
+    const active = present(h.accessory.getService(Service.IrrigationSystem), "the irrigation system").getCharacteristic(Characteristic.Active);
+
+    /* A write to the irrigation system's Active has nothing to command, so it is accepted and Active is put back after the revert beat, on the platform's timers as
+     * every revert is. The platform shuts down halfway through that beat, and a revert that left with the platform's timers never puts Active back, so the
+     * INACTIVE HomeKit wrote is what shows it drained, and the clock is what shows the beat it would have fired on was crossed.
+     */
+    await triggerSet(active, Characteristic.Active.INACTIVE);
+
+    assert.equal(h.clock.nextDeadline, HYDRAWISE_REVERT_DELAY, "the write armed its revert, the next deadline on the controller's clock");
+
+    h.clock.advance(HYDRAWISE_REVERT_DELAY / 2);
+    await h.abort();
+    await settle();
+
+    assert.equal(h.clock.pending, 0, "the shutdown drained the revert with the platform's timers and ended the poll's sleep, so nothing is left to land");
+
+    h.clock.advance(HYDRAWISE_REVERT_DELAY * 3);
+    await settle();
+
+    assert.equal(active.value, Characteristic.Active.INACTIVE, "a revert pending when the platform shuts down drains instead of putting Active back");
+    assert.deepEqual([ h.clock.now(), h.clock.pending ], [ (HYDRAWISE_REVERT_DELAY / 2) + (HYDRAWISE_REVERT_DELAY * 3), 0 ],
+      "across a span well past the beat the revert would have fired on, with nothing armed after it");
   });
 
   test("a run with no duration to give is no command, and the valve is put back without a word", async (t) => {
@@ -307,12 +369,13 @@ describe("HydrawiseController valve and suspend onSet", () => {
 
     t.after(() => h.abort());
 
-    const valve = await waitFor(() => h.accessory.getServiceById(Service.Valve, "700001"), { description: "the valve for zone 700001 to appear" });
+    const valve = await firstValve(h);
 
     await triggerSet(valve.getCharacteristic(Characteristic.Active), Characteristic.Active.ACTIVE);
     await h.controller.commandsIdle;
-    await waitUntil(() => valve.getCharacteristic(Characteristic.Active).value === Characteristic.Active.INACTIVE, { description: "the valve to read inactive" });
+    await crossRevertDelay(h.clock);
 
+    assert.equal(valve.getCharacteristic(Characteristic.Active).value, Characteristic.Active.INACTIVE, "the valve is put back once the revert delay passes");
     assert.equal(h.commands.calls.length, 0, "a run of no length sends nothing");
     assert.equal(h.entries.filter(line => line.level === "error").length, 0, "and says nothing, since nothing was asked of Hydrawise");
   });
@@ -327,20 +390,24 @@ describe("HydrawiseController valve and suspend onSet", () => {
     t.after(() => h.abort());
 
     // Wait until the first poll has run so the switch reflects live state, then drive the suspend.
-    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
+    await firstValve(h);
 
     const suspend = h.accessory.getServiceById(Service.Switch, "All");
 
     assert.ok(suspend, "the suspend switch should exist");
 
-    // The production timestamp is Math.floor(Date.now() / 1000) + HYDRAWISE_SUSPEND_DURATION - the one-year offset added onto a whole-second floor. We bracket the
-    // invocation with before/after Date.now() reads floored the same way: the captured custom param must be an integer lying inside the floored bracket.
-    const before = Date.now();
+    /* The production timestamp is the controller's clock floored to a whole second plus HYDRAWISE_SUSPEND_DURATION - the one-year offset added onto a whole-second
+     * floor. The clock is stepped to the middle of a second first, well short of the next poll's sleep, so a timestamp left unfloored would carry the fraction. We
+     * bracket the invocation with before and after reads of that clock floored the same way: the captured custom param must be an integer inside the bracket.
+     */
+    h.clock.advance(1500);
+
+    const before = h.clock.now();
 
     await triggerSet(suspend.getCharacteristic(Characteristic.On), true);
     await h.controller.commandsIdle;
 
-    const after = Date.now();
+    const after = h.clock.now();
     const command = expectAt(h.commands.params, 0, "setzone call");
 
     assert.equal(command["action"], "suspendall", "the suspend should send the suspendall action");
@@ -367,7 +434,7 @@ describe("HydrawiseController valve and suspend onSet", () => {
     h.commands.programDefault({ reason: "denied", status: "refused" });
 
     // Wait until the first poll has run, so the controller answers HomeKit, then drive the suspend.
-    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
+    await firstValve(h);
 
     const suspend = h.accessory.getServiceById(Service.Switch, "All");
 
@@ -380,9 +447,10 @@ describe("HydrawiseController valve and suspend onSet", () => {
 
     const pollsAtTap = h.retrieve.callsTo("statusschedule.php").length;
 
-    // A refusal schedules the 50ms write of what the switch reads, which flips the true the tap stored back off.
-    await waitUntil(() => suspend.getCharacteristic(Characteristic.On).value === false, { description: "the suspend-all switch to read off" });
+    // A refusal schedules the revert-delay write of what the switch reads, which flips the true the tap stored back off when the controller's clock crosses it.
+    await crossRevertDelay(h.clock);
 
+    assert.equal(suspend.getCharacteristic(Characteristic.On).value, false, "the switch is put back once the revert delay passes");
     assert.ok(loggedAt(h.entries, "error", "Unable to complete the suspend request"), "the suspend failure should be logged");
 
     /* Every poll writes the switch's own reading as well, which for a running zone is off, so the value alone cannot say which write put it there. The revert
@@ -406,16 +474,16 @@ describe("HydrawiseController valve and suspend onSet", () => {
     h.commands.programDefault({ reason: "The answer from Hydrawise could not be read.", status: "unreadable" });
 
     // Wait until the first poll has run, so the controller answers HomeKit, then drive the suspend.
-    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
+    await firstValve(h);
 
     const suspend = h.accessory.getServiceById(Service.Switch, "All");
 
     assert.ok(suspend, "the suspend switch should exist");
     await triggerSet(suspend.getCharacteristic(Characteristic.On), true);
     await h.controller.commandsIdle;
+    await crossRevertDelay(h.clock);
 
-    await waitUntil(() => suspend.getCharacteristic(Characteristic.On).value === false, { description: "the suspend-all switch to read off" });
-
+    assert.equal(suspend.getCharacteristic(Characteristic.On).value, false, "the switch is put back once the revert delay passes");
     assert.ok(loggedAt(h.entries, "error", "Unable to retrieve the result of the suspend request"), "the malformed suspend response should be logged");
     assert.equal(h.commands.calls.length, 1, "and a reply that could not be read is not resent");
   });
@@ -429,18 +497,21 @@ describe("HydrawiseController valve and suspend onSet", () => {
 
     t.after(() => h.abort());
 
-    await waitUntil(() => h.accessory.getServiceById(Service.Valve, "700001") !== undefined, { description: "the valve for zone 700001 to appear" });
+    await firstValve(h);
 
     const suspend = h.accessory.getServiceById(Service.Switch, "All");
 
     assert.ok(suspend, "the suspend switch should exist");
 
-    const before = Date.now();
+    // The clock is stepped to the middle of a second, short of the next poll's sleep, so a timestamp that is not the floored whole second reads outside the bracket.
+    h.clock.advance(1500);
+
+    const before = h.clock.now();
 
     await triggerSet(suspend.getCharacteristic(Characteristic.On), false);
     await h.controller.commandsIdle;
 
-    const after = Date.now();
+    const after = h.clock.now();
     const command = expectAt(h.commands.params, 0, "setzone call");
     const custom = Number(command["custom"]);
 
