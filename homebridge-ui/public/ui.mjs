@@ -11,6 +11,7 @@ import { ZONE_STATE_LABELS, cachedAccessoryName, cachedControllerHardware, cache
 import { createActionGuard, withDeadline } from "homebridge-plugin-utils/webUi-liveness.mjs";
 import { displayedName, sanitizeName } from "homebridge-plugin-utils/homekit-name.js";
 import { PluginConfigSession } from "homebridge-plugin-utils/pluginConfigSession.mjs";
+import { mountSecretReveals } from "homebridge-plugin-utils/webUi-secret.mjs";
 import { webUi } from "homebridge-plugin-utils/webUi.mjs";
 
 // The feature-option category the controller-scope options this webUI reasons about live in. One constant anchors the category everywhere this file names it - the
@@ -275,7 +276,7 @@ const firstRunIsRequired = ({ config }) => hydrawiseConfig.apiKey(config).length
 /* The classes a credential result line wears in every state. The tone is layered on top of this base, so a line's blank, failure, and success states are one layout with
  * one color decision between them rather than a separate class string per state, which is what would let the states drift apart.
  */
-const RESULT_ROW_CLASS = "hbhh-result small mt-2";
+const RESULT_ROW_CLASS = "fo-result small mt-2";
 
 /* Paint one credential validation's result line in the tone its outcome calls for - a Bootstrap text color, or an empty string for the blank state. The sentence
  * lands through textContent, so a reason the server reported renders as text rather than as markup, matching the trust boundary every other display in this file
@@ -1429,30 +1430,8 @@ const onValidateV2 = async () => {
   }
 };
 
-// A reveal toggle's accessible name, naming what the NEXT click will do rather than what the field is doing now, which is what a control announced as a button
-// wants to say. The subject is the field's own plain name, so each toggle on the page announces which credential it acts on.
-const revealLabel = (subject, revealed) => (revealed ? "Hide the " : "Show the ") + subject + ".";
-
-/* Flip one masked credential between hidden and shown. Every reveal on the page comes through here: a toggle names the field it serves and the subject its
- * accessible name uses on its own data attributes, so a field gains a reveal by carrying a button in the markup rather than by growing a handler of its own. The
- * sidebar's zone dots carry their identity the same way, for the same reason.
- *
- * The field's type, the toggle's accessible name, and its pressed state describe one state between them, so they are written together and no path can move one and
- * leave the others saying something else. Nothing here touches a value or the staged pair: whether a secret is on screen right now says nothing about the
- * configuration, so the flip commits nothing and invalidates nothing.
- */
-const toggleReveal = (toggle) => {
-
-  const input = document.getElementById(toggle.dataset.reveal);
-  const revealed = input.type === "password";
-
-  input.type = revealed ? "text" : "password";
-  toggle.setAttribute("aria-label", revealLabel(toggle.dataset.revealSubject, revealed));
-  toggle.setAttribute("aria-pressed", revealed ? "true" : "false");
-};
-
-/* Wire the first-run validations, the credential reveals, and the edits that invalidate a verdict already on screen. Each lookup by id reaches its listener
- * through an optional chain, so a control this page's markup omits costs that control's wiring alone rather than the whole page's.
+/* Wire the first-run validations and the edits that invalidate a verdict already on screen. Each lookup by id reaches its listener through an optional chain, so a
+ * control this page's markup omits costs that control's wiring alone rather than the whole page's.
  */
 document.getElementById("validateApiKey")?.addEventListener("click", () => void onValidateApiKey());
 document.getElementById("validateV2")?.addEventListener("click", () => void onValidateV2());
@@ -1467,12 +1446,11 @@ for(const scope of Object.values(validationScopes)) {
   }
 }
 
-// Each masked credential's reveal, bound from the markup itself: a toggle declares the field it serves, so the page grows a reveal without this wiring changing.
-// The query answers only toggles that exist, so these bindings need no absent-target tolerance.
-for(const toggle of document.querySelectorAll("[data-reveal]")) {
-
-  toggle.addEventListener("click", () => toggleReveal(toggle));
-}
+/* Give each masked credential on the first-run page its reveal from HBPU's page kit. A field opts in through its markup, a secret field naming the subject its
+ * toggle announces, so the page grows a reveal without this wiring changing. The mount lasts the page's life and takes no signal, because the settings window is
+ * fresh on every open.
+ */
+mountSecretReveals({ root: document.getElementById("pageFirstRun") });
 
 /* The bound in seconds on the whole load-time wiring below. Five seconds settles the envelope provably inside the page boot monitor's ten-second watchdog, so a
  * wiring step that hangs against an unresponsive host can never be what makes the settings panel look broken.

@@ -4,13 +4,6 @@
     width: 33%;
   }
 
-  /* A credential validation's result line. It holds its own height whether or not it is saying anything, so a card does not shift under the user's eye as a
-   * validation answers.
-   */
-  .hbhh-result {
-    min-height: 1.25em;
-  }
-
   /* A zone's sidebar row: its state dot, its number, and its name. The dot and number columns are fixed widths, which is what makes every name in the list start
    * at one shared edge no matter how many digits the numbers above and below it carry.
    */
@@ -92,14 +85,6 @@
   <img src="https://raw.githubusercontent.com/hjdhjd/homebridge-hunter-hydrawise/main/images/homebridge-hunter-hydrawise.svg" alt="homebridge-hunter-hydrawise logo" class="hbhh-logo" />
 </p>
 <div id="pageFirstRun" class="fo-page" style="display: none;">
-  <!-- The eye glyph every credential reveal on this page wears, drawn once here and referenced by each toggle so the controls cannot drift into different marks.
-       Every stroke draws in currentColor and each instance sizes itself in em, so a glyph takes the color and the scale of the button hosting it. -->
-  <svg aria-hidden="true" class="d-none">
-    <symbol id="hbhhEyeGlyph" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.25" viewBox="0 0 16 16">
-      <path d="M1 8c2-3.2 4.3-4.8 7-4.8s5 1.6 7 4.8c-2 3.2-4.3 4.8-7 4.8S3 11.2 1 8Z"></path>
-      <circle cx="8" cy="8" r="2.1"></circle>
-    </symbol>
-  </svg>
   <div class="mx-auto text-start" style="width: 90%;">
     <p class="mb-2">Welcome to <strong>homebridge-hunter-hydrawise</strong>. To get started:</p>
     <ol>
@@ -112,15 +97,11 @@
       <h6 class="mb-1">API key</h6>
       <p class="small mb-3">Your API key is all this plugin needs to discover your controllers and run your zones.</p>
       <label class="form-label mb-1" for="apiKey">Hydrawise API key</label>
-      <div class="fo-secret-field">
+      <div class="fo-secret-field" data-secret-subject="API key">
         <input type="password" class="form-control fo-monospace" id="apiKey" autocomplete="new-password">
-        <button type="button" class="fo-secret-toggle" id="revealApiKey" aria-label="Show the API key." aria-pressed="false" data-reveal="apiKey"
-          data-reveal-subject="API key">
-          <svg aria-hidden="true" height="1em" width="1em"><use href="#hbhhEyeGlyph"></use></svg>
-        </button>
       </div>
       <button type="button" class="btn btn-primary btn-sm mt-2" id="validateApiKey">Validate API Key</button>
-      <div class="hbhh-result small mt-2" id="apiKeyResult"></div>
+      <div class="fo-result small mt-2" id="apiKeyResult"></div>
       <div class="small text-danger" id="loginError"></div>
       <details class="small mt-2">
         <summary>About this API's limits</summary>
@@ -141,22 +122,17 @@
       <label class="form-label mb-1" for="hydrawiseUsername">Hydrawise username</label>
       <input type="email" class="form-control fo-monospace" id="hydrawiseUsername" autocomplete="email" placeholder="you@example.com">
       <label class="form-label mb-1 mt-3" for="hydrawisePassword">Hydrawise password</label>
-      <div class="fo-secret-field">
+      <div class="fo-secret-field" data-secret-subject="password">
         <input type="password" class="form-control fo-monospace" id="hydrawisePassword" autocomplete="current-password">
-        <button type="button" class="fo-secret-toggle" id="revealPassword" aria-label="Show the password." aria-pressed="false"
-          data-reveal="hydrawisePassword" data-reveal-subject="password">
-          <svg aria-hidden="true" height="1em" width="1em"><use href="#hbhhEyeGlyph"></use></svg>
-        </button>
       </div>
       <button type="button" class="btn btn-primary btn-sm mt-2" id="validateV2">Validate Account Login</button>
-      <div class="hbhh-result small mt-2" id="validateV2Result"></div>
+      <div class="fo-result small mt-2" id="validateV2Result"></div>
       <details class="small mt-2">
         <summary>About this API's limits</summary>
         <ul class="mb-0 mt-2" dir="auto">
           <li>Hydrawise publishes no limits for this API, so the plugin sets its own and stays well inside them.</li>
           <li>The account details refresh every 15 minutes.</li>
-          <li>Zone suspensions are capped at 10 commands an hour. A command the plugin holds back puts its switch straight back where it was and says why in the Homebridge log.</li>
-          <li>This API suspends and resumes an individual zone, which is what the per-zone suspend switches run on.</li>
+          <li>The account login only reads; every zone command, per-zone suspensions included, goes through your API key under its limits.</li>
         </ul>
       </details>
     </div>
