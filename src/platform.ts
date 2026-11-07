@@ -4,8 +4,8 @@
  */
 import type { API, Characteristic, DynamicPlatformPlugin, HAP, Logging, PlatformAccessory, PlatformConfig } from "homebridge";
 import { APIEvent, AccessoryPersistence, FeatureOptions, MQTT_AVAILABILITY_OFFLINE, RateBudget, TimerRegistry, armDeadline, classifyTransportError,
-  composeSignals, createApiDispatcher, createMqttClient, debugGatedLog, exponentialBackoff, formatErrorMessage, loopFaultReporter, mqttTopic, notResponding,
-  repeatDemotedLog, retry, sanitizeName, superviseLoop, systemClock } from "homebridge-plugin-utils";
+  composeSignals, createApiDispatcher, createMqttClient, debugGatedLog, exponentialBackoff, formatErrorMessage, loopFaultReporter, mqttConnectionSettings, mqttTopic,
+  notResponding, readOptionsSetting, repeatDemotedLog, retry, sanitizeName, superviseLoop, systemClock } from "homebridge-plugin-utils";
 import type { Categories, Clock, HomebridgePluginLogging, MqttClient, Nullable, RepeatDemotedLog } from "homebridge-plugin-utils";
 import type { CustomerDetailsResponse, HydrawiseAccessory, HydrawiseAccessoryContext, HydrawiseCommandOutcome, HydrawiseControllerAccessory,
   HydrawiseControllerConfig, HydrawiseControllerIdentity, HydrawiseEndpoint, HydrawiseZoneIdentity, SetZoneResponse } from "./types.ts";
@@ -107,8 +107,9 @@ export function v2RefreshDelay({ random = Math.random, throttles }: { random?: (
  * platform with its log, configuration and API alone, so every member takes its production default and the field never sees anything else.
  *
  * @property clock       - The one time source for every wait, deadline and time read the platform schedules. Defaults to the system clock.
- * @property mqttFactory - How the MQTT client is built, handed the broker settings, the platform's clock and its lifetime signal. Defaults to HBPU's guarded
- *                         factory, which answers null when MQTT is off or the broker URL is unusable.
+ * @property mqttFactory - How the MQTT client is built, handed the broker settings HBPU's resolver answered, the platform's clock and its lifetime signal, and
+ *                         called only when that resolver finds MQTT on. Defaults to HBPU's guarded factory, which answers null for a broker URL the client
+ *                         cannot parse.
  */
 export interface HydrawisePlatformDefaults {
 
@@ -210,16 +211,17 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
 
   constructor(log: Logging, config: PlatformConfig | undefined, api: API, { clock = systemClock, mqttFactory = createMqttClient }: HydrawisePlatformDefaults = {}) {
 
-    // PlatformConfig exposes user values through an any-typed index signature, so we read each value through a bracket-access cast to its declared type and keep the
-    // reads type-checked rather than any. We resolve the options list once and share it between the feature-options engine and our own config snapshot.
-    const options = (config?.["options"] as string[] | undefined) ?? [];
-
     this.accessories = [];
     this.account = {} as CustomerDetailsResponse;
     this.api = api;
     this.clock = clock;
     this.configuredDevices = {};
-    this.featureOptions = new FeatureOptions(featureOptionCategories, featureOptions, options);
+
+    /* PlatformConfig exposes user values through an any-typed index signature, so we read each value through a bracket-access cast to its declared type and keep
+     * the reads type-checked rather than any. The options setting is read through HBPU's reader instead: it is the typed read an untyped setting needs before it
+     * reaches the engine's string[] parameter, and the engine applies the same rule to whatever it is handed.
+     */
+    this.featureOptions = new FeatureOptions(featureOptionCategories, featureOptions, readOptionsSetting(config?.["options"]));
     this.hap = api.hap;
 
     /* Wrap the Homebridge logger in the library's config-gated composition: our debug output emits through warn - visible without Homebridge's own debug switch -
@@ -263,14 +265,16 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
     // shutdown itself to save whatever is waiting, so it takes no teardown-stack registration of its own.
     this.persistence = new AccessoryPersistence({ api, clock: this.clock, platformName: PLATFORM_NAME, pluginIdentifier: PLUGIN_NAME });
 
-    /* Assemble the effective configuration. This is the one place a raw configuration property and a configured feature option meet: every consolidated setting
-     * resolves through the engine's one precedence here - an explicitly configured option rules in every state it can be in, a legacy configuration property
-     * otherwise outranks the catalog default, and the default closes the chain - so no reader downstream has to know that a setting has two possible homes. The
-     * legacy arm is transitional and sunsets at the plugin's next major version, at which point the option is the only home a setting has.
+    /* Assemble the effective configuration. This is where a raw configuration property and a configured feature option meet for every setting the platform
+     * carries: each resolves through the engine's one precedence here - an explicitly configured option rules in every state it can be in, a legacy
+     * configuration property otherwise outranks the catalog default, and the default closes the chain - so no reader downstream has to know that a setting can
+     * live in its option or in a legacy property. The MQTT broker URL and topic prefix are carried nowhere: HBPU's resolver reads them by the same precedence at
+     * the client's construction below. The legacy arm is transitional and sunsets at the plugin's next major version, at which point the option is the only home
+     * a setting has.
      *
      * The engine takes any option name, so each read states its name against the catalog's global unions through `satisfies`, which keeps a misspelled or
      * wrongly scoped name a compile error. A legacy property keeps this file's bracket-access cast posture, and a non-string smuggled past that cast by a
-     * hand-edited configuration degrades safely at every consumer: the API key gate reads it as no key, and the MQTT factory reads it as nothing configured.
+     * hand-edited configuration degrades safely: the API key gate reads it as no key.
      */
     this.config = {
 
@@ -278,11 +282,6 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
         option: "Account.ApiKey" satisfies HydrawiseGlobalValueOption }) ?? "",
       debug: this.featureOptions.consolidatedFlag({ fallback: (typeof config?.["debug"] === "boolean") ? config["debug"] : undefined,
         option: "Log.Debug" satisfies HydrawiseGlobalFlagOption }),
-      mqttTopic: this.featureOptions.consolidatedValue({ fallback: config?.["mqttTopic"] as string | undefined,
-        option: "Mqtt.Topic" satisfies HydrawiseGlobalValueOption }),
-      mqttUrl: this.featureOptions.consolidatedValue({ fallback: config?.["mqttUrl"] as string | undefined,
-        option: "Mqtt.Url" satisfies HydrawiseGlobalValueOption }),
-      options,
 
       // The account credentials have no legacy configuration property of their own, so they resolve from the feature option alone and their reads carry no
       // fallback.
@@ -312,13 +311,18 @@ export class HydrawisePlatform implements DynamicPlatformPlugin {
       this.log.info("Enhanced features are enabled using your Hydrawise account login.");
     }
 
-    /* Initialize MQTT, if needed, through the platform's MQTT factory, which is HBPU's guarded factory in the field. The guarded factory answers null for each of
-     * the ways MQTT can fail to start - a broker URL or topic prefix that resolves to nothing, and a URL the client cannot parse - so a mistyped MQTT setting
-     * degrades to MQTT being off rather than keeping the rest of the plugin from loading. An unusable URL is reported once at error level, with the URL itself
-     * redacted so a broker password embedded in it never reaches the log. The platform's shutdown signal ties the client's lifetime to ours, and the platform's
-     * clock is the one the end's grace waits on, as every other wait we schedule.
+    /* Initialize MQTT, if needed. HBPU's resolver and the platform's MQTT factory, HBPU's guarded factory in the field, each answer for a way MQTT can fail to
+     * start, and each lands on the same degradation - MQTT stays off and the rest of the plugin loads. The resolver answers null when no broker is configured
+     * anywhere, or the user turned an option off or enabled it without a value. Each legacy property reaches it as text or as unset, and it reads a blank topic
+     * as unset too, so a legacy topic that is blank or not text leaves the catalog's default prefix to answer beside a configured broker. The guarded factory
+     * answers null for a URL the client cannot parse, reporting that once at error level with the URL redacted so a broker password embedded in it never reaches
+     * the log. The platform's shutdown signal ties the client's lifetime to ours, and the platform's clock is the one the end's grace waits on, as every other
+     * wait we schedule.
      */
-    this.mqtt = mqttFactory({ brokerUrl: this.config.mqttUrl, log: this.log, topicPrefix: this.config.mqttTopic }, { clock: this.clock, signal: this.signal });
+    const mqttSettings = mqttConnectionSettings({ config: { mqttTopic: (typeof config?.["mqttTopic"] === "string") ? config["mqttTopic"] : undefined,
+      mqttUrl: (typeof config?.["mqttUrl"] === "string") ? config["mqttUrl"] : undefined }, featureOptions: this.featureOptions });
+
+    this.mqtt = mqttSettings && mqttFactory({ ...mqttSettings, log: this.log }, { clock: this.clock, signal: this.signal });
 
     // On every broker session, state each restored controller this run has not built as unreachable. The client's lifetime is the platform's, so the registration
     // carries no signal of its own.

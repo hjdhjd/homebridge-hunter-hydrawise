@@ -19,7 +19,7 @@ import type { BuildPlatformResult, TestMqttClient } from "./testing/platform.hel
 import { Characteristic, Service, buildPlatform, dispatcherOf, heldEndFor, installMockDispatcher, installV2Client, makeTestV2Client, programCountedReply,
   programJsonReply, programStatusReply, seedAccessory, v2DispatcherOf } from "./testing/platform.helpers.ts";
 import { HAPStatus, MQTT_DEFAULT_END_GRACE_MS, createMqttClient, onAbort } from "homebridge-plugin-utils";
-import { HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_TIMEOUT } from "./settings.ts";
+import { HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_API_TIMEOUT, HYDRAWISE_MQTT_TOPIC } from "./settings.ts";
 import { HYDRAWISE_CONTROLLER_FALLBACK_NAME, HydrawiseReservedNames, suspendZoneSubtype, zoneAccessoryId } from "./types.ts";
 import type { Characteristic as HapCharacteristic, PlatformAccessory } from "homebridge";
 import { describe, test } from "node:test";
@@ -332,7 +332,7 @@ describe("HydrawisePlatform configure", () => {
     assert.notEqual(call.client, null, "a valid broker URL should construct an MQTT client");
     assert.equal(platform.mqtt, call.client, "and the platform holds the client its factory answered");
     assert.equal(call.config.brokerUrl, BROKER_URL, "the factory is handed the broker URL the platform resolved");
-    assert.equal(call.config.topicPrefix, platform.config.mqttTopic, "and the topic prefix");
+    assert.equal(call.config.topicPrefix, HYDRAWISE_MQTT_TOPIC, "and the catalog's topic prefix, with no topic configured");
     assert.equal(call.config.log, platform.log, "and the platform's own logger");
 
     const init = present(call.init, "the init the platform handed its factory");

@@ -11,12 +11,12 @@
  */
 import { API_KEY_LENGTH, makeHydrawiseConfig, makeHydrawiseNames, makeLegacyHydrawiseConfig } from "./config.ts";
 import type { Assert, Equal } from "homebridge-plugin-utils/testing";
-import { FeatureOptions, displayedName, sanitizeName } from "homebridge-plugin-utils";
+import { FeatureOptions, displayedName, readOptionsSetting, sanitizeName } from "homebridge-plugin-utils";
+import { buildPlatform, mqttSettingsOf } from "../testing/platform.helpers.ts";
 import { controllerDisplayName, zoneDisplayName } from "../types.ts";
 import { describe, test } from "node:test";
 import { featureOptionCategories, featureOptions } from "../options.ts";
 import assert from "node:assert/strict";
-import { buildPlatform } from "../testing/platform.helpers.ts";
 
 // APIEvent.SHUTDOWN's string value, fired to tear down a platform the round-trip test builds.
 const SHUTDOWN = "shutdown";
@@ -30,8 +30,8 @@ const OPTION_KEY = "EEEE-FFFF-GGGG-HHH";
 const ACCOUNT_USERNAME = "gardener=test@example.com";
 const ACCOUNT_PASSWORD = "correct horse battery";
 
-// The interpreter under test, built the way the webUI builds it: the real engine class and the real served catalog.
-const config = makeHydrawiseConfig({ FeatureOptions, catalog: { categories: featureOptionCategories, options: featureOptions } });
+// The interpreter under test, built the way the webUI builds it: the real engine class, the real served catalog and HBPU's real reader of the options setting.
+const config = makeHydrawiseConfig({ FeatureOptions, catalog: { categories: featureOptionCategories, options: featureOptions }, readOptionsSetting });
 
 /* Compile-time shape exercise for the factories' injected values. It never runs - the function is never called, and its leading underscore marks it, with its
  * bindings, as a compile-time exercise the typecheck reads - so it adds nothing to the runtime totals. Each injected value's type is the imported HBPU value's
@@ -41,6 +41,8 @@ const _injectedShapeExercises = (): void => {
 
   type _InjectedEngineIsTheClass = Assert<Equal<Parameters<typeof makeHydrawiseConfig>[0]["FeatureOptions"], typeof FeatureOptions>>;
   type _InjectedLegacyEngineIsTheClass = Assert<Equal<Parameters<typeof makeLegacyHydrawiseConfig>[0]["FeatureOptions"], typeof FeatureOptions>>;
+  type _InjectedReaderIsTheFunction = Assert<Equal<Parameters<typeof makeHydrawiseConfig>[0]["readOptionsSetting"], typeof readOptionsSetting>>;
+  type _InjectedLegacyReaderIsTheFunction = Assert<Equal<Parameters<typeof makeLegacyHydrawiseConfig>[0]["readOptionsSetting"], typeof readOptionsSetting>>;
   type _InjectedDisplayedNameIsTheFunction = Assert<Equal<Parameters<typeof makeHydrawiseNames>[0]["displayedName"], typeof displayedName>>;
   type _InjectedSanitizeNameIsTheFunction = Assert<Equal<Parameters<typeof makeHydrawiseNames>[0]["sanitizeName"], typeof sanitizeName>>;
 };
@@ -297,8 +299,11 @@ describe("hydrawise webUI config interpreters", () => {
     });
 
     assert.equal(after.platform.config.apiKey, before.platform.config.apiKey, "the migrated config resolves the same effective API key");
-    assert.equal(after.platform.config.mqttUrl, before.platform.config.mqttUrl, "the migrated config resolves the same effective broker URL");
-    assert.equal(after.platform.config.mqttTopic, before.platform.config.mqttTopic, "the migrated config resolves the same effective topic prefix");
+
+    // The MQTT settings resolve where each platform builds its client, so the comparison reads what each handed its factory. The legacy side is read against its
+    // own properties first, so defaults that agree cannot pass for a preserved setting.
+    assert.deepEqual(mqttSettingsOf(before), { brokerUrl: "mqtt://127.0.0.1:1", topicPrefix: "garden" }, "the legacy config builds its client on its own properties");
+    assert.deepEqual(mqttSettingsOf(after), mqttSettingsOf(before), "the migrated config builds its MQTT client on the same broker URL and topic prefix");
     assert.equal(before.platform.config.debug, true, "the legacy configuration resolves debug on, so the comparison below is not two defaults agreeing");
     assert.equal(after.platform.config.debug, before.platform.config.debug, "the migrated config resolves the same effective debug flag");
   });
@@ -326,14 +331,19 @@ describe("hydrawise webUI config interpreters", () => {
     assert.ok(Object.hasOwn(patch, "mqttTopic"), "the defined sibling is still staged for deletion");
   });
 
-  test("an options substrate that is not an array declines rather than guessing", () => {
+  test("an options setting that is not a list reads as no entries, and the legacy property beside it still migrates", () => {
 
-    assert.equal(config.migrate({ apiKey: LEGACY_KEY, options: {} }), null, "an unparseable options substrate leaves the whole config alone");
+    // HBPU's reader answers a setting that is not a list with no entries, as HBPU's own migration reads it, so the key composes into a list of its own.
+    const patch = config.migrate({ apiKey: LEGACY_KEY, options: {} });
+
+    assert.ok(patch, "a setting that is not a list declines nothing");
+    assert.ok(Object.hasOwn(patch, "apiKey"), "the legacy key property is staged for deletion");
+    assert.deepEqual(patch.options, ["Enable.Account.ApiKey=" + LEGACY_KEY], "the key migrates into a list that replaces the setting, holding its entry alone");
   });
 
   test("the degraded-mode interpreter reads what the real interpreter writes", () => {
 
-    const legacy = makeLegacyHydrawiseConfig({ FeatureOptions });
+    const legacy = makeLegacyHydrawiseConfig({ FeatureOptions, readOptionsSetting });
 
     assert.equal(legacy.apiKey({ apiKey: LEGACY_KEY }), LEGACY_KEY, "the legacy property answers directly");
     assert.equal(legacy.migrate({ apiKey: LEGACY_KEY }), null, "degraded mode never migrates blind");
@@ -356,7 +366,7 @@ describe("hydrawise webUI config interpreters", () => {
 
   test("a degraded first run leaves the key it writes as the only key the configuration keeps", () => {
 
-    const legacy = makeLegacyHydrawiseConfig({ FeatureOptions });
+    const legacy = makeLegacyHydrawiseConfig({ FeatureOptions, readOptionsSetting });
 
     /* Each start holds an entry addressing the key that is not the key first run validates: one enabled with a value, one disabled, and one enabled with none.
      * The catalog-backed reader and the runtime let any such entry outrank the property the degraded write sets, and the next healthy load's migration, finding
@@ -391,7 +401,7 @@ describe("hydrawise webUI config interpreters", () => {
 
   test("the degraded interpreter writes the account credentials as option entries, not as properties", () => {
 
-    const legacy = makeLegacyHydrawiseConfig({ FeatureOptions });
+    const legacy = makeLegacyHydrawiseConfig({ FeatureOptions, readOptionsSetting });
     const patch = legacy.withFirstRun({ options: ["Disable.Device.ABC123"] }, { apiKey: OPTION_KEY, password: ACCOUNT_PASSWORD, username: ACCOUNT_USERNAME });
 
     /* The key writes a property because a property is always safe to write blind. The credentials cannot: there is no property home for them, so a property write
@@ -405,7 +415,7 @@ describe("hydrawise webUI config interpreters", () => {
 
   test("the degraded credential write replaces rather than accumulates", () => {
 
-    const legacy = makeLegacyHydrawiseConfig({ FeatureOptions });
+    const legacy = makeLegacyHydrawiseConfig({ FeatureOptions, readOptionsSetting });
     const first = legacy.withFirstRun({}, { apiKey: OPTION_KEY, password: "first-password", username: "first-user" });
     const second = legacy.withFirstRun({ options: first.options }, { apiKey: OPTION_KEY, password: ACCOUNT_PASSWORD, username: ACCOUNT_USERNAME });
 
@@ -417,7 +427,7 @@ describe("hydrawise webUI config interpreters", () => {
 
   test("the degraded credential write supersedes an explicitly disabled entry too", () => {
 
-    const legacy = makeLegacyHydrawiseConfig({ FeatureOptions });
+    const legacy = makeLegacyHydrawiseConfig({ FeatureOptions, readOptionsSetting });
     const patch = legacy.withFirstRun({ options: [ "Disable.Account.Username", "Enable.Account.Password" ] },
       { apiKey: OPTION_KEY, password: ACCOUNT_PASSWORD, username: ACCOUNT_USERNAME });
 
@@ -429,10 +439,10 @@ describe("hydrawise webUI config interpreters", () => {
 
   test("the degraded credential write drops a non-string entry from the options it writes", () => {
 
-    const legacy = makeLegacyHydrawiseConfig({ FeatureOptions });
+    const legacy = makeLegacyHydrawiseConfig({ FeatureOptions, readOptionsSetting });
 
-    // The write reads the options list through the module's one filter, so a hand-edited entry that is not text is left out of the list it writes rather than
-    // passed on through a patch that declares its entries as text.
+    // The write reads the options list through HBPU's reader, so a hand-edited entry that is not text is left out of the list it writes rather than passed on
+    // through a patch that declares its entries as text.
     const patch = legacy.withFirstRun({ options: [ 42, "Disable.Device.ABC123" ] }, { apiKey: OPTION_KEY, password: ACCOUNT_PASSWORD, username: ACCOUNT_USERNAME });
 
     assert.deepEqual(patch.options, [ "Disable.Device.ABC123", "Enable.Account.Password=" + ACCOUNT_PASSWORD, "Enable.Account.Username=" + ACCOUNT_USERNAME ],
@@ -441,7 +451,7 @@ describe("hydrawise webUI config interpreters", () => {
 
   test("the two interpreters read each other's credential writes", () => {
 
-    const legacy = makeLegacyHydrawiseConfig({ FeatureOptions });
+    const legacy = makeLegacyHydrawiseConfig({ FeatureOptions, readOptionsSetting });
     const values = { apiKey: OPTION_KEY, password: ACCOUNT_PASSWORD, username: ACCOUNT_USERNAME };
 
     /* Both directions matter, because a session can degrade or recover between one open and the next. What is on disk has to be ONE shape either way: a degraded
@@ -460,7 +470,7 @@ describe("hydrawise webUI config interpreters", () => {
 
   test("the degraded credential readers answer nothing set when no entry carries the credential", () => {
 
-    const legacy = makeLegacyHydrawiseConfig({ FeatureOptions });
+    const legacy = makeLegacyHydrawiseConfig({ FeatureOptions, readOptionsSetting });
 
     assert.equal(legacy.username({ options: [ "Enable.Account.Password=" + ACCOUNT_PASSWORD, "Disable.Device.ABC123" ] }), "",
       "an array that carries no username entry reads as nothing set");
@@ -469,7 +479,7 @@ describe("hydrawise webUI config interpreters", () => {
 
   test("the degraded readers answer the key and the account login exactly as the catalog-backed readers do", () => {
 
-    const legacy = makeLegacyHydrawiseConfig({ FeatureOptions });
+    const legacy = makeLegacyHydrawiseConfig({ FeatureOptions, readOptionsSetting });
 
     /* The forms an entry can take on one option, alone and with a disable before and after an enabled value, since the engine lets the first entry addressing an
      * option decide. Each answer is held to the catalog-backed reader's over the same configuration rather than to a hand-typed expectation, so a degraded rule that
@@ -557,7 +567,7 @@ describe("hydrawise webUI retired-option rename migration", () => {
      */
     const family = makeHydrawiseConfig({ FeatureOptions, catalog: { categories: featureOptionCategories,
       options: { ...featureOptions, ["Device"]: [ ...(featureOptions["Device"] ?? []),
-        { default: false, description: "Suspend one zone.", name: "Suspend.Zone", scopes: [ "controller", "device", "global" ] } ] } } });
+        { default: false, description: "Suspend one zone.", name: "Suspend.Zone", scopes: [ "controller", "device", "global" ] } ] } }, readOptionsSetting });
 
     const untouched = [ "Enable.Device.Suspend.All", "Disable.Device.Suspend.All." + SERIAL, "Enable.Device.Suspend.Zone", "Enable.Device.Suspend.Zone.700001" ];
 
@@ -618,8 +628,8 @@ describe("hydrawise webUI retired-option rename migration", () => {
 
   test("a non-string entry in a hand-edited options array is dropped as it is read", () => {
 
-    /* What the boundary filter answers. The entry grammar is text, so an entry of any other kind is dropped before the engine reads the array: the effective key
-     * resolves rather than the engine throwing on the stray entry, and a migration that rewrites a retired name stages the text entries alone.
+    /* What HBPU's reader answers. The entry grammar is text, so an entry of any other kind is dropped as the setting is read: the effective key resolves rather
+     * than the engine throwing on the stray entry, and a migration that rewrites a retired name stages the text entries alone.
      */
     const handEdited = { options: [ 42, "Enable.Account.ApiKey=" + OPTION_KEY, "Enable.Device.Suspend." + SERIAL ] };
 

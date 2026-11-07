@@ -6,20 +6,17 @@ import type { FeatureOptionEntry, FeatureOptionScope, Nullable } from "homebridg
 import { buildComposedScopeDescribers, mqttFeatureOptions } from "homebridge-plugin-utils";
 import { HYDRAWISE_MQTT_TOPIC } from "./settings.ts";
 
-/* The plugin's effective configuration, assembled once by the platform constructor. Each consolidated setting resolves there - the configured feature option
- * first, the legacy configuration property as its fallback - so this describes what the plugin actually runs on rather than mirroring the shape of config.json.
+/* The plugin's effective configuration, assembled once by the platform constructor. Each setting here resolves there - the configured feature option first,
+ * the legacy configuration property as its fallback - so this describes what the plugin actually runs on rather than mirroring the shape of config.json.
  *
- * The MQTT and account-credential fields carry the feature-option engine's own tri-state answer: a string when a value resolves, null when the option is explicitly
- * disabled, and undefined when an entry exists carrying no value. Every absence means the same thing to the reader downstream - MQTT is off, and the optional
- * enhanced features stay dormant - which is why each is declared optional as well as nullable: the question mark is what admits the resolver's undefined arm.
+ * The account-credential fields carry the feature-option engine's own tri-state answer: a string when a value resolves, null when the option is explicitly
+ * disabled, and undefined when an entry exists carrying no value. Every absence means the same thing to the reader downstream - the optional enhanced features
+ * stay dormant - which is why each is declared optional as well as nullable: the question mark is what admits the resolver's undefined arm.
  */
 export interface HydrawiseOptions {
 
   apiKey: string;
   debug?: boolean;
-  mqttTopic?: Nullable<string>;
-  mqttUrl?: Nullable<string>;
-  options?: string[];
   password?: Nullable<string>;
   username?: Nullable<string>;
 }

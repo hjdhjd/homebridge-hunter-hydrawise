@@ -2,15 +2,18 @@
  *
  * platform.options.test.ts: The platform's consolidated setting resolution and its guarded MQTT construction, exercised against a REAL platform built
  * through the harness. Covers every arm of the precedence rule - option over legacy property, legacy property over catalog default, and the explicit disabled and
- * valueless option states - for the API key, the MQTT broker URL, the MQTT topic prefix, and the debug flag, plus the client the resolved values do or do not construct.
+ * valueless option states - for the API key, the MQTT broker URL, the MQTT topic prefix, and the debug flag, plus the client the resolved values do or do not construct,
+ * the legacy topic that is blank or not text, which leaves the catalog default to answer, and the legacy broker URL that is not text, which leaves MQTT off.
  *
- * Every value pair here is deliberately distinct, so a resolver reading the wrong arm cannot echo the right answer back and pass. A platform builds its client
- * through the harness's MQTT factory double, which answers a configured broker with a recording double and MQTT off with null, so no row dials a broker.
+ * Every value pair here is deliberately distinct, so a resolver reading the wrong arm cannot echo the right answer back and pass. The MQTT settings resolve where
+ * the platform builds its client, through HBPU's resolver, so a row reads the broker URL and topic prefix the platform handed the harness's MQTT factory double,
+ * which answers with a recording double so no row dials a broker; with MQTT off the platform calls the factory not at all.
  */
+import { buildPlatform, mqttSettingsOf } from "./testing/platform.helpers.ts";
 import { describe, test } from "node:test";
 import { expectAt, loggedAt } from "homebridge-plugin-utils/testing";
+import { HYDRAWISE_MQTT_TOPIC } from "./settings.ts";
 import assert from "node:assert/strict";
-import { buildPlatform } from "./testing/platform.helpers.ts";
 
 // APIEvent.SHUTDOWN's string value. Firing it aborts the platform's shutdown signal, which is what ends any MQTT client a test constructed.
 const SHUTDOWN = "shutdown";
@@ -21,78 +24,122 @@ const OPTION_KEY = "EEEE-FFFF-GGGG-HHH";
 
 describe("HydrawisePlatform consolidated options", () => {
 
-  test("resolves a legacy-only configuration through to the effective config", (t) => {
+  test("resolves a legacy-only configuration through to the effective config and the MQTT client", (t) => {
 
-    const { emit, platform } = buildPlatform({ apiKey: LEGACY_KEY, mqttTopic: "legacy-topic", mqttUrl: "mqtt://127.0.0.1:1" });
+    const built = buildPlatform({ apiKey: LEGACY_KEY, mqttTopic: "legacy-topic", mqttUrl: "mqtt://127.0.0.1:1" });
+    const { emit, platform } = built;
 
     t.after(() => emit(SHUTDOWN));
 
     assert.equal(platform.config.apiKey, LEGACY_KEY, "a legacy API key property resolves as the effective key");
-    assert.equal(platform.config.mqttUrl, "mqtt://127.0.0.1:1", "a legacy broker URL property resolves as the effective URL");
-    assert.equal(platform.config.mqttTopic, "legacy-topic", "a legacy topic property outranks the catalog default rather than being overwritten by it");
+    assert.deepEqual(mqttSettingsOf(built), { brokerUrl: "mqtt://127.0.0.1:1", topicPrefix: "legacy-topic" },
+      "a legacy broker URL property builds the client, under a legacy topic property that outranks the catalog default rather than being overwritten by it");
   });
 
   test("resolves configured options with no legacy properties present", (t) => {
 
     // The harness always supplies the API key property, so an empty string is how a test says the configuration carries no legacy key at all.
-    const { emit, platform } = buildPlatform({ apiKey: "", options: [ "Enable.Account.ApiKey=" + OPTION_KEY, "Enable.Mqtt.Topic=option-topic" ] });
+    const built = buildPlatform({ apiKey: "", options: [ "Enable.Account.ApiKey=" + OPTION_KEY, "Enable.Mqtt.Topic=option-topic",
+      "Enable.Mqtt.Url=mqtt://127.0.0.1:1" ] });
+    const { emit, platform } = built;
 
     t.after(() => emit(SHUTDOWN));
 
     assert.equal(platform.config.apiKey, OPTION_KEY, "a configured API key option resolves with no legacy property in play");
-    assert.equal(platform.config.mqttTopic, "option-topic", "a configured topic option resolves with no legacy property in play");
-    assert.equal(platform.config.mqttUrl, null, "an unconfigured broker URL resolves to nothing");
+    assert.deepEqual(mqttSettingsOf(built), { brokerUrl: "mqtt://127.0.0.1:1", topicPrefix: "option-topic" },
+      "configured broker URL and topic options build the client with no legacy property in play");
+  });
+
+  test("a configured topic with no broker anywhere builds no MQTT client", (t) => {
+
+    const { emit, mqttFactory, platform } = buildPlatform({ options: ["Enable.Mqtt.Topic=option-topic"] });
+
+    t.after(() => emit(SHUTDOWN));
+
+    assert.equal(mqttFactory.createCalls.length, 0, "an unconfigured broker URL leaves the platform nothing to build a client from");
     assert.equal(platform.mqtt, null, "no broker URL means no MQTT client and no connection");
   });
 
   test("a configured option outranks its legacy property for every consolidated setting", (t) => {
 
-    const { emit, platform } = buildPlatform({ apiKey: LEGACY_KEY, mqttTopic: "legacy-topic", mqttUrl: "mqtt://127.0.0.2:1",
+    const built = buildPlatform({ apiKey: LEGACY_KEY, mqttTopic: "legacy-topic", mqttUrl: "mqtt://127.0.0.2:1",
       options: [ "Enable.Account.ApiKey=" + OPTION_KEY, "Enable.Mqtt.Topic=option-topic", "Enable.Mqtt.Url=mqtt://127.0.0.1:1" ] });
+    const { emit, platform } = built;
 
     t.after(() => emit(SHUTDOWN));
 
     assert.equal(platform.config.apiKey, OPTION_KEY, "the API key option wins over the legacy property");
-    assert.equal(platform.config.mqttUrl, "mqtt://127.0.0.1:1", "the broker URL option wins over the legacy property");
-    assert.equal(platform.config.mqttTopic, "option-topic", "the topic option wins over the legacy property");
+    assert.deepEqual(mqttSettingsOf(built), { brokerUrl: "mqtt://127.0.0.1:1", topicPrefix: "option-topic" },
+      "the broker URL and topic options win over their legacy properties");
   });
 
   test("an explicitly disabled broker URL turns MQTT off despite a legacy property", (t) => {
 
-    const { emit, platform } = buildPlatform({ mqttUrl: "mqtt://127.0.0.1:1", options: ["Disable.Mqtt.Url"] });
+    const { emit, mqttFactory, platform } = buildPlatform({ mqttUrl: "mqtt://127.0.0.1:1", options: ["Disable.Mqtt.Url"] });
 
     t.after(() => emit(SHUTDOWN));
 
-    assert.equal(platform.config.mqttUrl, null, "an explicit disable resolves to nothing rather than falling back to the legacy property");
+    assert.equal(mqttFactory.createCalls.length, 0, "an explicit disable resolves to nothing rather than falling back to the legacy property");
     assert.equal(platform.mqtt, null, "a disabled broker URL constructs no client even with a usable legacy URL configured");
   });
 
   test("an unconfigured topic resolves to the catalog default", (t) => {
 
-    const { emit, platform } = buildPlatform();
+    const built = buildPlatform({ mqttUrl: "mqtt://127.0.0.1:1" });
+
+    t.after(() => built.emit(SHUTDOWN));
+
+    assert.equal(mqttSettingsOf(built).topicPrefix, HYDRAWISE_MQTT_TOPIC, "with no topic property and no topic option, the catalog registration supplies the prefix");
+  });
+
+  test("a blank legacy topic beside a legacy broker builds the client under the catalog default", (t) => {
+
+    const built = buildPlatform({ mqttTopic: "", mqttUrl: "mqtt://127.0.0.1:1" });
+
+    t.after(() => built.emit(SHUTDOWN));
+
+    assert.equal(mqttSettingsOf(built).topicPrefix, HYDRAWISE_MQTT_TOPIC, "a blank topic field reads as no topic at all, so MQTT stays on under the default prefix");
+  });
+
+  test("a legacy topic that is not text beside a legacy broker builds the client under the catalog default", (t) => {
+
+    const built = buildPlatform({ mqttTopic: 42, mqttUrl: "mqtt://127.0.0.1:1" });
+
+    t.after(() => built.emit(SHUTDOWN));
+
+    assert.equal(mqttSettingsOf(built).topicPrefix, HYDRAWISE_MQTT_TOPIC, "a hand-edited topic that is not text reads as unset, so MQTT stays on under the default");
+  });
+
+  test("a legacy broker URL that is not text beside a legacy topic builds no client and logs no MQTT error", (t) => {
+
+    // The value carries a length, so HBPU's resolver would read it as a configured broker if the platform handed it over as it stands. A value with no length
+    // reads as unset there whatever the platform does, so it would prove nothing about the platform reading the property as text.
+    const { emit, entries, mqttFactory, platform } = buildPlatform({ mqttTopic: "legacy-topic", mqttUrl: ["mqtt://127.0.0.1:1"] });
 
     t.after(() => emit(SHUTDOWN));
 
-    assert.equal(platform.config.mqttTopic, "hydrawise", "with no topic property and no topic option, the catalog registration supplies the prefix");
+    assert.equal(mqttFactory.createCalls.length, 0, "a hand-edited broker URL that is not text reads as unset, so no client is built");
+    assert.equal(platform.mqtt, null, "and MQTT stays off");
+    assert.ok(!loggedAt(entries, "error", "MQTT"), "with no MQTT error logged");
   });
 
   test("an explicitly disabled topic turns MQTT off beside a usable broker URL", (t) => {
 
-    const { emit, platform } = buildPlatform({ mqttTopic: "legacy-topic", mqttUrl: "mqtt://127.0.0.1:1", options: ["Disable.Mqtt.Topic"] });
+    const { emit, mqttFactory, platform } = buildPlatform({ mqttTopic: "legacy-topic", mqttUrl: "mqtt://127.0.0.1:1", options: ["Disable.Mqtt.Topic"] });
 
     t.after(() => emit(SHUTDOWN));
 
-    assert.equal(platform.config.mqttTopic, null, "an explicitly disabled topic resolves to nothing");
+    assert.equal(mqttFactory.createCalls.length, 0, "an explicitly disabled topic resolves to nothing, so no client is built");
     assert.equal(platform.mqtt, null, "disabling either MQTT option turns the whole feature off, not just that one field");
   });
 
   test("a valueless topic entry resolves to nothing and turns MQTT off", (t) => {
 
-    const { emit, platform } = buildPlatform({ mqttUrl: "mqtt://127.0.0.1:1", options: ["Enable.Mqtt.Topic"] });
+    const { emit, mqttFactory, platform } = buildPlatform({ mqttUrl: "mqtt://127.0.0.1:1", options: ["Enable.Mqtt.Topic"] });
 
     t.after(() => emit(SHUTDOWN));
 
-    assert.equal(platform.config.mqttTopic, undefined, "an entry that exists carrying no value resolves to nothing, its emptiness included");
+    assert.equal(mqttFactory.createCalls.length, 0, "an entry that exists carrying no value resolves to nothing, its emptiness included, so no client is built");
     assert.equal(platform.mqtt, null, "an empty topic prefix leaves MQTT off");
   });
 

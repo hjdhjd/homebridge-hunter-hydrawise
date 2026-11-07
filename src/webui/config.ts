@@ -2,7 +2,7 @@
  *
  * webui/config.ts: Pure interpreters over the injected Hydrawise platform configuration.
  */
-import type { FeatureCategoryEntry, FeatureOptionEntry, FeatureOptions, displayedName, sanitizeName } from "homebridge-plugin-utils";
+import type { FeatureCategoryEntry, FeatureOptionEntry, FeatureOptions, displayedName, readOptionsSetting, sanitizeName } from "homebridge-plugin-utils";
 import type { HYDRAWISE_CONTROLLER_FALLBACK_NAME, HYDRAWISE_ZONE_FALLBACK_NAME, controllerDisplayName, zoneDisplayName } from "../types.ts";
 import type { HydrawiseControllerOption, HydrawiseFeatureOption, HydrawiseGlobalFlagOption, HydrawiseGlobalValueOption } from "../options.ts";
 
@@ -204,34 +204,27 @@ export interface HydrawiseNamesDependencies {
 }
 
 /**
- * What the interpreter is built over: the feature-option engine class and the served catalog. The engine's type is declared here at module scope, where `typeof
- * FeatureOptions` names the imported class, rather than in the factory's parameter, where the same words would name the parameter itself.
+ * What the interpreter is built over: the feature-option engine class, the served catalog, and HBPU's reader of the options setting, through which every read and
+ * write here takes the configured entries, so a hand-edited entry that is not text is dropped as it is read and a setting that is not a list reads as no entries.
+ * The injected types are declared here at module scope, where `typeof FeatureOptions` names the imported class, rather than in the factory's parameter, where the
+ * same words would name the parameter itself.
  */
 export interface HydrawiseConfigDependencies {
 
   readonly FeatureOptions: typeof FeatureOptions;
   readonly catalog: HydrawiseConfigCatalog;
+  readonly readOptionsSetting: typeof readOptionsSetting;
 }
 
 /**
- * What the degraded-mode interpreter is built over: the feature-option engine class alone, which the page holds whether or not a catalog is ever served. Its type
- * is declared at module scope for the reason the interface above states.
+ * What the degraded-mode interpreter is built over: the feature-option engine class and HBPU's reader of the options setting, which the page holds whether or not
+ * a catalog is ever served. Their types are declared at module scope for the reason the interface above states.
  */
 export interface HydrawiseLegacyConfigDependencies {
 
   readonly FeatureOptions: typeof FeatureOptions;
+  readonly readOptionsSetting: typeof readOptionsSetting;
 }
-
-/* The configured entries: the config's options array, less every entry that is not a string. This module-scope filter is every reader's and writer's single read
- * of the list - the catalog-backed engine, which the degraded-mode readers resolve through too, its retired-name rewrite, and the degraded-mode first-run write
- * alike. The entry grammar is text and every reader reads each entry as text, so a hand-edited entry of any other kind is dropped here, once, as it is read,
- * rather than handed on to throw inside the engine or carried out of a degraded write through a patch that declares its entries as text. An options key that is
- * absent, or that holds anything but an array, reads as no entries at all.
- */
-const optionsOf = (config?: HydrawiseConfig): string[] => {
-
-  return Array.isArray(config?.options) ? config.options.filter((entry: unknown): entry is string => typeof entry === "string") : [];
-};
 
 /**
  * Build the page's naming rule over HBPU's naming functions, injected as the engine is below so this module imports no values. It mirrors the runtime's composers,
@@ -266,21 +259,22 @@ export const makeHydrawiseNames = ({ displayedName, sanitizeName }: HydrawiseNam
 };
 
 /**
- * Build the interpreter over an injected feature-option engine class and the option catalog the plugin's own UI server publishes. Injecting both is what keeps
- * this module free of value imports and testable under node against the real engine and the real catalog, rather than against a stand-in that could drift from
- * either.
+ * Build the interpreter over an injected feature-option engine class, the option catalog the plugin's own UI server publishes, and HBPU's reader of the options
+ * setting. Injecting them is what keeps this module free of value imports and testable under node against the real engine, the real catalog and the real reader,
+ * rather than against a stand-in that could drift from any of them.
  *
- * @param injected.FeatureOptions - The feature-option engine class.
- * @param injected.catalog        - The served catalog, carrying its categories and its options record.
+ * @param injected.FeatureOptions     - The feature-option engine class.
+ * @param injected.catalog            - The served catalog, carrying its categories and its options record.
+ * @param injected.readOptionsSetting - HBPU's reader of the options setting, which answers the setting's text entries.
  *
  * @returns The interpreter: readers for the effective API key, account password, and account username, the legacy-settings migration, and the first-run
  *          write that commits all of them at once.
  */
-export const makeHydrawiseConfig = ({ FeatureOptions, catalog }: HydrawiseConfigDependencies): HydrawiseConfigInterpreter => {
+export const makeHydrawiseConfig = ({ FeatureOptions, catalog, readOptionsSetting }: HydrawiseConfigDependencies): HydrawiseConfigInterpreter => {
 
-  // A feature-option engine over the served catalog and the config's text entries, which the filter above hands it as an array of its own, so nothing the engine
-  // does can reach the configuration's own array.
-  const engineFor = (config?: HydrawiseConfig): FeatureOptions => new FeatureOptions(catalog.categories, catalog.options, optionsOf(config));
+  // A feature-option engine over the served catalog and the config's text entries, as HBPU's reader answers them. A well-formed list reaches the engine as the
+  // configuration's own array, and nothing the engine does can reach it, because its mutators replace their array rather than edit it.
+  const engineFor = (config?: HydrawiseConfig): FeatureOptions => new FeatureOptions(catalog.categories, catalog.options, readOptionsSetting(config?.options));
 
   /* Every option key the SERVED catalog currently declares, lowercased. The composition is the feature-option engine's own rule - a category name joined to an
    * option name by a dot, with a nameless option addressing its category alone - stated here rather than imported because this module deliberately imports no
@@ -423,9 +417,9 @@ export const makeHydrawiseConfig = ({ FeatureOptions, catalog }: HydrawiseConfig
      * off is what the catalog already declares, and writing one would manufacture configuration for no gain - the same minimal-config rule the value arm
      * follows. Anything that is not a boolean is a hand-edit we decline to interpret, and it leaves without composing.
      *
-     * Two shapes decline entirely. A legacy key present with the value undefined is the terminal shape this very patch produces, so it reads as absent and a
-     * second pass over an already-staged config stages nothing. And an options array that is not an array at all is a substrate we cannot parse, so the
-     * migration leaves the whole config alone rather than guessing at it.
+     * A legacy key present with the value undefined is the terminal shape this very patch produces, so it reads as absent and a second pass over an
+     * already-staged config stages nothing. The options setting is read through HBPU's reader, as HBPU's own migration reads it, so a setting that is not a list
+     * holds no entries, and the properties beside it still migrate into a list of their own. Only a missing configuration declines outright.
      *
      * @param config - The platform configuration entry.
      *
@@ -433,7 +427,7 @@ export const makeHydrawiseConfig = ({ FeatureOptions, catalog }: HydrawiseConfig
      */
     migrate: (config?: HydrawiseConfig): HydrawiseConfigPatch | null => {
 
-      if(!config || ((config.options !== undefined) && !Array.isArray(config.options))) {
+      if(!config) {
 
         return null;
       }
@@ -442,7 +436,7 @@ export const makeHydrawiseConfig = ({ FeatureOptions, catalog }: HydrawiseConfig
        * migration answers null the moment a configuration carries no legacy properties, which is true of nearly every installation that has already been through
        * it once - gating the rename behind that scan would leave exactly those configurations carrying the retired name forever.
        */
-      const renamed = renameRetiredOptions(optionsOf(config));
+      const renamed = renameRetiredOptions(readOptionsSetting(config.options));
       const carried = Object.entries(CONSOLIDATED_SETTINGS).filter(([property]) => config[property] !== undefined);
 
       if(!carried.length) {
@@ -562,14 +556,15 @@ export const makeHydrawiseConfig = ({ FeatureOptions, catalog }: HydrawiseConfig
  * nothing ever reads - and they compose the canonical option entry directly. That is a narrow, well-understood exception: the entry form is the one the engine
  * composes for a value option, and the password and username options are value options in the declaration the readers resolve through.
  *
- * @param injected.FeatureOptions - The feature-option engine class.
+ * @param injected.FeatureOptions     - The feature-option engine class.
+ * @param injected.readOptionsSetting - HBPU's reader of the options setting, which answers the setting's text entries.
  *
  * @returns The degraded-mode interpreter.
  */
-export const makeLegacyHydrawiseConfig = ({ FeatureOptions }: HydrawiseLegacyConfigDependencies): HydrawiseLegacyConfigInterpreter => {
+export const makeLegacyHydrawiseConfig = ({ FeatureOptions, readOptionsSetting }: HydrawiseLegacyConfigDependencies): HydrawiseLegacyConfigInterpreter => {
 
   // The catalog-backed readers over the account settings' declaration, so the degraded and the catalog-backed interpreter read the key and the login by one rule.
-  const reader = makeHydrawiseConfig({ FeatureOptions, catalog: ACCOUNT_CATALOG });
+  const reader = makeHydrawiseConfig({ FeatureOptions, catalog: ACCOUNT_CATALOG, readOptionsSetting });
 
   return {
 
@@ -608,8 +603,8 @@ export const makeLegacyHydrawiseConfig = ({ FeatureOptions }: HydrawiseLegacyCon
      *
      * Every entry already addressing the API key is dropped, and so is every entry addressing a credential option the write replaces, each in either action form
      * and with or without a value, so a second pass replaces rather than accumulates - the same thing the engine's own set does, done by hand because no served
-     * catalog is in hand to set it through. The entries it keeps are read through the module-scope filter, so a hand-edited entry that is not text is left out of
-     * the list it writes.
+     * catalog is in hand to set it through. The entries it keeps are read through HBPU's reader, so a hand-edited entry that is not text is left out of the list
+     * it writes.
      *
      * The key's entries go because the property this write sets must be the key's one home: neither the next healthy load nor the runtime may prefer a stale entry
      * over the new key. Each lets an entry outrank the property, so a stale entry left standing would win over the key this write just validated, and the healthy
@@ -627,7 +622,7 @@ export const makeLegacyHydrawiseConfig = ({ FeatureOptions }: HydrawiseLegacyCon
      */
     withFirstRun: (config: HydrawiseConfig | undefined, { apiKey, password, username }: HydrawiseFirstRunValues): HydrawiseLegacyConfigPatch => {
 
-      const entries = optionsOf(config);
+      const entries = readOptionsSetting(config?.options);
       const written: [ string, string ][] = (password?.length && username?.length) ?
         [ [ CREDENTIAL_SETTINGS.password, password ], [ CREDENTIAL_SETTINGS.username, username ] ] : [];
 

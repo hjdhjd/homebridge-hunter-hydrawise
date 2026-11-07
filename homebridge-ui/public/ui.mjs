@@ -12,6 +12,7 @@ import { createActionGuard, withDeadline } from "homebridge-plugin-utils/webUi-l
 import { displayedName, sanitizeName } from "homebridge-plugin-utils/homekit-name.js";
 import { PluginConfigSession } from "homebridge-plugin-utils/pluginConfigSession.mjs";
 import { mountSecretReveals } from "homebridge-plugin-utils/webUi-secret.mjs";
+import { readOptionsSetting } from "homebridge-plugin-utils/featureOptions-setting.js";
 import { webUi } from "homebridge-plugin-utils/webUi.mjs";
 
 // The feature-option category the controller-scope options this webUI reasons about live in. One constant anchors the category everywhere this file names it - the
@@ -122,7 +123,7 @@ const getCatalog = () => {
 /* The interpreter every configuration read in this file goes through. It is declared already holding the degraded-mode interpreter, so the binding is never
  * undefined in any window and no consumer needs a guard; the wiring below swaps in the catalog-backed interpreter the moment the catalog is in hand.
  */
-let hydrawiseConfig = makeLegacyHydrawiseConfig({ FeatureOptions });
+let hydrawiseConfig = makeLegacyHydrawiseConfig({ FeatureOptions, readOptionsSetting });
 
 /* The page's naming rule, built once over HBPU's naming functions: every controller and zone name this page shows goes through it, so the page names each as the
  * runtime's composers name it in HomeKit. It needs no catalog, so it is whole from the first render.
@@ -137,14 +138,15 @@ const hydrawiseNames = makeHydrawiseNames({ displayedName, sanitizeName });
  */
 const controllerLabel = ({ accessory, identity, override }) => hydrawiseNames.controllerName({ override, reported: cachedAccessoryName(accessory) ?? identity });
 
-// Build the feature-option engine over the cached catalog and the user's configured options. The engine is rebuilt per call because the configured options change
-// underneath us as the user edits them, so an edit the user just saved is reflected the next time we ask. Every consult in this file resolves through here, which
-// is what keeps the enable-state oracle and the zone-name lookup answering from one engine rather than two.
+// Build the feature-option engine over the cached catalog and the user's configured options, read through HBPU's reader as every read of the setting here is. The
+// engine is rebuilt per call because the configured options change underneath us as the user edits them, so an edit the user just saved is reflected the next
+// time we ask. Every consult in this file resolves through here, which is what keeps the enable-state oracle and the zone-name lookup answering from one engine
+// rather than two.
 const getEngine = async (config) => {
 
   const { categories, options } = await getCatalog();
 
-  return new FeatureOptions(categories, options, config?.options ?? []);
+  return new FeatureOptions(categories, options, readOptionsSetting(config?.options));
 };
 
 // Ask the feature-option engine whether the runtime publishes a controller, using the runtime's exact gate call so the webUI and the plugin cannot disagree
@@ -230,21 +232,15 @@ const matchControllerAccessory = (cached, targetSerial) => cached.find((accessor
   (foldSerial(accessory.context.controller.serialNumber) === targetSerial));
 
 /* Extract the controller serials named by the config floor, through the engine's own grammar: one record per entry addressing the whole-device option, the id in
- * the casing the user wrote it. A global entry yields an empty id and is dropped; a zone-scope disable yields that zone's relay id, and the caller screens every
- * candidate against the known zones. An entry that is really some other option's address - a dotted tail, a value payload - yields nothing, because the engine
- * reads it as what it is.
+ * the casing the user wrote it. The entries are the configured ones as HBPU's reader answers them. A global entry yields an empty id and is dropped; a zone-scope
+ * disable yields that zone's relay id, and the caller screens every candidate against the known zones. An entry that is really some other option's address - a
+ * dotted tail, a value payload - yields nothing, because the engine reads it as what it is.
  */
-const floorSerials = (options, catalog) => {
-
-  if(!Array.isArray(options)) {
-
-    return [];
-  }
+const floorSerials = (entries, catalog) => {
 
   const serials = [];
 
-  for(const entry of enumerateConfiguredEntries({ catalog: catalog.index, configuredOptions: options.filter((entry) => typeof entry === "string"),
-    option: DEVICE_CATEGORY })) {
+  for(const entry of enumerateConfiguredEntries({ catalog: catalog.index, configuredOptions: entries, option: DEVICE_CATEGORY })) {
 
     if(entry.id.length) {
 
@@ -537,7 +533,7 @@ const getControllers = async ({ config }) => {
   const catalog = await getCatalog();
   const floorSet = new Set();
 
-  for(const serial of floorSerials(config?.options, catalog)) {
+  for(const serial of floorSerials(readOptionsSetting(config?.options), catalog)) {
 
     const key = foldSerial(serial);
 
@@ -1494,7 +1490,7 @@ const wiringController = new AbortController();
  */
 const wireHydrawiseConfig = async () => {
 
-  hydrawiseConfig = makeHydrawiseConfig({ FeatureOptions, catalog: await getCatalog() });
+  hydrawiseConfig = makeHydrawiseConfig({ FeatureOptions, catalog: await getCatalog(), readOptionsSetting });
 
   // The library's session is the single conduit the framework's own writes use, so the patch merges onto a replica synced just now rather than onto a snapshot
   // taken before the page opened.

@@ -23,7 +23,7 @@
 import "homebridge-plugin-utils/polyfills";
 import type { API, PlatformAccessory } from "homebridge";
 import { AccessoryPersistence, FeatureOptions, TimerRegistry, acquireService, sanitizeName, setAccessoryName } from "homebridge-plugin-utils";
-import type { Clock, HomebridgePluginLogging, Nullable, RateBudget } from "homebridge-plugin-utils";
+import type { Clock, HomebridgePluginLogging, MqttClientConfigCandidate, Nullable, RateBudget } from "homebridge-plugin-utils";
 import { HYDRAWISE_API_BASE_URL, HYDRAWISE_API_JITTER, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_REVERT_DELAY, PLATFORM_NAME, PLUGIN_NAME } from "../settings.ts";
 import { HeldEnd, failingBodies } from "./network.helpers.ts";
 import type { HydrawiseAccessory, HydrawiseCommandOutcome, HydrawiseControllerConfig, HydrawiseControllerHardware, HydrawiseControllerIdentity,
@@ -31,7 +31,7 @@ import type { HydrawiseAccessory, HydrawiseCommandOutcome, HydrawiseControllerCo
   StatusScheduleResponse } from "../types.ts";
 import type { HydrawiseBodyRead, HydrawisePlatformDefaults } from "../platform.ts";
 import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
-import { TestClock, TestMqttClient, TestMqttClientFactory, advanceUntil, capturingLog, loadHomebridge, present, settle, settleUntil,
+import { TestClock, TestMqttClient, TestMqttClientFactory, advanceUntil, capturingLog, expectAt, loadHomebridge, present, settle, settleUntil,
   watchServerWarnings } from "homebridge-plugin-utils/testing";
 import type { TestHomebridgeApi, TestHomebridgeApiCall, TestLogEntry, TestPlatformAccessory } from "homebridge-plugin-utils/testing";
 import { featureOptionCategories, featureOptions } from "../options.ts";
@@ -433,8 +433,6 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
 
     apiKey: "test-api-key",
     debug: false,
-    mqttTopic: "hydrawise",
-    options: options.userOptions ?? [],
     ...options.config
   };
 
@@ -779,8 +777,11 @@ export interface BuildPlatformOptions {
   clock?: TestClock;
   debug?: boolean;
   mqttFactory?: HydrawisePlatformDefaults["mqttFactory"];
-  mqttTopic?: string;
-  mqttUrl?: string;
+
+  // The legacy topic and broker URL properties as a hand-edited configuration can carry them, text or otherwise, so a row hands the platform a value that is not
+  // text unchanged.
+  mqttTopic?: unknown;
+  mqttUrl?: unknown;
   options?: string[];
 }
 
@@ -805,7 +806,8 @@ export interface BuildPlatformResult {
   failRegistrationUuids: Set<string>;
 
   // HBPU's MQTT factory double the harness built for this platform, on its clock: every call the platform made to it, the configuration and the init it handed
-  // in, and the double each call answered, null where MQTT is off. A row that hands the platform a factory of its own leaves this one uncalled.
+  // in, and the double each call answered. The platform calls it only where HBPU's resolver finds MQTT on, so a platform with MQTT off leaves it uncalled, as
+  // does a row that hands the platform a factory of its own.
   mqttFactory: TestMqttClientFactory;
   platform: HydrawisePlatform;
 
@@ -886,6 +888,21 @@ export function buildPlatform(options: BuildPlatformOptions = {}): BuildPlatform
 
   return { api, clock, emit: (event: string): void => void api.emit(event), entries: log.entries, failRegistrationUuids, mqttFactory, platform,
     registered: () => callsOf(api, "register").flat(), unregistered: () => callsOf(api, "unregister").flat(), updated };
+}
+
+/**
+ * Read the broker URL and topic prefix a platform handed its MQTT factory, from the factory's record of the one call a platform with MQTT on makes. The MQTT
+ * settings resolve where the platform builds its client, so this is where a row reads what they resolved to.
+ *
+ * @param built - The built platform, whose MQTT factory double recorded the call.
+ *
+ * @returns The broker URL and the topic prefix the platform built its client on.
+ */
+export function mqttSettingsOf({ mqttFactory }: Pick<BuildPlatformResult, "mqttFactory">): Pick<MqttClientConfigCandidate, "brokerUrl" | "topicPrefix"> {
+
+  const { config } = expectAt(mqttFactory.createCalls, 0, "the MQTT client the platform built");
+
+  return { brokerUrl: config.brokerUrl, topicPrefix: config.topicPrefix };
 }
 
 // The Hydrawise API origin every retrieve() request targets. The MockAgent intercepts against this origin, derived from the same base URL production assembles its
