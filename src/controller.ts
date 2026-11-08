@@ -4,8 +4,8 @@
  */
 import type { API, CharacteristicValue, HAP, Service } from "homebridge";
 import { HAP_DEFAULT_MODEL, HAP_DURATION_CEILING, HOMEBRIDGE_UNKNOWN_FIRMWARE, HYDRAWISE_ACTIVE_ZONE_INDICATOR, HYDRAWISE_API_JITTER,
-  HYDRAWISE_API_NEXTPOLL_MAX, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_COMMAND_ATTEMPTS, HYDRAWISE_POLL_LOSS_THRESHOLD, HYDRAWISE_REVERT_DELAY,
-  HYDRAWISE_SUSPEND_DURATION, HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
+  HYDRAWISE_API_NEXTPOLL_MAX, HYDRAWISE_API_RETRY_INTERVAL, HYDRAWISE_COMMAND_ATTEMPTS, HYDRAWISE_DEFAULT_RUN_DURATION, HYDRAWISE_POLL_LOSS_THRESHOLD,
+  HYDRAWISE_REVERT_DELAY, HYDRAWISE_SUSPEND_DURATION, HYDRAWISE_V2_FACTS_TTL } from "./settings.ts";
 import { HYDRAWISE_UNSCHEDULED_SENTINEL, HydrawiseReservedNames, controllerDisplayName, controllerIdentity, isControllerIdentity, isFirmwareVersion,
   isRainSensorSubtype, isScheduleStatus, isSuspendZoneSubtype, isZoneIdentity, isZoneStoppedBySensor, rainSensorSubtype, sameControllerIdentity, sameScheduleStatus,
   sameZoneIdentity, scheduleStatus, suspendZoneSubtype, zoneDisplayName, zoneHasUpcomingRun, zoneIdentity, zoneScheduleStatus } from "./types.ts";
@@ -1897,7 +1897,7 @@ export class HydrawiseController {
           valveService.getCharacteristic(this.hap.Characteristic.Active).onGet(answering(() => valveService.getCharacteristic(this.hap.Characteristic.Active).value));
         }
 
-        // Manually control the zone valve. A write queues the run or the stop and returns at once, and the run carries the duration the valve shows right now.
+        // Manually control the zone valve. A write queues the run or the stop and returns at once, and the run carries the valve's manual run time.
         valveService.getCharacteristic(this.hap.Characteristic.Active).onSet(answering((value: CharacteristicValue): void => {
 
           if(value !== this.hap.Characteristic.Active.ACTIVE) {
@@ -1907,7 +1907,7 @@ export class HydrawiseController {
             return;
           }
 
-          this.commandValve({ duration: Number(valveService.getCharacteristic(this.hap.Characteristic.SetDuration).value ?? 0), on: true, origin: "homekit", zone });
+          this.commandValve({ duration: this.manualRunDuration(valveService), on: true, origin: "homekit", zone });
         }));
 
         this.bound.add(valveService);
@@ -1933,9 +1933,12 @@ export class HydrawiseController {
         valveService.updateCharacteristic(this.hap.Characteristic.RemainingDuration, Math.min(duration, HAP_DURATION_CEILING));
       } else {
 
-        // Set the duration of the next run of this valve, in seconds, in HomeKit based on the Hydrawise scheduled runtime, capped at HomeKit's own SetDuration
-        // maximum.
-        valveService.updateCharacteristic(this.hap.Characteristic.SetDuration, Math.min(duration, HAP_DURATION_CEILING));
+        /* Mirror the Hydrawise scheduled runtime into the valve's run time, capped at HomeKit's own SetDuration maximum, so HomeKit shows Hydrawise's real run
+         * time and a tap runs the zone for its normal length. Hydrawise reports zero for a zone with no upcoming run, which is no run time at all, so a zero never
+         * overwrites the one the valve holds: the zone keeps its last real run time, or takes the default when it has never had one.
+         */
+        valveService.updateCharacteristic(this.hap.Characteristic.SetDuration, (duration > 0) ? Math.min(duration, HAP_DURATION_CEILING) :
+          this.manualRunDuration(valveService));
       }
 
       // Active represents whether the zone is ready to be activated - meaning it's queued to turn on imminently or is currently on - unless the user's own run or
@@ -2678,6 +2681,15 @@ export class HydrawiseController {
   private isStoppedBySensor(zone: HydrawiseZoneConfig): boolean {
 
     return isZoneStoppedBySensor(zone, this.status);
+  }
+
+  // The run time, in seconds, a HomeKit start gives a zone: the valve's own run time while it holds a positive one, and the default otherwise, which covers a valve
+  // Hydrawise has never given a run time and a zero written from HomeKit itself before the next poll.
+  private manualRunDuration(valveService: Service): number {
+
+    const duration = Number(valveService.getCharacteristic(this.hap.Characteristic.SetDuration).value ?? 0);
+
+    return (duration > 0) ? duration : HYDRAWISE_DEFAULT_RUN_DURATION;
   }
 
   // Utility to convert the duration from seconds to minutes, with the correct plural marker.

@@ -199,6 +199,11 @@ export const HAP_DEFAULT_MODEL = "Default-Model";
  */
 export const HAP_DURATION_CEILING = 3600;
 
+/* The run time, in seconds, a zone starts for from HomeKit when Hydrawise has never given it a scheduled run time to mirror. Hydrawise requires a length for every
+ * run it starts, so a zone needs some answer here, and a short one is the conservative choice: a run nobody meant to start wastes the least water.
+ */
+export const HYDRAWISE_DEFAULT_RUN_DURATION = 300;
+
 // The HAP accessory category a standalone zone accessory declares - Apple's sprinkler category, so the Home app renders a lone irrigation valve as a sprinkler
 // rather than as a generic accessory. The mirror is compiler-locked against hap-nodejs's own declaration, so the value can never drift from what HAP defines.
 export const HYDRAWISE_ZONE_ACCESSORY_CATEGORY = Categories.SPRINKLER;

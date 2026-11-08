@@ -54,7 +54,7 @@ function standaloneZone(overrides: Partial<HydrawiseZoneConfig> = {}): Hydrawise
 }
 
 // The overrides that make the zone scheduled rather than running. A manual-run assertion needs them: the walk writes SetDuration only for a zone that is not already
-// running, and the run command the handler sends is a no-op without one.
+// running, and these give the run command the handler sends the scheduled run time to carry.
 const SCHEDULED: Partial<HydrawiseZoneConfig> = { run: 480, time: 68000, timestr: "16:00" };
 
 // The overrides that give the zone the unscheduled sentinel shape. Served with a rain sensor whose relay list covers the zone, this is the wire state that

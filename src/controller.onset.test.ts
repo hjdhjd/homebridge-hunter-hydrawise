@@ -10,12 +10,13 @@
 // The Hydrawise API wire shapes use snake_case keys such as relay_id and controller_id, so camelcase is disabled here to let these literals mirror the wire verbatim.
 /* eslint-disable camelcase */
 import { Characteristic, Service, advanceThroughPolls, buildController, crossRevertDelay } from "./testing/platform.helpers.ts";
-import { HYDRAWISE_REVERT_DELAY, HYDRAWISE_SUSPEND_DURATION } from "./settings.ts";
+import { HYDRAWISE_DEFAULT_RUN_DURATION, HYDRAWISE_REVERT_DELAY, HYDRAWISE_SUSPEND_DURATION } from "./settings.ts";
 import type { HydrawiseZoneConfig, StatusScheduleResponse } from "./types.ts";
 import { advanceUntil, expectAt, loggedAt, present, settle, settleUntil, triggerSet } from "homebridge-plugin-utils/testing";
 import { describe, test } from "node:test";
 import { makeStatusSchedule, makeZone } from "./api.helpers.ts";
 import type { BuildControllerResult } from "./testing/platform.helpers.ts";
+import { HYDRAWISE_UNSCHEDULED_SENTINEL } from "./types.ts";
 import type { Service as HapService } from "homebridge";
 import assert from "node:assert/strict";
 import { bareSensors } from "./api.fixtures.ts";
@@ -37,6 +38,12 @@ async function firstValve(h: BuildControllerResult): Promise<HapService> {
 function scheduledZone(): HydrawiseZoneConfig {
 
   return makeZone({ name: "Alpha", relay: 1, relay_id: 700001, run: 480, time: 68000, timestr: "16:00" });
+}
+
+// A zone with no upcoming run: the far-future sentinel with a run time of zero, the shape every zone carries in a rain delay.
+function unscheduledZone(): HydrawiseZoneConfig {
+
+  return makeZone({ name: "Alpha", relay: 1, relay_id: 700001, run: 0, time: HYDRAWISE_UNSCHEDULED_SENTINEL, timestr: "" });
 }
 
 function runningZone(): HydrawiseZoneConfig {
@@ -357,27 +364,70 @@ describe("HydrawiseController valve and suspend onSet", () => {
       "across a span well past the beat the revert would have fired on, with nothing armed after it");
   });
 
-  test("a run with no duration to give is no command, and the valve is put back without a word", async (t) => {
+  test("a tap on a zone Hydrawise has never given a run time starts it for the default", async (t) => {
 
-    // A zone with no scheduled run carries a SetDuration of zero, so a tap on its valve asks for a run of no length at all, which the guard declines before
-    // anything is queued.
+    // Hydrawise reports a run time of zero for a zone with no upcoming run. The valve takes the default in its place, so a tap still starts the zone.
     const h = buildController({ program: (recorder) => {
 
-      recorder.programDefault("statusschedule.php", { body: schedule([makeZone({ name: "Alpha", relay: 1, relay_id: 700001, run: 0, time: 68000, timestr: "16:00" })]),
-        kind: "response" });
+      recorder.programDefault("statusschedule.php", { body: schedule([unscheduledZone()]), kind: "response" });
     }, signalAborted: false });
 
     t.after(() => h.abort());
 
     const valve = await firstValve(h);
 
+    assert.equal(valve.getCharacteristic(Characteristic.SetDuration).value, HYDRAWISE_DEFAULT_RUN_DURATION, "the valve shows the default, never a zero");
+
     await triggerSet(valve.getCharacteristic(Characteristic.Active), Characteristic.Active.ACTIVE);
     await h.controller.commandsIdle;
-    await crossRevertDelay(h.clock);
 
-    assert.equal(valve.getCharacteristic(Characteristic.Active).value, Characteristic.Active.INACTIVE, "the valve is put back once the revert delay passes");
-    assert.equal(h.commands.calls.length, 0, "a run of no length sends nothing");
-    assert.equal(h.entries.filter(line => line.level === "error").length, 0, "and says nothing, since nothing was asked of Hydrawise");
+    const command = expectAt(h.commands.params, 0, "setzone call");
+
+    assert.equal(command["action"], "run", "the tap starts the zone");
+    assert.equal(command["custom"], String(HYDRAWISE_DEFAULT_RUN_DURATION), "for the default run time");
+  });
+
+  test("a zone keeps its last real run time across a poll that reports none", async (t) => {
+
+    const h = buildController({ program: (recorder) => {
+
+      recorder.program("statusschedule.php", { body: schedule([scheduledZone()]), kind: "response" });
+      recorder.programDefault("statusschedule.php", { body: schedule([unscheduledZone()]), kind: "response" });
+    }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    const valve = await firstValve(h);
+
+    // A poll's projection has certainly completed once the poll after it has begun, so the wait is bounded on the poll after the one reporting no run time.
+    await advanceThroughPolls(h, h.retrieve.callsTo("statusschedule.php").length + 1);
+
+    assert.equal(valve.getCharacteristic(Characteristic.SetDuration).value, 480, "a poll reporting no run time leaves the scheduled one in place");
+
+    await triggerSet(valve.getCharacteristic(Characteristic.Active), Characteristic.Active.ACTIVE);
+    await h.controller.commandsIdle;
+
+    assert.equal(expectAt(h.commands.params, 0, "setzone call")["custom"], "480", "and a tap runs the zone for it");
+  });
+
+  test("a zero run time written from HomeKit starts the zone for the default", async (t) => {
+
+    const h = buildController({ program: (recorder) => {
+
+      recorder.programDefault("statusschedule.php", { body: schedule([scheduledZone()]), kind: "response" });
+    }, signalAborted: false });
+
+    t.after(() => h.abort());
+
+    const valve = await firstValve(h);
+
+    // A tap that lands before the next poll reads whatever HomeKit last wrote, so a zero written there falls back to the default rather than asking for no run.
+    valve.getCharacteristic(Characteristic.SetDuration).setValue(0);
+
+    await triggerSet(valve.getCharacteristic(Characteristic.Active), Characteristic.Active.ACTIVE);
+    await h.controller.commandsIdle;
+
+    assert.equal(expectAt(h.commands.params, 0, "setzone call")["custom"], String(HYDRAWISE_DEFAULT_RUN_DURATION), "the run carries the default");
   });
 
   test("the suspend command floors its timestamp to a whole second (the bug 14 fix)", async (t) => {
