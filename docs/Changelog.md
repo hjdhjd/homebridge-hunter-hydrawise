@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2.1.0 (2026-11-07)
+  * New feature: your rain sensors in HomeKit and on MQTT. Each one appears as a contact sensor that opens while the sensor is tripped. Sign in with your Hydrawise account to get them.
+  * Improvement: switches and valves respond in HomeKit right away, and the plugin paces commands within Hydrawise's limits for you...change several zones at once, or change your mind partway, and Hydrawise ends up where you left things. If a command doesn't go through, the switch goes back and the log tells you why.
+  * Improvement: the per-zone suspend switches are no longer limited to 10 changes an hour.
+  * Improvement: the enhanced features cope better when Hydrawise is busy, and sign back in on their own.
+  * Improvement: even without signing in, the log tells you when a zone looks suspended or stopped by rain.
+  * Improvement: Sync Name is now off by default, so a name you give a zone or controller in the Home app stays put. Turn on Sync Name to keep names in step with Hydrawise. If you had Sync Name off before this release and renamed a controller or standalone zone in the Home app, that name may revert once after upgrading...rename it again and it will stick.
+  * Improvement: a Name you set always applies...rename that zone or controller in the Home app and your Name is put back right away. The settings page and the log use your Name too.
+  * Improvement: accessories show "No Response" in HomeKit while Hydrawise can't be reached, including right after a restart, and recover on their own.
+  * Improvement: clearer log messages when Hydrawise can't be reached, with a problem that keeps happening logged once instead of on every poll.
+  * Improvement: your MQTT broker sees each controller go offline when Homebridge stops.
+  * Improvement: settings page refinements.
+  * Fix: a zone you start from HomeKit now runs even when Hydrawise has nothing scheduled for it.
+  * Fix: the Suspend All switch now stays in step when you resume watering outside HomeKit, like in the Hydrawise app.
+  * Fix: a zone suspension now ends in HomeKit and on the settings page as soon as its end time passes.
+  * Fix: a controller's firmware version shows in HomeKit right after Homebridge restarts.
+  * Fix: a zone or controller named only with emoji or punctuation now appears in HomeKit, as "Controller" or "Zone 3", until you set a Name.
+  * Housekeeping.
+
 ## 2.0.0 (2026-08-15)
   * Breaking change: Homebridge 2.0 or later and Node.js 22.20 or later are now required.
   * New feature: sign in with your Hydrawise account to unlock enhanced features - accurate rain and suspension state for every zone, a suspend switch for each individual zone, the full zone and controller names your account carries, whether each controller is reachable, and each controller's real model and firmware.
